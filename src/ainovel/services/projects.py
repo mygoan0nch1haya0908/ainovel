@@ -1,9 +1,12 @@
 from uuid import uuid4
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ainovel.models.project import ConstitutionVersion, NovelProject
+
+VERSION_ALLOCATION_ATTEMPTS = 3
 
 
 class ProjectService:
@@ -25,7 +28,11 @@ class ProjectService:
             target_chars_max=target_chars_max,
         )
         self.session.add(project)
-        self.session.commit()
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
         return project
 
     def get(self, project_id: str) -> NovelProject:
@@ -39,14 +46,10 @@ class ProjectService:
     def add_constitution(
         self, project_id: str, content: dict[str, object], author_approved: bool
     ) -> ConstitutionVersion:
-        transaction = (
-            self.session.begin_nested()
-            if self.session.in_transaction()
-            else self.session.begin()
-        )
-        with transaction:
+        for attempt in range(VERSION_ALLOCATION_ATTEMPTS):
             project = self.session.get(NovelProject, project_id)
             if project is None:
+                self.session.rollback()
                 raise ValueError("project not found")
             version_number = self.session.scalar(
                 select(func.coalesce(func.max(ConstitutionVersion.version_number), 0) + 1).where(
@@ -61,7 +64,19 @@ class ProjectService:
                 author_approved=author_approved,
             )
             self.session.add(constitution)
-            self.session.flush()
-            if author_approved:
-                project.current_constitution_version_id = constitution.id
-        return constitution
+            try:
+                self.session.flush()
+            except IntegrityError:
+                self.session.rollback()
+                if attempt == VERSION_ALLOCATION_ATTEMPTS - 1:
+                    raise
+                continue
+            try:
+                if author_approved:
+                    project.current_constitution_version_id = constitution.id
+                self.session.commit()
+            except Exception:
+                self.session.rollback()
+                raise
+            return constitution
+        raise RuntimeError("constitution version allocation exhausted")
