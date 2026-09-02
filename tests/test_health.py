@@ -24,3 +24,12 @@ def test_default_app_does_not_create_schema(monkeypatch) -> None:
 
     with TestClient(create_app()) as client:
         assert client.get("/health").status_code == 200
+
+def test_explicit_url_app_does_not_create_schema(monkeypatch) -> None:
+    def fail_if_called(*args, **kwargs) -> None:
+        raise AssertionError("application factories must not create schemas")
+
+    monkeypatch.setattr(Base.metadata, "create_all", fail_if_called)
+
+    with TestClient(create_app("sqlite+pysqlite:///explicit.db")) as client:
+        assert client.get("/health").status_code == 200

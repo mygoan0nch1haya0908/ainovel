@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from ainovel.app import create_app
 
+from ainovel.models import Base
 
 @pytest.fixture
 def database_url(tmp_path: Path) -> str:
@@ -14,5 +15,7 @@ def database_url(tmp_path: Path) -> str:
 
 @pytest.fixture
 def client(database_url: str) -> Iterator[TestClient]:
-    with TestClient(create_app(database_url)) as test_client:
+    app = create_app(database_url)
+    Base.metadata.create_all(app.state.engine)
+    with TestClient(app) as test_client:
         yield test_client
