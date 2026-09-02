@@ -10,3 +10,7 @@ def test_health_returns_ready() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
+
+
+def test_app_exposes_session_factory(client: TestClient) -> None:
+    assert client.app.state.session_factory is not None
