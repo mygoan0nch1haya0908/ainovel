@@ -32,3 +32,16 @@ def session(client: TestClient):
 def project(session):
     from ainovel.services.projects import ProjectService
     return ProjectService(session).create("测试小说", 2_000_000, 5_000_000)
+
+
+@pytest.fixture
+def official_outline(session, project):
+    from ainovel.services.outlines import OutlineNodeInput, OutlineService
+
+    service = OutlineService(session)
+    candidate = service.create_candidate(
+        project.id,
+        [OutlineNodeInput(key="book", parent_key=None, kind="book", title="全书总纲", order=0)],
+        reason="test outline",
+    )
+    return service.approve(candidate.id)
