@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -13,6 +13,11 @@ from ainovel.models.outline import OutlineNode, OutlineVersion
 from ainovel.models.project import NovelProject
 
 VERSION_ALLOCATION_ATTEMPTS = 3
+OUTLINE_APPROVAL_CONFLICT_MESSAGE = "outline approval conflict"
+
+
+class OutlineApprovalConflict(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -60,6 +65,7 @@ class OutlineService:
             if project is None:
                 self.session.rollback()
                 raise ValueError("project not found")
+            self.session.refresh(project)
             base_version_id = project.official_outline_version_id
             if base_version_id is not None:
                 self._official_version_for_project(base_version_id, project_id)
@@ -122,13 +128,24 @@ class OutlineService:
         if project is None:
             self.session.rollback()
             raise ValueError("project not found")
-        previous_id = project.official_outline_version_id
+        base_version_id = version.base_version_id
+        pointer_matches_base = (
+            NovelProject.official_outline_version_id.is_(None)
+            if base_version_id is None
+            else NovelProject.official_outline_version_id == base_version_id
+        )
         try:
-            if previous_id is not None:
-                previous = self._official_version_for_project(previous_id, project.id)
+            result = self.session.execute(
+                update(NovelProject)
+                .where(NovelProject.id == project.id, pointer_matches_base)
+                .values(official_outline_version_id=version.id)
+            )
+            if result.rowcount != 1:
+                raise OutlineApprovalConflict(OUTLINE_APPROVAL_CONFLICT_MESSAGE)
+            if base_version_id is not None:
+                previous = self._official_version_for_project(base_version_id, project.id)
                 previous.status = "superseded"
             version.status = "official"
-            project.official_outline_version_id = version.id
             self.session.commit()
         except Exception:
             self.session.rollback()

@@ -1,7 +1,8 @@
 import pytest
+from sqlalchemy import select
 
 from ainovel.models.outline import OutlineVersion
-from ainovel.services.outlines import OutlineNodeInput, OutlineService
+from ainovel.services.outlines import OutlineApprovalConflict, OutlineNodeInput, OutlineService
 
 
 def test_candidate_outline_does_not_replace_official_project_version(session, project) -> None:
@@ -147,3 +148,52 @@ def test_compare_reports_stable_keys_without_database_fields(session, project) -
     assert diff.added == ["added"]
     assert diff.removed == ["removed"]
     assert diff.changed == ["changed"]
+
+def test_stale_candidate_approval_conflicts_without_creating_two_official_versions(
+    client, project
+) -> None:
+    with client.app.state.session_factory() as setup_session:
+        setup_service = OutlineService(setup_session)
+        initial = setup_service.create_candidate(
+            project.id,
+            [OutlineNodeInput(key="book", parent_key=None, kind="book", title="initial", order=0)],
+            reason="initial",
+        )
+        setup_service.approve(initial.id)
+
+    with client.app.state.session_factory() as first_candidate_session:
+        first_candidate = OutlineService(first_candidate_session).create_candidate(
+            project.id,
+            [OutlineNodeInput(key="book", parent_key=None, kind="book", title="first", order=0)],
+            reason="first",
+        )
+        first_candidate_id = first_candidate.id
+
+    with client.app.state.session_factory() as second_candidate_session:
+        second_candidate = OutlineService(second_candidate_session).create_candidate(
+            project.id,
+            [OutlineNodeInput(key="book", parent_key=None, kind="book", title="second", order=0)],
+            reason="second",
+        )
+        second_candidate_id = second_candidate.id
+
+    with client.app.state.session_factory() as stale_session:
+        stale_session.get(type(project), project.id)
+        with client.app.state.session_factory() as winning_session:
+            winner = OutlineService(winning_session).approve(first_candidate_id)
+            winner_id = winner.id
+
+        with pytest.raises(OutlineApprovalConflict, match="outline approval conflict"):
+            OutlineService(stale_session).approve(second_candidate_id)
+
+    with client.app.state.session_factory() as verify_session:
+        persisted_project = verify_session.get(type(project), project.id)
+        official_versions = verify_session.scalars(
+            select(OutlineVersion).where(
+                OutlineVersion.project_id == project.id,
+                OutlineVersion.status == "official",
+            )
+        ).all()
+
+    assert persisted_project.official_outline_version_id == winner_id
+    assert [version.id for version in official_versions] == [winner_id]
