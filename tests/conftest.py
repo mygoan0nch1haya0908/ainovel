@@ -19,3 +19,16 @@ def client(database_url: str) -> Iterator[TestClient]:
     Base.metadata.create_all(app.state.engine)
     with TestClient(app) as test_client:
         yield test_client
+
+
+@pytest.fixture
+def session(client: TestClient):
+    with client.app.state.session_factory() as db_session:
+        yield db_session
+        db_session.rollback()
+
+
+@pytest.fixture
+def project(session):
+    from ainovel.services.projects import ProjectService
+    return ProjectService(session).create("测试小说", 2_000_000, 5_000_000)
