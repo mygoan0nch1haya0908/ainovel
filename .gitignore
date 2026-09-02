@@ -1,0 +1,12 @@
+.worktrees/
+.superpowers/
+.venv/
+__pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
+*.pyc
+*.db
+*.db-shm
+*.db-wal
+.env
