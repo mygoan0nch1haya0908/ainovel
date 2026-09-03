@@ -45,3 +45,15 @@ def official_outline(session, project):
         reason="test outline",
     )
     return service.approve(candidate.id)
+
+
+@pytest.fixture
+def approved_chapter(session, project, official_outline):
+    from ainovel.services.batches import BatchService
+
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 1)
+    service.save_candidate_chapter(batch.id, 1, "已批准章", "甲" * 4500, {})
+    service.mark_ready(batch.id)
+    service.approve(batch.id, official_outline.id)
+    return service.list_chapters(batch.id)[0]

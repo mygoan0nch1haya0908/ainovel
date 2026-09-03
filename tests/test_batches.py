@@ -1,5 +1,7 @@
 import pytest
+from sqlalchemy import event, select
 
+from ainovel.models.audit import AuditEvent
 from ainovel.services.batches import BatchService
 from ainovel.services.counting import count_visible_characters
 from ainovel.services.outlines import OutlineNodeInput, OutlineService
@@ -133,3 +135,92 @@ def test_list_chapters_orders_candidates_by_ordinal(session, project, official_o
     service.save_candidate_chapter(batch.id, 1, "第一章", "正文", {})
 
     assert [chapter.ordinal for chapter in service.list_chapters(batch.id)] == [1, 2]
+
+
+def test_failed_approval_keeps_every_chapter_candidate(session, project, official_outline) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 2)
+    service.save_candidate_chapter(batch.id, 1, "一", "甲" * 4500, {"seq": 1})
+    service.save_candidate_chapter(batch.id, 2, "二", "乙" * 4500, {"seq": 2})
+    service.mark_ready(batch.id)
+
+    @event.listens_for(session, "before_commit", once=True)
+    def fail_commit(_session) -> None:
+        raise RuntimeError("simulated commit failure")
+
+    with pytest.raises(RuntimeError, match="simulated commit failure"):
+        service.approve(batch.id, official_outline.id)
+
+    session.rollback()
+    session.expire_all()
+    chapters = service.list_chapters(batch.id)
+    assert [chapter.status for chapter in chapters] == ["candidate", "candidate"]
+    assert service.get(batch.id).status != "approved"
+    assert session.scalars(
+        select(AuditEvent).where(
+            AuditEvent.entity_id == batch.id, AuditEvent.action == "batch_approved"
+        )
+    ).all() == []
+
+
+def test_approval_persists_official_chapters_and_one_event_in_new_session(
+    session, client, project, official_outline
+) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 2)
+    first = service.save_candidate_chapter(batch.id, 1, "一", "甲" * 4500, {"seq": 1})
+    second = service.save_candidate_chapter(batch.id, 2, "二", "乙" * 4500, {"seq": 2})
+    service.mark_ready(batch.id)
+
+    service.approve(batch.id, official_outline.id, actor="editor")
+
+    with client.app.state.session_factory() as second_session:
+        persisted = BatchService(second_session).list_chapters(batch.id)
+        event_record = second_session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.entity_type == "writing_batch",
+                AuditEvent.entity_id == batch.id,
+                AuditEvent.action == "batch_approved",
+            )
+        )
+        assert [chapter.status for chapter in persisted] == ["official", "official"]
+        assert [chapter.official_chapter_number for chapter in persisted] == [1, 2]
+        assert event_record is not None
+        assert event_record.actor == "editor"
+        assert event_record.details == {
+            "chapter_ids": [first.id, second.id],
+            "state_deltas": [{"seq": 1}, {"seq": 2}],
+        }
+
+
+def test_approval_requires_the_batches_existing_official_outline(
+    session, project, official_outline
+) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 1)
+    service.save_candidate_chapter(batch.id, 1, "一", "甲" * 4500, {})
+    service.mark_ready(batch.id)
+    replacement = OutlineService(session).create_candidate(
+        project.id,
+        [OutlineNodeInput(key="book", parent_key=None, kind="book", title="新版", order=0)],
+        reason="revision",
+    )
+    replacement = OutlineService(session).approve(replacement.id)
+
+    with pytest.raises(ValueError, match="batch.*official outline"):
+        service.approve(batch.id, replacement.id)
+
+    assert service.get(batch.id).status == "ready_for_review"
+
+
+def test_published_chapter_cannot_be_replaced(session, approved_chapter) -> None:
+    service = BatchService(session)
+    service.publish_chapter(approved_chapter.id)
+
+    with pytest.raises(PermissionError, match="published chapters are frozen"):
+        service.replace_candidate_body(approved_chapter.id, "新正文")
+
+
+def test_official_chapter_cannot_be_replaced(session, approved_chapter) -> None:
+    with pytest.raises(PermissionError, match="candidate chapters"):
+        BatchService(session).replace_candidate_body(approved_chapter.id, "新正文")

@@ -17,6 +17,7 @@ class NovelProject(TimestampMixin, Base):
     target_chars_max: Mapped[int] = mapped_column(Integer, nullable=False)
     official_outline_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     current_constitution_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    next_official_chapter_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
 
 class ConstitutionVersion(TimestampMixin, Base):

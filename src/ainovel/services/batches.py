@@ -3,9 +3,10 @@ from __future__ import annotations
 from copy import deepcopy
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
+from ainovel.models.audit import AuditEvent
 from ainovel.models.batch import Chapter, WritingBatch
 from ainovel.models.outline import OutlineVersion
 from ainovel.models.project import NovelProject
@@ -15,6 +16,7 @@ MIN_BATCH_CHAPTERS = 1
 MAX_BATCH_CHAPTERS = 5
 MIN_VISIBLE_CHARACTERS = 4500
 MAX_VISIBLE_CHARACTERS = 6000
+CHAPTER_NUMBER_ALLOCATION_ATTEMPTS = 3
 
 
 class BatchService:
@@ -48,6 +50,14 @@ class BatchService:
             status="draft",
         )
         self.session.add(batch)
+        self._add_audit(
+            project.id,
+            "writing_batch",
+            batch.id,
+            "batch_created",
+            "author",
+            {"base_outline_version_id": outline.id, "planned_chapters": planned_chapters},
+        )
         try:
             self.session.commit()
         except Exception:
@@ -114,25 +124,40 @@ class BatchService:
             raise
         return chapter
 
+    def replace_candidate_body(self, chapter_id: str, body: str) -> Chapter:
+        chapter = self.get_chapter(chapter_id)
+        if chapter.status == "published":
+            self.session.rollback()
+            raise PermissionError("published chapters are frozen")
+        if chapter.status != "candidate":
+            self.session.rollback()
+            raise PermissionError("only candidate chapters can be edited")
+        chapter.body = body
+        chapter.visible_char_count = count_visible_characters(body)
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return chapter
+
     def mark_ready(self, batch_id: str) -> WritingBatch:
         batch = self.get(batch_id)
         if batch.status != "draft":
             self.session.rollback()
             raise ValueError("only draft batches can be marked ready")
         chapters = self.list_chapters(batch.id)
-        expected_ordinals = set(range(1, batch.planned_chapters + 1))
-        if {chapter.ordinal for chapter in chapters} != expected_ordinals:
-            self.session.rollback()
-            raise ValueError("all planned chapter ordinals are required before review")
-        if any(
-            not MIN_VISIBLE_CHARACTERS
-            <= chapter.visible_char_count
-            <= MAX_VISIBLE_CHARACTERS
-            for chapter in chapters
-        ):
-            self.session.rollback()
-            raise ValueError("chapter visible character counts must be between 4500 and 6000")
+        self._validate_planned_chapters(batch, chapters)
+        self._validate_visible_counts(chapters)
         batch.status = "ready_for_review"
+        self._add_audit(
+            batch.project_id,
+            "writing_batch",
+            batch.id,
+            "batch_ready",
+            "author",
+            {"chapter_ids": [chapter.id for chapter in chapters]},
+        )
         try:
             self.session.commit()
         except Exception:
@@ -141,12 +166,145 @@ class BatchService:
         return batch
 
     def reject(self, batch_id: str, reason: str) -> WritingBatch:
-        del reason
         batch = self.get(batch_id)
+        if batch.status not in {"draft", "ready_for_review"}:
+            self.session.rollback()
+            raise ValueError("only draft or ready batches can be rejected")
         batch.status = "rejected"
+        self._add_audit(
+            batch.project_id,
+            "writing_batch",
+            batch.id,
+            "batch_rejected",
+            "author",
+            {"reason": reason},
+        )
         try:
             self.session.commit()
         except Exception:
             self.session.rollback()
             raise
         return batch
+
+    def approve(
+        self, batch_id: str, approved_outline_version_id: str, actor: str = "author"
+    ) -> WritingBatch:
+        for attempt in range(CHAPTER_NUMBER_ALLOCATION_ATTEMPTS):
+            try:
+                batch = self.get(batch_id)
+                if batch.status != "ready_for_review":
+                    raise ValueError("only ready batches can be approved")
+                chapters = self.list_chapters(batch.id)
+                self._validate_planned_chapters(batch, chapters)
+                self._validate_visible_counts(chapters)
+                if any(chapter.status != "candidate" for chapter in chapters):
+                    raise ValueError("only candidate chapters can be approved")
+                project = self.session.get(NovelProject, batch.project_id)
+                if project is None:
+                    raise ValueError("project not found")
+                outline = self.session.get(OutlineVersion, approved_outline_version_id)
+                if (
+                    outline is None
+                    or approved_outline_version_id != batch.base_outline_version_id
+                    or outline.project_id != batch.project_id
+                    or outline.status != "official"
+                    or project.official_outline_version_id != outline.id
+                ):
+                    raise ValueError("approval requires the batch's existing official outline")
+
+                self.session.refresh(project)
+                first_number = project.next_official_chapter_number
+                reservation = self.session.execute(
+                    update(NovelProject)
+                    .where(
+                        NovelProject.id == project.id,
+                        NovelProject.next_official_chapter_number == first_number,
+                    )
+                    .values(
+                        next_official_chapter_number=first_number + len(chapters),
+                        official_outline_version_id=outline.id,
+                    )
+                )
+                if reservation.rowcount != 1:
+                    self.session.rollback()
+                    if attempt == CHAPTER_NUMBER_ALLOCATION_ATTEMPTS - 1:
+                        raise RuntimeError("official chapter number allocation exhausted")
+                    continue
+
+                for number, chapter in enumerate(chapters, start=first_number):
+                    chapter.status = "official"
+                    chapter.official_chapter_number = number
+                batch.status = "approved"
+                self._add_audit(
+                    batch.project_id,
+                    "writing_batch",
+                    batch.id,
+                    "batch_approved",
+                    actor,
+                    {
+                        "chapter_ids": [chapter.id for chapter in chapters],
+                        "state_deltas": [deepcopy(chapter.state_delta) for chapter in chapters],
+                    },
+                )
+                self.session.commit()
+                return batch
+            except Exception:
+                self.session.rollback()
+                raise
+        raise RuntimeError("official chapter number allocation exhausted")
+
+    def publish_chapter(self, chapter_id: str) -> Chapter:
+        chapter = self.get_chapter(chapter_id)
+        if chapter.status != "official":
+            self.session.rollback()
+            raise ValueError("only official chapters can be published")
+        chapter.status = "published"
+        self._add_audit(
+            chapter.project_id,
+            "chapter",
+            chapter.id,
+            "chapter_published",
+            "author",
+            {"official_chapter_number": chapter.official_chapter_number},
+        )
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return chapter
+
+    @staticmethod
+    def _validate_planned_chapters(batch: WritingBatch, chapters: list[Chapter]) -> None:
+        expected_ordinals = set(range(1, batch.planned_chapters + 1))
+        if len(chapters) != batch.planned_chapters or {chapter.ordinal for chapter in chapters} != expected_ordinals:
+            raise ValueError("all planned chapter ordinals are required before review")
+
+    @staticmethod
+    def _validate_visible_counts(chapters: list[Chapter]) -> None:
+        if any(
+            not MIN_VISIBLE_CHARACTERS <= chapter.visible_char_count <= MAX_VISIBLE_CHARACTERS
+            for chapter in chapters
+        ):
+            raise ValueError("chapter visible character counts must be between 4500 and 6000")
+
+    def _add_audit(
+        self,
+        project_id: str,
+        entity_type: str,
+        entity_id: str,
+        action: str,
+        actor: str,
+        details: dict[str, object],
+    ) -> None:
+        self.session.add(
+            AuditEvent(
+                id=str(uuid4()),
+                project_id=project_id,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                action=action,
+                actor=actor,
+                details=deepcopy(details),
+            )
+        )
