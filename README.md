@@ -23,6 +23,8 @@ For an existing local database, apply all available migrations before running th
 .\.venv\Scripts\alembic upgrade head
 ```
 
+Pytest is configured to keep temporary test artifacts in the worktree-local `.pytest-tmp` directory, which Git ignores.
+
 ## Tests
 
 ```powershell
