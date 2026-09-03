@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}{{ summary.project.title }} · AI 小说工作台{% endblock %}
+{% block content %}
+<h1>{{ summary.project.title }}</h1>
+<p>目标字数：{{ summary.project.target_chars_min }} 至 {{ summary.project.target_chars_max }}</p>
+<section aria-labelledby="versions-heading"><h2 id="versions-heading">当前版本</h2>
+  <p>创作宪法：{% if summary.current_constitution_version_number %}v{{ summary.current_constitution_version_number }}{% else %}尚未确认{% endif %}</p>
+  <p>官方大纲：{% if official_outline %}v{{ official_outline.version_number }}{% else %}尚未确认{% endif %}</p>
+</section>
+<section aria-labelledby="official-heading"><h2 id="official-heading">官方正文</h2>
+  <p>官方章节：{{ statistics.chapter_count }} 章</p><p>可见字数：{{ statistics.visible_character_count }}</p>
+</section>
+<aside><p>模型生成将在第二阶段引入；当前仅提供本地项目与审批流程。</p></aside>
+<section aria-labelledby="batch-create-heading"><h2 id="batch-create-heading">创建候选批次</h2>
+{% if official_outline %}<form action="/projects/{{ summary.project.id }}/batches" method="post"><p><label for="planned_chapters">计划章节数（1 至 5）</label><input id="planned_chapters" name="planned_chapters" type="number" min="1" max="5" required></p><button type="submit">创建候选批次</button></form>{% else %}<p>请先创建并确认官方大纲后再创建批次。</p>{% endif %}
+</section>
+<section aria-labelledby="batches-heading"><h2 id="batches-heading">候选批次</h2>
+{% if batches %}<ul>{% for batch in batches %}<li>
+<p>批次 {{ batch.id }}：{{ batch.planned_chapters }} 章，状态：{{ batch_status_labels[batch.status] }}</p>
+{% if batch.status == "draft" %}<form action="/batches/{{ batch.id }}/ready" method="post" data-confirm="确认提交此批次审批？"><button type="submit">提交审批</button></form>{% endif %}
+{% if batch.status == "ready_for_review" %}<form action="/batches/{{ batch.id }}/approve" method="post" data-confirm="确认批准此批次？"><button type="submit">批准</button></form>{% endif %}
+{% if batch.status in ["draft", "ready_for_review"] %}<form action="/batches/{{ batch.id }}/reject" method="post" data-confirm="确认驳回此批次？"><p><label for="reason-{{ batch.id }}">驳回原因</label><input id="reason-{{ batch.id }}" name="reason" required></p><button type="submit">驳回</button></form>{% endif %}
+</li>{% endfor %}</ul>{% else %}<p>暂无候选批次</p>{% endif %}
+</section>
+<section aria-labelledby="audit-heading"><h2 id="audit-heading">审计记录</h2>
+{% if audit_events %}<ol>{% for event in audit_events %}<li>{{ audit_action_labels.get(event.action, event.action) }}（{{ event.actor }}）</li>{% endfor %}</ol>{% else %}<p>暂无审计记录</p>{% endif %}
+</section>
+{% endblock %}

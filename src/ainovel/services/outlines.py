@@ -203,6 +203,14 @@ class OutlineService:
             select(func.count()).select_from(OutlineVersion).where(OutlineVersion.project_id == project_id)
         ) or 0
 
+    def current_official_for_project(self, project_id: str) -> OutlineVersion | None:
+        project = self.session.get(NovelProject, project_id)
+        if project is None:
+            raise ValueError("project not found")
+        if project.official_outline_version_id is None:
+            return None
+        return self._official_version_for_project(project.official_outline_version_id, project.id)
+
     def _get_version(self, version_id: str) -> OutlineVersion:
         version = self.session.get(OutlineVersion, version_id)
         if version is None:

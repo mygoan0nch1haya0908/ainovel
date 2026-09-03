@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from uuid import uuid4
 
 from sqlalchemy import func, select
@@ -7,6 +8,12 @@ from sqlalchemy.orm import Session
 from ainovel.models.project import ConstitutionVersion, NovelProject
 
 VERSION_ALLOCATION_ATTEMPTS = 3
+
+
+@dataclass(frozen=True)
+class ProjectSummary:
+    project: NovelProject
+    current_constitution_version_number: int | None
 
 
 class ProjectService:
@@ -42,6 +49,23 @@ class ProjectService:
         if project is None:
             raise ValueError("project not found")
         return project
+
+    def list_projects(self) -> list[NovelProject]:
+        return self.session.scalars(
+            select(NovelProject).order_by(NovelProject.created_at.desc())
+        ).all()
+
+    def summary(self, project_id: str) -> ProjectSummary:
+        project = self.get(project_id)
+        version_number = None
+        if project.current_constitution_version_id is not None:
+            version_number = self.session.scalar(
+                select(ConstitutionVersion.version_number).where(
+                    ConstitutionVersion.id == project.current_constitution_version_id,
+                    ConstitutionVersion.project_id == project.id,
+                )
+            )
+        return ProjectSummary(project, version_number)
 
     def add_constitution(
         self, project_id: str, content: dict[str, object], author_approved: bool

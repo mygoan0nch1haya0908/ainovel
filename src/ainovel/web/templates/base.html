@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}AI 小说工作台{% endblock %}</title>
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header><p><a href="/">AI 小说工作台</a></p></header>
+  {% if error %}<p role="status">{{ error }}</p>{% else %}<p role="status">本地优先，您的数据保留在此环境中。</p>{% endif %}
+  <main>{% block content %}{% endblock %}</main>
+</body>
+</html>

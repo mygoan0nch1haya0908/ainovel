@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass
 from uuid import uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from ainovel.models.audit import AuditEvent
@@ -17,6 +18,12 @@ MAX_BATCH_CHAPTERS = 5
 MIN_VISIBLE_CHARACTERS = 4500
 MAX_VISIBLE_CHARACTERS = 6000
 CHAPTER_NUMBER_ALLOCATION_ATTEMPTS = 3
+
+
+@dataclass(frozen=True)
+class OfficialChapterStatistics:
+    chapter_count: int
+    visible_character_count: int
 
 
 class BatchService:
@@ -81,6 +88,32 @@ class BatchService:
         self.get(batch_id)
         return self.session.scalars(
             select(Chapter).where(Chapter.batch_id == batch_id).order_by(Chapter.ordinal)
+        ).all()
+
+    def list_for_project(self, project_id: str) -> list[WritingBatch]:
+        return self.session.scalars(
+            select(WritingBatch)
+            .where(WritingBatch.project_id == project_id)
+            .order_by(WritingBatch.created_at.desc())
+        ).all()
+
+    def official_chapter_statistics(self, project_id: str) -> OfficialChapterStatistics:
+        chapter_count, visible_character_count = self.session.execute(
+            select(
+                func.count(Chapter.id),
+                func.coalesce(func.sum(Chapter.visible_char_count), 0),
+            ).where(
+                Chapter.project_id == project_id,
+                Chapter.official_chapter_number.is_not(None),
+            )
+        ).one()
+        return OfficialChapterStatistics(chapter_count, visible_character_count)
+
+    def list_audit_events(self, project_id: str) -> list[AuditEvent]:
+        return self.session.scalars(
+            select(AuditEvent)
+            .where(AuditEvent.project_id == project_id)
+            .order_by(AuditEvent.created_at.desc())
         ).all()
 
     def save_candidate_chapter(
