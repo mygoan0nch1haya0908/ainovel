@@ -41,5 +41,6 @@ class Chapter(TimestampMixin, Base):
     body: Mapped[str] = mapped_column(Text, nullable=False)
     visible_char_count: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     state_delta: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     official_chapter_number: Mapped[int | None] = mapped_column(Integer, nullable=True)

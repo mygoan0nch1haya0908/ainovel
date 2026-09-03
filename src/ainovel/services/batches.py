@@ -115,6 +115,7 @@ class BatchService:
             status="candidate",
             state_delta=deepcopy(state_delta),
             official_chapter_number=None,
+            revision=1,
         )
         self.session.add(chapter)
         try:
@@ -125,6 +126,7 @@ class BatchService:
         return chapter
 
     def replace_candidate_body(self, chapter_id: str, body: str) -> Chapter:
+        self.session.expire_all()
         chapter = self.get_chapter(chapter_id)
         if chapter.status == "published":
             self.session.rollback()
@@ -132,16 +134,33 @@ class BatchService:
         if chapter.status != "candidate":
             self.session.rollback()
             raise PermissionError("only candidate chapters can be edited")
-        chapter.body = body
-        chapter.visible_char_count = count_visible_characters(body)
+        visible_char_count = count_visible_characters(body)
+        result = self.session.execute(
+            update(Chapter)
+            .where(
+                Chapter.id == chapter.id,
+                Chapter.status == "candidate",
+                Chapter.revision == chapter.revision,
+            )
+            .values(
+                body=body,
+                visible_char_count=visible_char_count,
+                revision=chapter.revision + 1,
+            )
+        )
+        if result.rowcount != 1:
+            self.session.rollback()
+            raise PermissionError("candidate body replacement conflict")
         try:
             self.session.commit()
         except Exception:
             self.session.rollback()
             raise
-        return chapter
+        self.session.expire_all()
+        return self.get_chapter(chapter.id)
 
     def mark_ready(self, batch_id: str) -> WritingBatch:
+        self.session.expire_all()
         batch = self.get(batch_id)
         if batch.status != "draft":
             self.session.rollback()
@@ -149,7 +168,14 @@ class BatchService:
         chapters = self.list_chapters(batch.id)
         self._validate_planned_chapters(batch, chapters)
         self._validate_visible_counts(chapters)
-        batch.status = "ready_for_review"
+        claim = self.session.execute(
+            update(WritingBatch)
+            .where(WritingBatch.id == batch.id, WritingBatch.status == "draft")
+            .values(status="ready_for_review")
+        )
+        if claim.rowcount != 1:
+            self.session.rollback()
+            raise ValueError("batch ready conflict")
         self._add_audit(
             batch.project_id,
             "writing_batch",
@@ -163,14 +189,23 @@ class BatchService:
         except Exception:
             self.session.rollback()
             raise
-        return batch
+        self.session.expire_all()
+        return self.get(batch.id)
 
     def reject(self, batch_id: str, reason: str) -> WritingBatch:
+        self.session.expire_all()
         batch = self.get(batch_id)
         if batch.status not in {"draft", "ready_for_review"}:
             self.session.rollback()
             raise ValueError("only draft or ready batches can be rejected")
-        batch.status = "rejected"
+        claim = self.session.execute(
+            update(WritingBatch)
+            .where(WritingBatch.id == batch.id, WritingBatch.status == batch.status)
+            .values(status="rejected")
+        )
+        if claim.rowcount != 1:
+            self.session.rollback()
+            raise ValueError("batch rejection conflict")
         self._add_audit(
             batch.project_id,
             "writing_batch",
@@ -184,21 +219,23 @@ class BatchService:
         except Exception:
             self.session.rollback()
             raise
-        return batch
+        self.session.expire_all()
+        return self.get(batch.id)
 
     def approve(
         self, batch_id: str, approved_outline_version_id: str, actor: str = "author"
     ) -> WritingBatch:
         for attempt in range(CHAPTER_NUMBER_ALLOCATION_ATTEMPTS):
+            self.session.expire_all()
             try:
                 batch = self.get(batch_id)
                 if batch.status != "ready_for_review":
-                    raise ValueError("only ready batches can be approved")
+                    raise ValueError("approval conflict")
                 chapters = self.list_chapters(batch.id)
                 self._validate_planned_chapters(batch, chapters)
                 self._validate_visible_counts(chapters)
                 if any(chapter.status != "candidate" for chapter in chapters):
-                    raise ValueError("only candidate chapters can be approved")
+                    raise ValueError("approval conflict")
                 project = self.session.get(NovelProject, batch.project_id)
                 if project is None:
                     raise ValueError("project not found")
@@ -207,58 +244,102 @@ class BatchService:
                     outline is None
                     or approved_outline_version_id != batch.base_outline_version_id
                     or outline.project_id != batch.project_id
-                    or outline.status != "official"
-                    or project.official_outline_version_id != outline.id
                 ):
                     raise ValueError("approval requires the batch's existing official outline")
+                if outline.status != "official":
+                    raise ValueError("approval conflict")
+                if project.official_outline_version_id != outline.id:
+                    raise ValueError("approval conflict")
 
-                self.session.refresh(project)
+                batch_claim = self.session.execute(
+                    update(WritingBatch)
+                    .where(
+                        WritingBatch.id == batch.id,
+                        WritingBatch.status == "ready_for_review",
+                    )
+                    .values(status="approved")
+                )
+                if batch_claim.rowcount != 1:
+                    self.session.rollback()
+                    raise ValueError("approval conflict")
+
                 first_number = project.next_official_chapter_number
                 reservation = self.session.execute(
                     update(NovelProject)
                     .where(
                         NovelProject.id == project.id,
                         NovelProject.next_official_chapter_number == first_number,
+                        NovelProject.official_outline_version_id == approved_outline_version_id,
                     )
-                    .values(
-                        next_official_chapter_number=first_number + len(chapters),
-                        official_outline_version_id=outline.id,
-                    )
+                    .values(next_official_chapter_number=first_number + len(chapters))
                 )
                 if reservation.rowcount != 1:
                     self.session.rollback()
                     if attempt == CHAPTER_NUMBER_ALLOCATION_ATTEMPTS - 1:
-                        raise RuntimeError("official chapter number allocation exhausted")
+                        raise ValueError("approval conflict")
                     continue
 
                 for number, chapter in enumerate(chapters, start=first_number):
-                    chapter.status = "official"
-                    chapter.official_chapter_number = number
-                batch.status = "approved"
-                self._add_audit(
-                    batch.project_id,
-                    "writing_batch",
-                    batch.id,
-                    "batch_approved",
-                    actor,
-                    {
-                        "chapter_ids": [chapter.id for chapter in chapters],
-                        "state_deltas": [deepcopy(chapter.state_delta) for chapter in chapters],
-                    },
-                )
-                self.session.commit()
-                return batch
+                    promotion = self.session.execute(
+                        update(Chapter)
+                        .where(
+                            Chapter.id == chapter.id,
+                            Chapter.status == "candidate",
+                            Chapter.revision == chapter.revision,
+                            Chapter.body == chapter.body,
+                            Chapter.visible_char_count == chapter.visible_char_count,
+                        )
+                        .values(
+                            status="official",
+                            official_chapter_number=number,
+                            revision=chapter.revision + 1,
+                        )
+                    )
+                    if promotion.rowcount != 1:
+                        self.session.rollback()
+                        if attempt == CHAPTER_NUMBER_ALLOCATION_ATTEMPTS - 1:
+                            raise ValueError("approval conflict")
+                        break
+                else:
+                    self._add_audit(
+                        batch.project_id,
+                        "writing_batch",
+                        batch.id,
+                        "batch_approved",
+                        actor,
+                        {
+                            "chapter_ids": [chapter.id for chapter in chapters],
+                            "state_deltas": [deepcopy(chapter.state_delta) for chapter in chapters],
+                        },
+                    )
+                    self.session.commit()
+                    self.session.expire_all()
+                    return self.get(batch.id)
             except Exception:
                 self.session.rollback()
                 raise
-        raise RuntimeError("official chapter number allocation exhausted")
+        raise ValueError("approval conflict")
 
     def publish_chapter(self, chapter_id: str) -> Chapter:
+        self.session.expire_all()
         chapter = self.get_chapter(chapter_id)
         if chapter.status != "official":
             self.session.rollback()
+            if chapter.status == "published":
+                raise ValueError("publication conflict")
             raise ValueError("only official chapters can be published")
-        chapter.status = "published"
+        claim = self.session.execute(
+            update(Chapter)
+            .where(
+                Chapter.id == chapter.id,
+                Chapter.status == "official",
+                Chapter.revision == chapter.revision,
+            )
+            .values(status="published", revision=chapter.revision + 1)
+        )
+        if claim.rowcount != 1:
+            self.session.rollback()
+            raise ValueError("publication conflict")
         self._add_audit(
             chapter.project_id,
             "chapter",
@@ -272,7 +353,8 @@ class BatchService:
         except Exception:
             self.session.rollback()
             raise
-        return chapter
+        self.session.expire_all()
+        return self.get_chapter(chapter.id)
 
     @staticmethod
     def _validate_planned_chapters(batch: WritingBatch, chapters: list[Chapter]) -> None:
