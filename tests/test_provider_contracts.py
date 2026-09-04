@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import traceback
+
 import pytest
 from pydantic import ValidationError
 
@@ -88,6 +90,31 @@ def test_demo_fake_can_generate_an_exact_length_chapter() -> None:
     assert count_visible_characters(draft.body) == 4500
 
 
+
+@pytest.mark.parametrize("length", [4499, 6001])
+def test_chapter_draft_rejects_body_outside_visible_character_limits(length: int) -> None:
+    with pytest.raises(ValidationError, match="4500.*6000"):
+        ChapterDraft.model_validate({"title": "演示", "body": "演" * length})
+
+
+def test_runner_hides_invalid_provider_payload_from_rendered_traceback() -> None:
+    secret = "hidden-provider-reasoning-should-not-be-logged"
+    provider = FakeProvider([
+        ModelResponse(
+            structured={"chapters": [], "hidden_reasoning": secret},
+            text=None,
+            provider_response_id=None,
+            input_tokens=None,
+            output_tokens=None,
+            latency_ms=1,
+        )
+    ])
+
+    with pytest.raises(ProviderProtocolError) as error:
+        AgentRunner().run(provider, batch_plan_request(), BatchPlanDraft)
+
+    rendered = "".join(traceback.format_exception(error.type, error.value, error.tb))
+    assert secret not in rendered
 def test_batch_plan_requires_contiguous_ordinals() -> None:
     with pytest.raises(ValidationError, match="contiguous"):
         BatchPlanDraft.model_validate(

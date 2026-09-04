@@ -19,4 +19,4 @@ class AgentRunner:
         try:
             return result_type.model_validate(response.structured)
         except ValidationError as error:
-            raise ProviderProtocolError("provider returned invalid structured output") from error
+            raise ProviderProtocolError("provider returned invalid structured output") from None

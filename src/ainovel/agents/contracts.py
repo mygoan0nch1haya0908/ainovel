@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from ainovel.services.counting import count_visible_characters
 
 
 class AgentSchema(BaseModel):
@@ -42,6 +43,13 @@ class ChapterDraft(AgentSchema):
             raise ValueError("text must be nonblank")
         return value
 
+    @field_validator("body")
+    @classmethod
+    def body_has_valid_visible_character_count(cls, value: str) -> str:
+        visible_count = count_visible_characters(value)
+        if not 4500 <= visible_count <= 6000:
+            raise ValueError("body must contain between 4500 and 6000 visible characters")
+        return value
 
 class ChapterSummaryDelta(AgentSchema):
     summary: str
