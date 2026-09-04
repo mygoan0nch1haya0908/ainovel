@@ -156,6 +156,11 @@ def upgrade() -> None:
         ),
         sa.ForeignKeyConstraint(["workflow_id"], ["generation_workflows.id"]),
         sa.PrimaryKeyConstraint("id"),
+        sa.CheckConstraint(
+            "(lease_owner IS NULL AND lease_expires_at IS NULL) OR "
+            "(lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)",
+            name="ck_workflow_steps_lease_pair",
+        ),
         sa.UniqueConstraint("workflow_id", "kind", "ordinal"),
         sa.UniqueConstraint("workflow_id", "position"),
     )
@@ -164,6 +169,13 @@ def upgrade() -> None:
         "workflow_steps",
         ["workflow_id", "status"],
         unique=False,
+    )
+    op.create_index(
+        "uq_workflow_steps_one_null_ordinal_kind",
+        "workflow_steps",
+        ["workflow_id", "kind"],
+        unique=True,
+        sqlite_where=sa.text("ordinal IS NULL"),
     )
 
     op.create_table(
@@ -294,6 +306,9 @@ def downgrade() -> None:
     op.drop_table("plan_decisions")
     op.drop_table("workflow_artifacts")
     op.drop_table("model_attempts")
+    op.drop_index(
+        "uq_workflow_steps_one_null_ordinal_kind", table_name="workflow_steps"
+    )
     op.drop_index(
         "ix_workflow_steps_workflow_status", table_name="workflow_steps"
     )

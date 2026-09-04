@@ -1,12 +1,46 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, text
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.types import TypeDecorator
 
 from ainovel.models.base import Base, TimestampMixin
+
+
+class UTCDateTime(TypeDecorator[datetime]):
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value: datetime | None, dialect) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("UTCDateTime requires a timezone-aware datetime")
+        normalized = value.astimezone(timezone.utc)
+        if dialect.name == "sqlite":
+            return normalized.replace(tzinfo=None)
+        return normalized
+
+    def process_result_value(self, value: datetime | None, _dialect) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
 
 
 class GenerationWorkflow(TimestampMixin, Base):
@@ -56,6 +90,18 @@ class WorkflowStep(Base):
     __table_args__ = (
         UniqueConstraint("workflow_id", "position"),
         UniqueConstraint("workflow_id", "kind", "ordinal"),
+        CheckConstraint(
+            "(lease_owner IS NULL AND lease_expires_at IS NULL) OR "
+            "(lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)",
+            name="ck_workflow_steps_lease_pair",
+        ),
+        Index(
+            "uq_workflow_steps_one_null_ordinal_kind",
+            "workflow_id",
+            "kind",
+            unique=True,
+            sqlite_where=text("ordinal IS NULL"),
+        ),
         Index("ix_workflow_steps_workflow_status", "workflow_id", "status"),
     )
 
@@ -73,7 +119,7 @@ class WorkflowStep(Base):
     active_artifact_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
+        UTCDateTime(), nullable=True
     )
     revision: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default=text("1")
