@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from time import perf_counter
 from typing import Any
 
@@ -19,12 +20,44 @@ from ainovel.providers.contracts import (
 
 
 class OpenAIProvider:
-    def __init__(self, client: OpenAI, allow_real_calls: bool) -> None:
+    def __init__(
+        self,
+        client: OpenAI,
+        allow_real_calls: bool,
+        context_window_limit: int = 16_000,
+        max_output_tokens_limit: int = 4_000,
+        model_capabilities: Mapping[str, ProviderCapabilities] | None = None,
+    ) -> None:
+        self._validate_limit(context_window_limit)
+        self._validate_limit(max_output_tokens_limit)
+        for capability in (model_capabilities or {}).values():
+            self._validate_limit(capability.context_window)
+            self._validate_limit(capability.max_output_tokens)
         self._client = client
         self._allow_real_calls = allow_real_calls
+        self._context_window_limit = context_window_limit
+        self._max_output_tokens_limit = max_output_tokens_limit
+        self._model_capabilities = dict(model_capabilities or {})
 
     def capabilities(self, model: str) -> ProviderCapabilities:
-        return ProviderCapabilities(128000, 16000, True, True, False, self._allow_real_calls)
+        override = self._model_capabilities.get(model)
+        if override is None:
+            return ProviderCapabilities(
+                self._context_window_limit,
+                self._max_output_tokens_limit,
+                True,
+                True,
+                False,
+                self._allow_real_calls,
+            )
+        return ProviderCapabilities(
+            min(self._context_window_limit, override.context_window),
+            min(self._max_output_tokens_limit, override.max_output_tokens),
+            override.strict_structured_output,
+            override.token_counting,
+            False,
+            self._allow_real_calls and override.real_calls_allowed,
+        )
 
     def generate(self, request: ModelRequest) -> ModelResponse:
         if not self._allow_real_calls:
@@ -48,6 +81,7 @@ class OpenAIProvider:
                     }
                 },
                 max_output_tokens=request.max_output_tokens,
+                timeout=request.timeout_seconds,
             )
         except AuthenticationError as error:
             raise ProviderAuthenticationError("OpenAI authentication failed") from None
@@ -94,3 +128,8 @@ class OpenAIProvider:
     @staticmethod
     def _optional_string(value: Any) -> str | None:
         return value if isinstance(value, str) else None
+
+    @staticmethod
+    def _validate_limit(value: int) -> None:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("provider capability limits must be positive integers")

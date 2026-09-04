@@ -6,14 +6,19 @@ from types import SimpleNamespace
 from typing import Any
 
 import httpx
+import httpx2
 import pytest
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AuthenticationError
 
 from ainovel.agents.contracts import ChapterSummaryDelta
 from ainovel.providers.contracts import (
     ModelRequest,
     ProviderAuthenticationError,
+    ProviderCapabilities,
+    ProviderDiagnostic,
     ProviderProtocolError,
     ProviderTimeout,
+    ProviderUnavailable,
 )
 from ainovel.providers.ollama import OllamaProvider
 from ainovel.providers.openai import OpenAIProvider
@@ -176,6 +181,7 @@ def test_openai_parses_output_text_and_maps_usage(fake_openai_client: FakeOpenAI
                 }
             },
             "max_output_tokens": request.max_output_tokens,
+            "timeout": request.timeout_seconds,
         }
     ]
 
@@ -205,6 +211,132 @@ def test_openai_rejects_malformed_output_without_leaking_secret(caplog: pytest.L
     assert secret not in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("sdk_error", "expected_error"),
+    [
+        (
+            lambda secret: AuthenticationError(
+                secret,
+                response=httpx2.Response(401, request=httpx2.Request("POST", "https://api.test")),
+                body=None,
+            ),
+            ProviderAuthenticationError,
+        ),
+        (
+            lambda secret: APITimeoutError(
+                httpx2.Request("POST", f"https://{secret}.test")
+            ),
+            ProviderTimeout,
+        ),
+        (
+            lambda secret: APIConnectionError(
+                message=secret,
+                request=httpx2.Request("POST", "https://api.test"),
+            ),
+            ProviderUnavailable,
+        ),
+        (
+            lambda secret: APIStatusError(
+                secret,
+                response=httpx2.Response(500, request=httpx2.Request("POST", "https://api.test")),
+                body=None,
+            ),
+            ProviderProtocolError,
+        ),
+    ],
+)
+def test_openai_classifies_sdk_errors_without_leaking_secrets(
+    caplog: pytest.LogCaptureFixture,
+    sdk_error: Any,
+    expected_error: type[Exception],
+) -> None:
+    secret = "openai-sdk-sentinel"
+    client = FakeOpenAIClient(sdk_error(secret))
+
+    with pytest.raises(expected_error) as error:
+        OpenAIProvider(client, allow_real_calls=True).generate(make_summary_request())
+
+    assert secret not in str(error.value)
+    assert secret not in caplog.text
+    assert secret not in "".join(traceback.format_exception(error.type, error.value, error.tb))
+
+
+def test_ollama_rejects_non_successful_chat_response_without_leaking_secret(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "ollama-status-sentinel"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text=secret, request=request)
+
+    provider = OllamaProvider(httpx.Client(transport=httpx.MockTransport(handler)), "http://ollama.test")
+
+    with pytest.raises(ProviderProtocolError) as error:
+        provider.generate(make_summary_request())
+
+    assert secret not in str(error.value)
+    assert secret not in caplog.text
+    assert secret not in "".join(traceback.format_exception(error.type, error.value, error.tb))
+
+
+def test_ollama_diagnose_classifies_unsuccessful_response_without_leaking_secret(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "ollama-diagnose-sentinel"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text=secret, request=request)
+
+    provider = OllamaProvider(httpx.Client(transport=httpx.MockTransport(handler)), "http://ollama.test")
+
+    diagnostic = provider.diagnose()
+
+    assert diagnostic == ProviderDiagnostic(False, "Ollama service is unavailable", ())
+    assert secret not in diagnostic.detail
+    assert secret not in caplog.text
+
+
+def test_provider_capability_ceilings_and_overrides_are_injected() -> None:
+    model_override = ProviderCapabilities(2_048, 512, True, False, True, True)
+    ollama = OllamaProvider(
+        httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, request=request))),
+        "http://ollama.test",
+        context_window_limit=8_000,
+        max_output_tokens_limit=1_000,
+        model_capabilities={"compact": model_override},
+    )
+    openai = OpenAIProvider(
+        FakeOpenAIClient(SimpleNamespace()),
+        allow_real_calls=True,
+        context_window_limit=6_000,
+        max_output_tokens_limit=900,
+    )
+
+    assert ollama.capabilities("unknown") == ProviderCapabilities(8_000, 1_000, True, True, True, True)
+    assert ollama.capabilities("compact") == ProviderCapabilities(2_048, 512, True, False, True, True)
+    assert openai.capabilities("any") == ProviderCapabilities(6_000, 900, True, True, False, True)
+
+
+@pytest.mark.parametrize(
+    "constructor",
+    [
+        lambda: OllamaProvider(
+            httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, request=request))),
+            "http://ollama.test",
+            context_window_limit=0,
+        ),
+        lambda: OpenAIProvider(
+            FakeOpenAIClient(SimpleNamespace()),
+            allow_real_calls=True,
+            max_output_tokens_limit=0,
+        ),
+    ],
+)
+def test_provider_capability_limits_must_be_positive(constructor: Any) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        constructor()
+
+
 def test_registry_rejects_unknown_provider_name(fake_openai_client: FakeOpenAIClient) -> None:
     registry = ProviderRegistry(
         {
@@ -216,3 +348,20 @@ def test_registry_rejects_unknown_provider_name(fake_openai_client: FakeOpenAICl
 
     with pytest.raises(ProviderProtocolError, match="unknown provider"):
         registry.get("not-a-provider")  # type: ignore[arg-type]
+
+
+def test_registry_calls_its_factory_for_each_lookup() -> None:
+    created: list[object] = []
+
+    def factory() -> object:
+        instance = object()
+        created.append(instance)
+        return instance
+
+    registry = ProviderRegistry({"fake": factory})
+
+    first = registry.get("fake")
+    second = registry.get("fake")
+
+    assert first is not second
+    assert created == [first, second]

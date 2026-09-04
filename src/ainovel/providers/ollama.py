@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from time import perf_counter
 from typing import Any
 
@@ -18,12 +19,39 @@ from ainovel.providers.contracts import (
 
 
 class OllamaProvider:
-    def __init__(self, client: httpx.Client, base_url: str) -> None:
+    def __init__(
+        self,
+        client: httpx.Client,
+        base_url: str,
+        context_window_limit: int = 16_000,
+        max_output_tokens_limit: int = 4_000,
+        model_capabilities: Mapping[str, ProviderCapabilities] | None = None,
+    ) -> None:
+        self._validate_limit(context_window_limit)
+        self._validate_limit(max_output_tokens_limit)
+        for capability in (model_capabilities or {}).values():
+            self._validate_limit(capability.context_window)
+            self._validate_limit(capability.max_output_tokens)
         self._client = client
         self._base_url = base_url.rstrip("/")
+        self._context_window_limit = context_window_limit
+        self._max_output_tokens_limit = max_output_tokens_limit
+        self._model_capabilities = dict(model_capabilities or {})
 
     def capabilities(self, model: str) -> ProviderCapabilities:
-        return ProviderCapabilities(128000, 16000, True, True, True, True)
+        override = self._model_capabilities.get(model)
+        if override is None:
+            return ProviderCapabilities(
+                self._context_window_limit, self._max_output_tokens_limit, True, True, True, True
+            )
+        return ProviderCapabilities(
+            min(self._context_window_limit, override.context_window),
+            min(self._max_output_tokens_limit, override.max_output_tokens),
+            override.strict_structured_output,
+            override.token_counting,
+            override.local,
+            override.real_calls_allowed,
+        )
 
     def generate(self, request: ModelRequest) -> ModelResponse:
         payload = {
@@ -92,6 +120,8 @@ class OllamaProvider:
             ))
         except httpx.TimeoutException:
             return ProviderDiagnostic(False, "Ollama diagnosis timed out", ())
+        except httpx.HTTPStatusError:
+            return ProviderDiagnostic(False, "Ollama service is unavailable", ())
         except httpx.RequestError:
             return ProviderDiagnostic(False, "Ollama service is unavailable", ())
         except (TypeError, ValueError, KeyError, json.JSONDecodeError):
@@ -108,3 +138,8 @@ class OllamaProvider:
     @staticmethod
     def _optional_string(value: Any) -> str | None:
         return value if isinstance(value, str) else None
+
+    @staticmethod
+    def _validate_limit(value: int) -> None:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("provider capability limits must be positive integers")
