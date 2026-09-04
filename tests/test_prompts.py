@@ -1,7 +1,9 @@
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from threading import Event, Lock, get_ident
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select, text
 from sqlalchemy.exc import IntegrityError
 
 from ainovel.agents.prompts import AGENT_PARAMETERS, AGENT_SCHEMAS, BUILTIN_PROMPTS
@@ -137,3 +139,114 @@ def test_snapshot_flushes_without_committing_the_callers_transaction(session, wo
 
     assert len(snapshots) == 4
     assert service.list_snapshots(workflow.id) == []
+
+
+def test_create_version_retries_a_real_sqlite_write_lock_with_distinct_versions(client) -> None:
+    engine = client.app.state.engine
+    session_factory = client.app.state.session_factory
+    both_reads_complete = Event()
+    reads_by_thread: dict[int, int] = {}
+    lock = Lock()
+
+    def pause_after_initial_max(_conn, _cursor, statement, _parameters, _context, _many):
+        if "max(prompt_versions.version_number)" not in statement:
+            return
+        thread_id = get_ident()
+        with lock:
+            reads_by_thread[thread_id] = reads_by_thread.get(thread_id, 0) + 1
+            if len(reads_by_thread) == 2:
+                both_reads_complete.set()
+            initial_read = reads_by_thread[thread_id] == 1
+        if initial_read:
+            assert both_reads_complete.wait(timeout=5)
+
+    def create(body: str):
+        with session_factory() as independent_session:
+            independent_session.execute(text("BEGIN"))
+            return PromptService(independent_session).create_version(
+                "chapter_writer", body, "author"
+            )
+
+    event.listen(engine, "after_cursor_execute", pause_after_initial_max)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            first = workers.submit(create, "thread one instructions")
+            second = workers.submit(create, "thread two instructions")
+            created = [first.result(timeout=15), second.result(timeout=15)]
+    finally:
+        event.remove(engine, "after_cursor_execute", pause_after_initial_max)
+
+    with session_factory() as verify_session:
+        persisted = verify_session.scalars(
+            select(PromptVersion)
+            .where(PromptVersion.role == "chapter_writer")
+            .order_by(PromptVersion.version_number)
+        ).all()
+
+    assert [row.version_number for row in persisted] == [1, 2]
+    assert {row.body for row in persisted} == {
+        "thread one instructions",
+        "thread two instructions",
+    }
+    assert {row.id for row in created} == {row.id for row in persisted}
+    assert all(read_count <= 3 for read_count in reads_by_thread.values())
+
+
+def test_concurrent_builtin_seeding_keeps_one_matching_version_per_role(client) -> None:
+    engine = client.app.state.engine
+    session_factory = client.app.state.session_factory
+    first_lookup_seen = Event()
+    second_lookup_seen = Event()
+    competing_immediate_begin_seen = Event()
+    lock = Lock()
+    first_lookup_thread: int | None = None
+
+    def note_competing_immediate_begin(_conn, _cursor, statement, _parameters, _context, _many):
+        if "begin immediate" in statement.casefold() and get_ident() != first_lookup_thread:
+            competing_immediate_begin_seen.set()
+
+    def synchronize_first_builtin_lookup(_conn, _cursor, statement, _parameters, _context, _many):
+        nonlocal first_lookup_thread
+        normalized = statement.casefold()
+        if "from prompt_versions" not in normalized or "content_hash" not in normalized:
+            return
+        thread_id = get_ident()
+        with lock:
+            if not first_lookup_seen.is_set():
+                first_lookup_thread = thread_id
+                first_lookup_seen.set()
+                wait_for_competitor = True
+            elif thread_id != first_lookup_thread:
+                second_lookup_seen.set()
+                wait_for_competitor = False
+            else:
+                wait_for_competitor = False
+        if wait_for_competitor:
+            assert second_lookup_seen.wait(timeout=5) or competing_immediate_begin_seen.wait(
+                timeout=5
+            )
+
+    def seed():
+        with session_factory() as independent_session:
+            return PromptService(independent_session).ensure_builtins()
+
+    event.listen(engine, "before_cursor_execute", note_competing_immediate_begin)
+    event.listen(engine, "after_cursor_execute", synchronize_first_builtin_lookup)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            first = workers.submit(seed)
+            second = workers.submit(seed)
+            first.result(timeout=15)
+            second.result(timeout=15)
+    finally:
+        event.remove(engine, "before_cursor_execute", note_competing_immediate_begin)
+        event.remove(engine, "after_cursor_execute", synchronize_first_builtin_lookup)
+
+    with session_factory() as verify_session:
+        persisted = verify_session.scalars(select(PromptVersion)).all()
+        active_roles = {row.role for row in persisted if row.active}
+
+    assert len(persisted) == 4
+    assert {(row.role, row.content_hash) for row in persisted} == {
+        (role, PromptService._content_hash(body)) for role, body in BUILTIN_PROMPTS.items()
+    }
