@@ -12,6 +12,8 @@ def test_create_project_uses_confirmed_length_range(session) -> None:
     assert project.target_chars_min == 2_000_000
     assert project.target_chars_max == 5_000_000
     assert project.official_outline_version_id is None
+    assert project.active_batch_id is None
+    assert project.next_batch_sequence == 1
 
 
 def test_project_rejects_reversed_length_range(session) -> None:

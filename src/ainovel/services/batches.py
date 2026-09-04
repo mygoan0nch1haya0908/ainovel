@@ -4,7 +4,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from uuid import uuid4
 
-from sqlalchemy import func, select, update
+from sqlalchemy import exists, func, select, update
 from sqlalchemy.orm import Session
 
 from ainovel.models.audit import AuditEvent
@@ -49,10 +49,29 @@ class BatchService:
         if outline.status != "official":
             self.session.rollback()
             raise ValueError("batch requires an official outline")
+        batch_id = str(uuid4())
+        sequence_number = project.next_batch_sequence
+        ownership = self.session.execute(
+            update(NovelProject)
+            .where(
+                NovelProject.id == project.id,
+                NovelProject.active_batch_id.is_(None),
+                NovelProject.next_batch_sequence == sequence_number,
+                NovelProject.official_outline_version_id == outline.id,
+            )
+            .values(
+                active_batch_id=batch_id,
+                next_batch_sequence=sequence_number + 1,
+            )
+        )
+        if ownership.rowcount != 1:
+            self.session.rollback()
+            raise ValueError("project already has an active batch or its state changed")
         batch = WritingBatch(
-            id=str(uuid4()),
+            id=batch_id,
             project_id=project.id,
             base_outline_version_id=outline.id,
+            sequence_number=sequence_number,
             planned_chapters=planned_chapters,
             status="draft",
         )
@@ -63,7 +82,11 @@ class BatchService:
             batch.id,
             "batch_created",
             "author",
-            {"base_outline_version_id": outline.id, "planned_chapters": planned_chapters},
+            {
+                "base_outline_version_id": outline.id,
+                "planned_chapters": planned_chapters,
+                "sequence_number": sequence_number,
+            },
         )
         try:
             self.session.commit()
@@ -203,7 +226,14 @@ class BatchService:
         self._validate_visible_counts(chapters)
         claim = self.session.execute(
             update(WritingBatch)
-            .where(WritingBatch.id == batch.id, WritingBatch.status == "draft")
+            .where(
+                WritingBatch.id == batch.id,
+                WritingBatch.status == "draft",
+                exists().where(
+                    NovelProject.id == batch.project_id,
+                    NovelProject.active_batch_id == batch.id,
+                ),
+            )
             .values(status="ready_for_review")
         )
         if claim.rowcount != 1:
@@ -226,6 +256,10 @@ class BatchService:
         return self.get(batch.id)
 
     def reject(self, batch_id: str, reason: str) -> WritingBatch:
+        normalized_reason = reason.strip()
+        if not normalized_reason:
+            self.session.rollback()
+            raise ValueError("rejection reason is required")
         self.session.expire_all()
         batch = self.get(batch_id)
         if batch.status not in {"draft", "ready_for_review"}:
@@ -239,13 +273,25 @@ class BatchService:
         if claim.rowcount != 1:
             self.session.rollback()
             raise ValueError("batch rejection conflict")
+        ownership = self.session.execute(
+            update(NovelProject)
+            .where(
+                NovelProject.id == batch.project_id,
+                NovelProject.active_batch_id == batch.id,
+                NovelProject.next_batch_sequence == batch.sequence_number + 1,
+            )
+            .values(active_batch_id=None)
+        )
+        if ownership.rowcount != 1:
+            self.session.rollback()
+            raise ValueError("batch rejection conflict")
         self._add_audit(
             batch.project_id,
             "writing_batch",
             batch.id,
             "batch_rejected",
             "author",
-            {"reason": reason},
+            {"reason": normalized_reason},
         )
         try:
             self.session.commit()
@@ -301,10 +347,15 @@ class BatchService:
                     update(NovelProject)
                     .where(
                         NovelProject.id == project.id,
+                        NovelProject.active_batch_id == batch.id,
+                        NovelProject.next_batch_sequence == batch.sequence_number + 1,
                         NovelProject.next_official_chapter_number == first_number,
                         NovelProject.official_outline_version_id == approved_outline_version_id,
                     )
-                    .values(next_official_chapter_number=first_number + len(chapters))
+                    .values(
+                        active_batch_id=None,
+                        next_official_chapter_number=first_number + len(chapters),
+                    )
                 )
                 if reservation.rowcount != 1:
                     self.session.rollback()

@@ -4,10 +4,12 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect
 
 from ainovel.models.batch import Chapter
 from ainovel.models.project import NovelProject
+import ainovel.db as database
 from ainovel.services.batches import BatchService
 from ainovel.services.outlines import OutlineNodeInput, OutlineService
 from ainovel.services.projects import ProjectService
@@ -62,12 +64,23 @@ def _remove_database_artifacts(database_path: Path, temporary_root: Path) -> Non
 
 
 def test_model_defaults_match_migration_server_defaults() -> None:
+    batch_sequence_default = NovelProject.__table__.c.next_batch_sequence.server_default
     project_counter_default = NovelProject.__table__.c.next_official_chapter_number.server_default
     chapter_revision_default = Chapter.__table__.c.revision.server_default
+    assert batch_sequence_default is not None
     assert project_counter_default is not None
     assert chapter_revision_default is not None
+    assert str(batch_sequence_default.arg) == "1"
     assert str(project_counter_default.arg) == "1"
     assert str(chapter_revision_default.arg) == "1"
+
+
+def test_readiness_revision_matches_the_migration_head() -> None:
+    config = Config(str(PROJECT_ROOT / "alembic.ini"))
+
+    assert getattr(database, "ALEMBIC_HEAD_REVISION", None) == ScriptDirectory.from_config(
+        config
+    ).get_current_head()
 
 
 def test_initial_migration_round_trip_creates_foundation_schema(

@@ -12,14 +12,14 @@
 </section>
 <aside><p>模型生成将在第二阶段引入；当前仅提供本地项目与审批流程。</p></aside>
 <section aria-labelledby="batch-create-heading"><h2 id="batch-create-heading">创建候选批次</h2>
-{% if official_outline %}<form action="/projects/{{ summary.project.id }}/batches" method="post"><p><label for="planned_chapters">计划章节数（1 至 5）</label><input id="planned_chapters" name="planned_chapters" type="number" min="1" max="5" required></p><button type="submit">创建候选批次</button></form>{% else %}<p>请先创建并确认官方大纲后再创建批次。</p>{% endif %}
+{% if official_outline %}<form action="/projects/{{ summary.project.id }}/batches" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><p><label for="planned_chapters">计划章节数（1 至 5）</label><input id="planned_chapters" name="planned_chapters" type="number" min="1" max="5" required></p><button type="submit">创建候选批次</button></form>{% else %}<p>请先创建并确认官方大纲后再创建批次。</p>{% endif %}
 </section>
 <section aria-labelledby="batches-heading"><h2 id="batches-heading">候选批次</h2>
 {% if batches %}<ul>{% for batch in batches %}<li>
 <p>批次 {{ batch.id }}：{{ batch.planned_chapters }} 章，状态：{{ batch_status_labels[batch.status] }}</p>
-{% if batch.status == "draft" %}<form action="/batches/{{ batch.id }}/ready" method="post" data-confirm="确认提交此批次审批？"><button type="submit">提交审批</button></form>{% endif %}
-{% if batch.status == "ready_for_review" %}<form action="/batches/{{ batch.id }}/approve" method="post" data-confirm="确认批准此批次？"><button type="submit">批准</button></form>{% endif %}
-{% if batch.status in ["draft", "ready_for_review"] %}<form action="/batches/{{ batch.id }}/reject" method="post" data-confirm="确认驳回此批次？"><p><label for="reason-{{ batch.id }}">驳回原因</label><input id="reason-{{ batch.id }}" name="reason" required></p><button type="submit">驳回</button></form>{% endif %}
+{% if batch.status == "draft" %}<form action="/batches/{{ batch.id }}/ready" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">提交审批</button></form>{% endif %}
+{% if batch.status == "ready_for_review" %}<form action="/batches/{{ batch.id }}/approve" method="post" data-confirm="确认批准此批次？"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">批准</button></form>{% endif %}
+{% if batch.status in ["draft", "ready_for_review"] %}<form action="/batches/{{ batch.id }}/reject" method="post" data-confirm="确认驳回此批次？"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><p><label for="reason-{{ batch.id }}">驳回原因</label><input id="reason-{{ batch.id }}" name="reason" required></p><button type="submit">驳回</button></form>{% endif %}
 </li>{% endfor %}</ul>{% else %}<p>暂无候选批次</p>{% endif %}
 </section>
 <section aria-labelledby="audit-heading"><h2 id="audit-heading">审计记录</h2>

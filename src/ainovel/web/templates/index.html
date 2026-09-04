@@ -5,6 +5,7 @@
 <section aria-labelledby="create-project-heading">
   <h2 id="create-project-heading">创建小说项目</h2>
   <form action="/projects" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <p><label for="title">项目名称</label><input id="title" name="title" value="{{ project_form.title }}" required></p>
     <p><label for="target_chars_min">目标字数下限</label><input id="target_chars_min" name="target_chars_min" type="number" min="1" value="{{ project_form.target_chars_min }}" required></p>
     <p><label for="target_chars_max">目标字数上限</label><input id="target_chars_max" name="target_chars_max" type="number" min="1" value="{{ project_form.target_chars_max }}" required></p>

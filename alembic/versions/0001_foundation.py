@@ -26,6 +26,13 @@ def upgrade() -> None:
         sa.Column("target_chars_max", sa.Integer(), nullable=False),
         sa.Column("official_outline_version_id", sa.String(length=36), nullable=True),
         sa.Column("current_constitution_version_id", sa.String(length=36), nullable=True),
+        sa.Column("active_batch_id", sa.String(length=36), nullable=True),
+        sa.Column(
+            "next_batch_sequence",
+            sa.Integer(),
+            nullable=False,
+            server_default=sa.text("1"),
+        ),
         sa.Column(
             "next_official_chapter_number",
             sa.Integer(),
@@ -86,6 +93,7 @@ def upgrade() -> None:
         sa.Column("id", sa.String(length=36), nullable=False),
         sa.Column("project_id", sa.String(length=36), nullable=False),
         sa.Column("base_outline_version_id", sa.String(length=36), nullable=False),
+        sa.Column("sequence_number", sa.Integer(), nullable=False),
         sa.Column("planned_chapters", sa.Integer(), nullable=False),
         sa.Column("status", sa.String(length=32), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
@@ -93,6 +101,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["base_outline_version_id"], ["outline_versions.id"]),
         sa.ForeignKeyConstraint(["project_id"], ["novel_projects.id"]),
         sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("project_id", "sequence_number"),
     )
     op.create_table(
         "chapters",

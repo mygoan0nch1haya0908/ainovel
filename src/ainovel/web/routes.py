@@ -11,6 +11,7 @@ from ainovel.db import get_session
 from ainovel.services.batches import BatchService
 from ainovel.services.outlines import OutlineService
 from ainovel.services.projects import ProjectService
+from ainovel.web.security import csrf_token, require_csrf
 
 router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent / "templates"))
@@ -33,6 +34,7 @@ def _project_context(request: Request, session: Session, project_id: str) -> dic
     batches = BatchService(session)
     return {
         "request": request, "summary": summary, "official_outline": official_outline,
+        "csrf_token": csrf_token(request),
         "batches": batches.list_for_project(project_id),
         "statistics": batches.official_chapter_statistics(project_id),
         "audit_events": batches.list_audit_events(project_id),
@@ -49,7 +51,7 @@ def _project_page(request: Request, session: Session, project_id: str, error: st
 def _index_error(request: Request, session: Session, values: dict[str, str], error: str) -> object:
     return templates.TemplateResponse(request, "index.html", {
         "request": request, "projects": ProjectService(session).list_projects(),
-        "project_form": values, "error": error,
+        "project_form": values, "error": error, "csrf_token": csrf_token(request),
     }, status_code=422)
 
 
@@ -58,11 +60,12 @@ def index(request: Request, session: Session = Depends(get_session)) -> object:
     return templates.TemplateResponse(request, "index.html", {
         "request": request, "projects": ProjectService(session).list_projects(),
         "project_form": {"title": "", "target_chars_min": "", "target_chars_max": ""}, "error": None,
+        "csrf_token": csrf_token(request),
     })
 
 
 @router.post("/projects")
-def create_project(request: Request, title: str = Form(""), target_chars_min: str = Form(""), target_chars_max: str = Form(""), session: Session = Depends(get_session)) -> object:
+def create_project(request: Request, title: str = Form(""), target_chars_min: str = Form(""), target_chars_max: str = Form(""), session: Session = Depends(get_session), _csrf: None = Depends(require_csrf)) -> object:
     values = {"title": title, "target_chars_min": target_chars_min, "target_chars_max": target_chars_max}
     if not title.strip():
         return _index_error(request, session, values, "项目名称不能为空")
@@ -87,7 +90,7 @@ def project_page(project_id: str, request: Request, session: Session = Depends(g
 
 
 @router.post("/projects/{project_id}/batches")
-def create_batch(project_id: str, request: Request, planned_chapters: str = Form(""), session: Session = Depends(get_session)) -> object:
+def create_batch(project_id: str, request: Request, planned_chapters: str = Form(""), session: Session = Depends(get_session), _csrf: None = Depends(require_csrf)) -> object:
     try:
         official_outline = OutlineService(session).current_official_for_project(project_id)
     except ValueError as error:
@@ -113,7 +116,7 @@ def _batch_project_id(batch_id: str, session: Session) -> str:
 
 
 @router.post("/batches/{batch_id}/ready")
-def mark_batch_ready(batch_id: str, request: Request, session: Session = Depends(get_session)) -> object:
+def mark_batch_ready(batch_id: str, request: Request, session: Session = Depends(get_session), _csrf: None = Depends(require_csrf)) -> object:
     project_id = _batch_project_id(batch_id, session)
     try:
         BatchService(session).mark_ready(batch_id)
@@ -123,7 +126,7 @@ def mark_batch_ready(batch_id: str, request: Request, session: Session = Depends
 
 
 @router.post("/batches/{batch_id}/approve")
-def approve_batch(batch_id: str, request: Request, session: Session = Depends(get_session)) -> object:
+def approve_batch(batch_id: str, request: Request, session: Session = Depends(get_session), _csrf: None = Depends(require_csrf)) -> object:
     service = BatchService(session)
     try:
         batch = service.get(batch_id)
@@ -138,7 +141,7 @@ def approve_batch(batch_id: str, request: Request, session: Session = Depends(ge
 
 
 @router.post("/batches/{batch_id}/reject")
-def reject_batch(batch_id: str, request: Request, reason: str = Form(""), session: Session = Depends(get_session)) -> object:
+def reject_batch(batch_id: str, request: Request, reason: str = Form(""), session: Session = Depends(get_session), _csrf: None = Depends(require_csrf)) -> object:
     project_id = _batch_project_id(batch_id, session)
     if not reason.strip():
         return _project_page(request, session, project_id, "请填写驳回原因", 422)

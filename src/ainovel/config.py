@@ -6,3 +6,4 @@ class Settings(BaseSettings):
 
     app_name: str = "AI Novel Studio"
     database_url: str = "sqlite+pysqlite:///./ainovel.db"
+    session_secret: str | None = None

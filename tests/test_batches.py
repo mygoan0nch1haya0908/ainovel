@@ -1,7 +1,8 @@
 import pytest
-from sqlalchemy import event, select
+from sqlalchemy import event, select, update
 
 from ainovel.models.audit import AuditEvent
+from ainovel.models.batch import WritingBatch
 from ainovel.models.outline import OutlineVersion
 from ainovel.models.project import NovelProject
 from ainovel.services.batches import BatchService
@@ -36,6 +37,152 @@ def test_batch_rejects_an_official_outline_from_another_project(session, officia
 
     with pytest.raises(ValueError, match="another project"):
         BatchService(session).create(other_project.id, official_outline.id, 1)
+
+
+def test_two_stale_sessions_create_only_one_active_batch(
+    client, project, official_outline
+) -> None:
+    with (
+        client.app.state.session_factory() as first_session,
+        client.app.state.session_factory() as second_session,
+    ):
+        first_project = first_session.get(NovelProject, project.id)
+        second_project = second_session.get(NovelProject, project.id)
+        assert first_project.active_batch_id is None
+        assert second_project.active_batch_id is None
+
+        winner = BatchService(first_session).create(project.id, official_outline.id, 1)
+        with pytest.raises(ValueError, match="active batch"):
+            BatchService(second_session).create(project.id, official_outline.id, 1)
+
+    with client.app.state.session_factory() as verify_session:
+        persisted_project = verify_session.get(NovelProject, project.id)
+        persisted_batches = BatchService(verify_session).list_for_project(project.id)
+        created_events = verify_session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.project_id == project.id,
+                AuditEvent.action == "batch_created",
+            )
+        ).all()
+
+    assert persisted_project.active_batch_id == winner.id
+    assert persisted_project.next_batch_sequence == 2
+    assert [(batch.id, batch.sequence_number) for batch in persisted_batches] == [
+        (winner.id, 1)
+    ]
+    assert len(created_events) == 1
+
+
+def test_stale_session_cannot_create_from_a_replaced_official_outline(
+    client, project, official_outline
+) -> None:
+    with client.app.state.session_factory() as stale_session:
+        stale_project = stale_session.get(NovelProject, project.id)
+        stale_outline = stale_session.get(OutlineVersion, official_outline.id)
+        assert stale_project.official_outline_version_id == stale_outline.id
+
+        with client.app.state.session_factory() as replacement_session:
+            replacement = OutlineService(replacement_session).create_candidate(
+                project.id,
+                [
+                    OutlineNodeInput(
+                        key="book", parent_key=None, kind="book", title="新版", order=0
+                    )
+                ],
+                reason="replacement",
+            )
+            OutlineService(replacement_session).approve(replacement.id)
+
+        with pytest.raises(ValueError, match="state changed"):
+            BatchService(stale_session).create(project.id, official_outline.id, 1)
+
+    with client.app.state.session_factory() as verify_session:
+        persisted_project = verify_session.get(NovelProject, project.id)
+        assert persisted_project.active_batch_id is None
+        assert persisted_project.next_batch_sequence == 1
+        assert BatchService(verify_session).list_for_project(project.id) == []
+
+
+def test_rejection_releases_ownership_and_replacement_uses_next_sequence(
+    session, project, official_outline
+) -> None:
+    service = BatchService(session)
+    rejected = service.create(project.id, official_outline.id, 1)
+
+    service.reject(rejected.id, "  rewrite this batch  ")
+    replacement = service.create(project.id, official_outline.id, 1)
+
+    session.expire_all()
+    persisted_project = session.get(NovelProject, project.id)
+    rejected_event = session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.entity_id == rejected.id,
+            AuditEvent.action == "batch_rejected",
+        )
+    )
+    assert rejected.sequence_number == 1
+    assert replacement.sequence_number == 2
+    assert persisted_project.active_batch_id == replacement.id
+    assert persisted_project.next_batch_sequence == 3
+    assert rejected_event.details["reason"] == "rewrite this batch"
+
+
+def test_non_active_older_batch_cannot_be_approved(
+    session, project, official_outline
+) -> None:
+    service = BatchService(session)
+    older = service.create(project.id, official_outline.id, 1)
+    service.save_candidate_chapter(older.id, 1, "旧批次", "甲" * 4500, {})
+    service.mark_ready(older.id)
+    service.reject(older.id, "replace")
+    replacement = service.create(project.id, official_outline.id, 1)
+
+    # Model a stale pre-fix ready row: project ownership must remain authoritative.
+    session.execute(
+        update(WritingBatch)
+        .where(WritingBatch.id == older.id)
+        .values(status="ready_for_review")
+    )
+    session.commit()
+
+    with pytest.raises(ValueError, match="approval conflict"):
+        service.approve(older.id, official_outline.id)
+
+    session.expire_all()
+    assert service.get(older.id).status == "ready_for_review"
+    assert session.get(NovelProject, project.id).active_batch_id == replacement.id
+    assert service.list_chapters(older.id)[0].status == "candidate"
+
+
+def test_out_of_sequence_batch_cannot_approve_even_with_a_stale_active_pointer(
+    session, project, official_outline
+) -> None:
+    service = BatchService(session)
+    older = service.create(project.id, official_outline.id, 1)
+    service.save_candidate_chapter(older.id, 1, "旧批次", "甲" * 4500, {})
+    service.mark_ready(older.id)
+    service.reject(older.id, "replace")
+    replacement = service.create(project.id, official_outline.id, 1)
+    session.execute(
+        update(NovelProject)
+        .where(NovelProject.id == project.id)
+        .values(active_batch_id=older.id)
+    )
+    session.execute(
+        update(WritingBatch)
+        .where(WritingBatch.id == older.id)
+        .values(status="ready_for_review")
+    )
+    session.commit()
+
+    with pytest.raises(ValueError, match="approval conflict"):
+        service.approve(older.id, official_outline.id)
+
+    session.expire_all()
+    persisted_project = session.get(NovelProject, project.id)
+    assert persisted_project.active_batch_id == older.id
+    assert persisted_project.next_batch_sequence == replacement.sequence_number + 1
+    assert persisted_project.next_official_chapter_number == 1
 
 
 def test_saved_candidate_chapter_does_not_become_official(session, project, official_outline) -> None:
@@ -130,6 +277,21 @@ def test_reject_keeps_candidate_chapter_rows(session, project, official_outline)
     assert [saved.id for saved in service.list_chapters(batch.id)] == [chapter.id]
 
 
+@pytest.mark.parametrize("reason", ["", "   ", "\t\r\n"])
+def test_reject_requires_a_non_blank_reason(
+    session, project, official_outline, reason
+) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 1)
+
+    with pytest.raises(ValueError, match="reason is required"):
+        service.reject(batch.id, reason)
+
+    session.expire_all()
+    assert service.get(batch.id).status == "draft"
+    assert session.get(NovelProject, project.id).active_batch_id == batch.id
+
+
 def test_list_chapters_orders_candidates_by_ordinal(session, project, official_outline) -> None:
     service = BatchService(session)
     batch = service.create(project.id, official_outline.id, 2)
@@ -158,6 +320,7 @@ def test_failed_approval_keeps_every_chapter_candidate(session, project, officia
     chapters = service.list_chapters(batch.id)
     assert [chapter.status for chapter in chapters] == ["candidate", "candidate"]
     assert service.get(batch.id).status != "approved"
+    assert session.get(NovelProject, project.id).active_batch_id == batch.id
     assert session.scalars(
         select(AuditEvent).where(
             AuditEvent.entity_id == batch.id, AuditEvent.action == "batch_approved"
@@ -178,6 +341,7 @@ def test_approval_persists_official_chapters_and_one_event_in_new_session(
 
     with client.app.state.session_factory() as second_session:
         persisted = BatchService(second_session).list_chapters(batch.id)
+        persisted_project = ProjectService(second_session).get(project.id)
         event_record = second_session.scalar(
             select(AuditEvent).where(
                 AuditEvent.entity_type == "writing_batch",
@@ -187,6 +351,7 @@ def test_approval_persists_official_chapters_and_one_event_in_new_session(
         )
         assert [chapter.status for chapter in persisted] == ["official", "official"]
         assert [chapter.official_chapter_number for chapter in persisted] == [1, 2]
+        assert persisted_project.active_batch_id is None
         assert event_record is not None
         assert event_record.actor == "editor"
         assert event_record.details == {
