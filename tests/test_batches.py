@@ -1,0 +1,566 @@
+import pytest
+from sqlalchemy import event, select, update
+
+from ainovel.models.audit import AuditEvent
+from ainovel.models.batch import WritingBatch
+from ainovel.models.outline import OutlineVersion
+from ainovel.models.project import NovelProject
+from ainovel.services.batches import BatchService
+from ainovel.services.counting import count_visible_characters
+from ainovel.services.outlines import OutlineNodeInput, OutlineService
+from ainovel.services.projects import ProjectService
+
+
+def test_visible_count_excludes_whitespace_but_includes_punctuation_and_ascii() -> None:
+    assert count_visible_characters(" 甲，A1\n乙。 ") == 6
+
+
+@pytest.mark.parametrize("planned", [0, 6])
+def test_batch_size_must_be_between_one_and_five(session, project, official_outline, planned) -> None:
+    with pytest.raises(ValueError, match="between 1 and 5"):
+        BatchService(session).create(project.id, official_outline.id, planned)
+
+
+def test_batch_requires_the_projects_official_outline(session, project, official_outline) -> None:
+    candidate = OutlineService(session).create_candidate(
+        project.id,
+        [OutlineNodeInput(key="book", parent_key=None, kind="book", title="候选", order=0)],
+        reason="unapproved",
+    )
+
+    with pytest.raises(ValueError, match="official"):
+        BatchService(session).create(project.id, candidate.id, 1)
+
+
+def test_batch_rejects_an_official_outline_from_another_project(session, official_outline) -> None:
+    other_project = ProjectService(session).create("另一部小说", 10, 20)
+
+    with pytest.raises(ValueError, match="another project"):
+        BatchService(session).create(other_project.id, official_outline.id, 1)
+
+
+def test_two_stale_sessions_create_only_one_active_batch(
+    client, project, official_outline
+) -> None:
+    with (
+        client.app.state.session_factory() as first_session,
+        client.app.state.session_factory() as second_session,
+    ):
+        first_project = first_session.get(NovelProject, project.id)
+        second_project = second_session.get(NovelProject, project.id)
+        assert first_project.active_batch_id is None
+        assert second_project.active_batch_id is None
+
+        winner = BatchService(first_session).create(project.id, official_outline.id, 1)
+        with pytest.raises(ValueError, match="active batch"):
+            BatchService(second_session).create(project.id, official_outline.id, 1)
+
+    with client.app.state.session_factory() as verify_session:
+        persisted_project = verify_session.get(NovelProject, project.id)
+        persisted_batches = BatchService(verify_session).list_for_project(project.id)
+        created_events = verify_session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.project_id == project.id,
+                AuditEvent.action == "batch_created",
+            )
+        ).all()
+
+    assert persisted_project.active_batch_id == winner.id
+    assert persisted_project.next_batch_sequence == 2
+    assert [(batch.id, batch.sequence_number) for batch in persisted_batches] == [
+        (winner.id, 1)
+    ]
+    assert len(created_events) == 1
+
+
+def test_stale_session_cannot_create_from_a_replaced_official_outline(
+    client, project, official_outline
+) -> None:
+    with client.app.state.session_factory() as stale_session:
+        stale_project = stale_session.get(NovelProject, project.id)
+        stale_outline = stale_session.get(OutlineVersion, official_outline.id)
+        assert stale_project.official_outline_version_id == stale_outline.id
+
+        with client.app.state.session_factory() as replacement_session:
+            replacement = OutlineService(replacement_session).create_candidate(
+                project.id,
+                [
+                    OutlineNodeInput(
+                        key="book", parent_key=None, kind="book", title="新版", order=0
+                    )
+                ],
+                reason="replacement",
+            )
+            OutlineService(replacement_session).approve(replacement.id)
+
+        with pytest.raises(ValueError, match="state changed"):
+            BatchService(stale_session).create(project.id, official_outline.id, 1)
+
+    with client.app.state.session_factory() as verify_session:
+        persisted_project = verify_session.get(NovelProject, project.id)
+        assert persisted_project.active_batch_id is None
+        assert persisted_project.next_batch_sequence == 1
+        assert BatchService(verify_session).list_for_project(project.id) == []
+
+
+def test_rejection_releases_ownership_and_replacement_uses_next_sequence(
+    session, project, official_outline
+) -> None:
+    service = BatchService(session)
+    rejected = service.create(project.id, official_outline.id, 1)
+
+    service.reject(rejected.id, "  rewrite this batch  ")
+    replacement = service.create(project.id, official_outline.id, 1)
+
+    session.expire_all()
+    persisted_project = session.get(NovelProject, project.id)
+    rejected_event = session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.entity_id == rejected.id,
+            AuditEvent.action == "batch_rejected",
+        )
+    )
+    assert rejected.sequence_number == 1
+    assert replacement.sequence_number == 2
+    assert persisted_project.active_batch_id == replacement.id
+    assert persisted_project.next_batch_sequence == 3
+    assert rejected_event.details["reason"] == "rewrite this batch"
+
+
+def test_non_active_older_batch_cannot_be_approved(
+    session, project, official_outline
+) -> None:
+    service = BatchService(session)
+    older = service.create(project.id, official_outline.id, 1)
+    service.save_candidate_chapter(older.id, 1, "旧批次", "甲" * 4500, {})
+    service.mark_ready(older.id)
+    service.reject(older.id, "replace")
+    replacement = service.create(project.id, official_outline.id, 1)
+
+    # Model a stale pre-fix ready row: project ownership must remain authoritative.
+    session.execute(
+        update(WritingBatch)
+        .where(WritingBatch.id == older.id)
+        .values(status="ready_for_review")
+    )
+    session.commit()
+
+    with pytest.raises(ValueError, match="approval conflict"):
+        service.approve(older.id, official_outline.id)
+
+    session.expire_all()
+    assert service.get(older.id).status == "ready_for_review"
+    assert session.get(NovelProject, project.id).active_batch_id == replacement.id
+    assert service.list_chapters(older.id)[0].status == "candidate"
+
+
+def test_out_of_sequence_batch_cannot_approve_even_with_a_stale_active_pointer(
+    session, project, official_outline
+) -> None:
+    service = BatchService(session)
+    older = service.create(project.id, official_outline.id, 1)
+    service.save_candidate_chapter(older.id, 1, "旧批次", "甲" * 4500, {})
+    service.mark_ready(older.id)
+    service.reject(older.id, "replace")
+    replacement = service.create(project.id, official_outline.id, 1)
+    session.execute(
+        update(NovelProject)
+        .where(NovelProject.id == project.id)
+        .values(active_batch_id=older.id)
+    )
+    session.execute(
+        update(WritingBatch)
+        .where(WritingBatch.id == older.id)
+        .values(status="ready_for_review")
+    )
+    session.commit()
+
+    with pytest.raises(ValueError, match="approval conflict"):
+        service.approve(older.id, official_outline.id)
+
+    session.expire_all()
+    persisted_project = session.get(NovelProject, project.id)
+    assert persisted_project.active_batch_id == older.id
+    assert persisted_project.next_batch_sequence == replacement.sequence_number + 1
+    assert persisted_project.next_official_chapter_number == 1
+
+
+def test_saved_candidate_chapter_does_not_become_official(session, project, official_outline) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 1)
+    chapter = service.save_candidate_chapter(batch.id, 1, "初临", "甲" * 4500, {"time": "+1 day"})
+
+    assert chapter.status == "candidate"
+    assert chapter.visible_char_count == 4500
+    assert chapter.official_chapter_number is None
+    assert batch.status == "draft"
+
+
+@pytest.mark.parametrize("ordinal", [0, 2])
+def test_candidate_ordinal_must_be_within_the_batches_plan(
+    session, project, official_outline, ordinal
+) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 1)
+
+    with pytest.raises(ValueError, match="ordinal"):
+        service.save_candidate_chapter(batch.id, ordinal, "越界", "正文", {})
+
+
+def test_candidate_state_delta_is_copied_before_persistence(session, project, official_outline) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 1)
+    state_delta = {"timeline": {"day": 1}}
+    chapter = service.save_candidate_chapter(batch.id, 1, "初临", "正文", state_delta)
+    state_delta["timeline"]["day"] = 2
+    session.expire(chapter)
+
+    assert service.get_chapter(chapter.id).state_delta == {"timeline": {"day": 1}}
+
+
+def test_duplicate_candidate_ordinal_is_not_persisted(session, project, official_outline) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 1)
+    service.save_candidate_chapter(batch.id, 1, "初稿", "正文", {})
+
+    with pytest.raises(ValueError, match="ordinal"):
+        service.save_candidate_chapter(batch.id, 1, "重复", "另一正文", {})
+
+    assert [chapter.title for chapter in service.list_chapters(batch.id)] == ["初稿"]
+
+
+@pytest.mark.parametrize("length", [4500, 6000])
+def test_boundary_length_chapter_can_be_marked_ready(session, project, official_outline, length) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 1)
+    service.save_candidate_chapter(batch.id, 1, "边界", "甲" * length, {})
+
+    ready = service.mark_ready(batch.id)
+
+    assert ready.status == "ready_for_review"
+
+
+@pytest.mark.parametrize("length", [4499, 6001])
+def test_out_of_range_chapter_remains_saved_but_cannot_be_ready(
+    session, project, official_outline, length
+) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 1)
+    chapter = service.save_candidate_chapter(batch.id, 1, "越界", "甲" * length, {})
+
+    with pytest.raises(ValueError, match="4500.*6000"):
+        service.mark_ready(batch.id)
+
+    assert service.get_chapter(chapter.id).status == "candidate"
+
+
+def test_ready_requires_every_planned_ordinal(session, project, official_outline) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 2)
+    service.save_candidate_chapter(batch.id, 1, "第一章", "甲" * 4500, {})
+
+    with pytest.raises(ValueError, match="all planned"):
+        service.mark_ready(batch.id)
+
+    assert service.get(batch.id).status == "draft"
+
+
+def test_reject_keeps_candidate_chapter_rows(session, project, official_outline) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 1)
+    chapter = service.save_candidate_chapter(batch.id, 1, "保留", "正文", {})
+
+    rejected = service.reject(batch.id, "needs rewrite")
+
+    assert rejected.status == "rejected"
+    assert service.get_chapter(chapter.id).status == "candidate"
+    assert [saved.id for saved in service.list_chapters(batch.id)] == [chapter.id]
+
+
+@pytest.mark.parametrize("reason", ["", "   ", "\t\r\n"])
+def test_reject_requires_a_non_blank_reason(
+    session, project, official_outline, reason
+) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 1)
+
+    with pytest.raises(ValueError, match="reason is required"):
+        service.reject(batch.id, reason)
+
+    session.expire_all()
+    assert service.get(batch.id).status == "draft"
+    assert session.get(NovelProject, project.id).active_batch_id == batch.id
+
+
+def test_list_chapters_orders_candidates_by_ordinal(session, project, official_outline) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 2)
+    service.save_candidate_chapter(batch.id, 2, "第二章", "正文", {})
+    service.save_candidate_chapter(batch.id, 1, "第一章", "正文", {})
+
+    assert [chapter.ordinal for chapter in service.list_chapters(batch.id)] == [1, 2]
+
+
+def test_failed_approval_keeps_every_chapter_candidate(session, project, official_outline) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 2)
+    service.save_candidate_chapter(batch.id, 1, "一", "甲" * 4500, {"seq": 1})
+    service.save_candidate_chapter(batch.id, 2, "二", "乙" * 4500, {"seq": 2})
+    service.mark_ready(batch.id)
+
+    @event.listens_for(session, "before_commit", once=True)
+    def fail_commit(_session) -> None:
+        raise RuntimeError("simulated commit failure")
+
+    with pytest.raises(RuntimeError, match="simulated commit failure"):
+        service.approve(batch.id, official_outline.id)
+
+    session.rollback()
+    session.expire_all()
+    chapters = service.list_chapters(batch.id)
+    assert [chapter.status for chapter in chapters] == ["candidate", "candidate"]
+    assert service.get(batch.id).status != "approved"
+    assert session.get(NovelProject, project.id).active_batch_id == batch.id
+    assert session.scalars(
+        select(AuditEvent).where(
+            AuditEvent.entity_id == batch.id, AuditEvent.action == "batch_approved"
+        )
+    ).all() == []
+
+
+def test_approval_persists_official_chapters_and_one_event_in_new_session(
+    session, client, project, official_outline
+) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 2)
+    first = service.save_candidate_chapter(batch.id, 1, "一", "甲" * 4500, {"seq": 1})
+    second = service.save_candidate_chapter(batch.id, 2, "二", "乙" * 4500, {"seq": 2})
+    service.mark_ready(batch.id)
+
+    service.approve(batch.id, official_outline.id, actor="editor")
+
+    with client.app.state.session_factory() as second_session:
+        persisted = BatchService(second_session).list_chapters(batch.id)
+        persisted_project = ProjectService(second_session).get(project.id)
+        event_record = second_session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.entity_type == "writing_batch",
+                AuditEvent.entity_id == batch.id,
+                AuditEvent.action == "batch_approved",
+            )
+        )
+        assert [chapter.status for chapter in persisted] == ["official", "official"]
+        assert [chapter.official_chapter_number for chapter in persisted] == [1, 2]
+        assert persisted_project.active_batch_id is None
+        assert event_record is not None
+        assert event_record.actor == "editor"
+        assert event_record.details == {
+            "chapter_ids": [first.id, second.id],
+            "state_deltas": [{"seq": 1}, {"seq": 2}],
+        }
+
+
+def test_approval_requires_the_batches_existing_official_outline(
+    session, project, official_outline
+) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 1)
+    service.save_candidate_chapter(batch.id, 1, "一", "甲" * 4500, {})
+    service.mark_ready(batch.id)
+    replacement = OutlineService(session).create_candidate(
+        project.id,
+        [OutlineNodeInput(key="book", parent_key=None, kind="book", title="新版", order=0)],
+        reason="revision",
+    )
+    replacement = OutlineService(session).approve(replacement.id)
+
+    with pytest.raises(ValueError, match="batch.*official outline"):
+        service.approve(batch.id, replacement.id)
+
+    assert service.get(batch.id).status == "ready_for_review"
+
+
+def test_published_chapter_cannot_be_replaced(session, approved_chapter) -> None:
+    service = BatchService(session)
+    service.publish_chapter(approved_chapter.id)
+
+    with pytest.raises(PermissionError, match="published chapters are frozen"):
+        service.replace_candidate_body(approved_chapter.id, "新正文")
+
+
+def test_official_chapter_cannot_be_replaced(session, approved_chapter) -> None:
+    with pytest.raises(PermissionError, match="candidate chapters"):
+        BatchService(session).replace_candidate_body(approved_chapter.id, "新正文")
+
+def test_stale_approval_cannot_claim_an_already_approved_batch(
+    session, client, project, official_outline
+) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 1)
+    service.save_candidate_chapter(batch.id, 1, "第一章", "甲" * 4500, {})
+    service.mark_ready(batch.id)
+
+    with client.app.state.session_factory() as stale_session:
+        stale_service = BatchService(stale_session)
+        stale_batch = stale_service.get(batch.id)
+        stale_chapters = stale_service.list_chapters(batch.id)
+        with client.app.state.session_factory() as winner_session:
+            BatchService(winner_session).approve(batch.id, official_outline.id)
+
+        with pytest.raises(ValueError, match="approval conflict"):
+            stale_service.approve(batch.id, official_outline.id)
+
+    with client.app.state.session_factory() as check_session:
+        chapters = BatchService(check_session).list_chapters(batch.id)
+        persisted_project = ProjectService(check_session).get(project.id)
+        approved_events = check_session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.entity_id == batch.id, AuditEvent.action == "batch_approved"
+            )
+        ).all()
+        assert [chapter.official_chapter_number for chapter in chapters] == [1]
+        assert persisted_project.next_official_chapter_number == 2
+        assert len(approved_events) == 1
+
+
+def test_stale_approval_cannot_overwrite_rejection(session, client, project, official_outline) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 1)
+    service.save_candidate_chapter(batch.id, 1, "第一章", "甲" * 4500, {})
+    service.mark_ready(batch.id)
+
+    with client.app.state.session_factory() as stale_session:
+        stale_service = BatchService(stale_session)
+        stale_batch = stale_service.get(batch.id)
+        stale_chapters = stale_service.list_chapters(batch.id)
+        with client.app.state.session_factory() as winner_session:
+            BatchService(winner_session).reject(batch.id, "editor rejected it")
+
+        with pytest.raises(ValueError, match="approval conflict"):
+            stale_service.approve(batch.id, official_outline.id)
+
+    with client.app.state.session_factory() as check_session:
+        final_service = BatchService(check_session)
+        assert final_service.get(batch.id).status == "rejected"
+        assert [chapter.status for chapter in final_service.list_chapters(batch.id)] == ["candidate"]
+        assert ProjectService(check_session).get(project.id).next_official_chapter_number == 1
+        assert check_session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.entity_id == batch.id, AuditEvent.action == "batch_approved"
+            )
+        ).all() == []
+
+
+def test_stale_approval_cannot_promote_a_body_replaced_after_validation(
+    session, client, project, official_outline
+) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 1)
+    chapter = service.save_candidate_chapter(batch.id, 1, "第一章", "甲" * 4500, {})
+    service.mark_ready(batch.id)
+
+    with client.app.state.session_factory() as stale_session:
+        stale_service = BatchService(stale_session)
+        stale_batch = stale_service.get(batch.id)
+        stale_chapters = stale_service.list_chapters(batch.id)
+        with client.app.state.session_factory() as editor_session:
+            BatchService(editor_session).replace_candidate_body(chapter.id, "乙" * 4499)
+
+        with pytest.raises(ValueError):
+            stale_service.approve(batch.id, official_outline.id)
+
+    with client.app.state.session_factory() as check_session:
+        final_chapter = BatchService(check_session).get_chapter(chapter.id)
+        assert final_chapter.status == "candidate"
+        assert final_chapter.visible_char_count == 4499
+
+
+def test_stale_publication_cannot_duplicate_a_publish_event(session, client, approved_chapter) -> None:
+    with client.app.state.session_factory() as stale_session:
+        stale_service = BatchService(stale_session)
+        stale_chapter = stale_service.get_chapter(approved_chapter.id)
+        with client.app.state.session_factory() as winner_session:
+            BatchService(winner_session).publish_chapter(approved_chapter.id)
+
+        with pytest.raises(ValueError, match="publication conflict"):
+            stale_service.publish_chapter(approved_chapter.id)
+
+    with client.app.state.session_factory() as check_session:
+        final_chapter = BatchService(check_session).get_chapter(approved_chapter.id)
+        published_events = check_session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.entity_id == approved_chapter.id,
+                AuditEvent.action == "chapter_published",
+            )
+        ).all()
+        assert final_chapter.status == "published"
+        assert len(published_events) == 1
+
+
+def test_stale_approval_cannot_restore_an_outdated_outline_pointer(
+    session, client, project, official_outline
+) -> None:
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 1)
+    service.save_candidate_chapter(batch.id, 1, "第一章", "甲" * 4500, {})
+    service.mark_ready(batch.id)
+
+    with client.app.state.session_factory() as stale_session:
+        stale_project = stale_session.get(NovelProject, project.id)
+        stale_outline = stale_session.get(OutlineVersion, official_outline.id)
+        stale_service = BatchService(stale_session)
+        stale_batch = stale_service.get(batch.id)
+        stale_chapters = stale_service.list_chapters(batch.id)
+        with client.app.state.session_factory() as winner_session:
+            replacement = OutlineService(winner_session).create_candidate(
+                project.id,
+                [
+                    OutlineNodeInput(
+                        key="book", parent_key=None, kind="book", title="新版", order=0
+                    )
+                ],
+                reason="replace outline",
+            )
+            replacement = OutlineService(winner_session).approve(replacement.id)
+
+        with pytest.raises(ValueError, match="approval conflict"):
+            stale_service.approve(batch.id, official_outline.id)
+
+    with client.app.state.session_factory() as check_session:
+        final_service = BatchService(check_session)
+        assert ProjectService(check_session).get(project.id).official_outline_version_id == replacement.id
+        assert final_service.get(batch.id).status == "ready_for_review"
+        assert check_session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.entity_id == batch.id, AuditEvent.action == "batch_approved"
+            )
+        ).all() == []
+
+
+def test_lifecycle_audits_are_recorded_once_and_invalid_retries_add_none(
+    session, project, official_outline
+) -> None:
+    service = BatchService(session)
+    rejected = service.create(project.id, official_outline.id, 1)
+    service.save_candidate_chapter(rejected.id, 1, "草稿", "甲" * 4500, {})
+    service.mark_ready(rejected.id)
+    service.reject(rejected.id, "rewrite")
+
+    batch = service.create(project.id, official_outline.id, 1)
+    chapter = service.save_candidate_chapter(batch.id, 1, "正文", "甲" * 4500, {})
+    service.mark_ready(batch.id)
+    service.approve(batch.id, official_outline.id)
+    service.publish_chapter(chapter.id)
+
+    with pytest.raises(ValueError):
+        service.approve(batch.id, official_outline.id)
+    with pytest.raises(ValueError):
+        service.publish_chapter(chapter.id)
+
+    events = session.scalars(select(AuditEvent).order_by(AuditEvent.created_at)).all()
+    actions = [event.action for event in events]
+    assert actions.count("batch_created") == 2
+    assert actions.count("batch_ready") == 2
+    assert actions.count("batch_rejected") == 1
+    assert actions.count("batch_approved") == 1
+    assert actions.count("chapter_published") == 1

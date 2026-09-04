@@ -10,3 +10,4 @@ htmlcov/
 *.db-shm
 *.db-wal
 .env
+.pytest-tmp/
