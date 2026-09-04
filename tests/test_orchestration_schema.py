@@ -208,11 +208,25 @@ def test_stage_two_columns_nullability_and_server_defaults(
 
     item = _column_map(migrated_engine, "context_packet_items")
     assert item["source_id"]["nullable"] is True
+    assert item["source_type"]["nullable"] is False
+    assert item["source_version"]["nullable"] is False
+    assert item["state_scope"]["nullable"] is False
+    assert item["source_content_hash"]["nullable"] is False
     assert item["excerpt_start"]["nullable"] is True
     assert item["excerpt_end"]["nullable"] is True
     assert item["trim_reason"]["nullable"] is True
     assert item["selected"]["default"] == "0"
     assert item["required"]["default"] == "0"
+    source = _column_map(migrated_engine, "context_sources")
+    assert source["source_version"]["type"].length == 64
+    assert Base.metadata.tables["context_sources"].c.source_version.type.length == 64
+    for column_name in (
+        "source_type",
+        "source_version",
+        "state_scope",
+        "source_content_hash",
+    ):
+        assert Base.metadata.tables["context_packet_items"].c[column_name].nullable is False
     assert Base.metadata.tables["workflow_steps"].c.lease_expires_at.type.timezone is True
 
 
@@ -680,6 +694,15 @@ def test_stage_two_migration_downgrades_and_re_upgrades(
         engine = create_engine(database_url)
         try:
             assert STAGE_TWO_TABLES <= set(inspect(engine).get_table_names())
+            source = _column_map(engine, "context_sources")
+            item = _column_map(engine, "context_packet_items")
+            assert source["source_version"]["type"].length == 64
+            assert {
+                "source_type",
+                "source_version",
+                "state_scope",
+                "source_content_hash",
+            } <= set(item)
             with engine.connect() as connection:
                 assert connection.execute(
                     text(

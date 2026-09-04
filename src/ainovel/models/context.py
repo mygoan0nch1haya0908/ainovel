@@ -24,7 +24,7 @@ class ContextSource(TimestampMixin, Base):
     )
     source_type: Mapped[str] = mapped_column(String(64), nullable=False)
     source_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    source_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_version: Mapped[str] = mapped_column(String(64), nullable=False)
     state_scope: Mapped[str] = mapped_column(String(64), nullable=False)
     layer: Mapped[int] = mapped_column(Integer, nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
@@ -58,6 +58,10 @@ class ContextPacketItem(TimestampMixin, Base):
     source_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("context_sources.id"), nullable=True
     )
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    state_scope: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     stable_source_key: Mapped[str] = mapped_column(String(255), nullable=False)
     layer: Mapped[int] = mapped_column(Integer, nullable=False)
     text_snapshot: Mapped[str] = mapped_column(Text, nullable=False)

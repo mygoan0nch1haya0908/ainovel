@@ -121,7 +121,7 @@ def _source(
         project_id=project_id,
         source_type=source_type,
         source_id=source_id,
-        source_version=version,
+        source_version=str(version),
         state_scope=scope,
         layer=layer,
         text=body,
@@ -337,6 +337,7 @@ def test_workflow_artifact_indexing_is_hash_versioned_and_preserves_excerpt_offs
 
     assert indexed_again.id == indexed.id
     assert indexed.content_hash == digest
+    assert indexed.source_version == digest
     assert indexed.state_scope == f"workflow:{workflow.id}"
     assert indexed.source_type == "historical_excerpt"
     selected = next(item for item in candidates if item.source_id == indexed.id)
@@ -461,6 +462,7 @@ def test_builder_rejects_a_step_from_another_workflow(
 def test_packet_persists_selected_trimmed_snapshots_and_deduplicates_overlap(
     session, project, official_outline
 ) -> None:
+    _add_fts(session)
     workflow, step = _workflow(session, project, official_outline)
     source = _source(project.id, "constitution", "constitution", 1, "official", 0, "required")
     session.add(source)
@@ -472,7 +474,7 @@ def test_packet_persists_selected_trimmed_snapshots_and_deduplicates_overlap(
         100,
         source_id=source.id,
         source_type="constitution",
-        source_version=source.content_hash,
+        source_version="1",
     )
     duplicate_optional = candidate(
         "stale duplicate",
@@ -535,6 +537,34 @@ def test_packet_persists_selected_trimmed_snapshots_and_deduplicates_overlap(
             ContextPacketItem.packet_id == packet.id
         )
     ) == 2
+
+    ContextIndexService(session).rebuild_official(project.id)
+    session.expire_all()
+    items = session.scalars(
+        select(ContextPacketItem)
+        .where(ContextPacketItem.packet_id == packet.id)
+        .order_by(ContextPacketItem.position)
+    ).all()
+    assert (
+        items[0].source_id,
+        items[0].source_type,
+        items[0].source_version,
+        items[0].state_scope,
+        items[0].source_content_hash,
+    ) == (None, "constitution", "1", "official", source.content_hash)
+    assert (
+        items[1].source_id,
+        items[1].source_type,
+        items[1].source_version,
+        items[1].state_scope,
+        items[1].source_content_hash,
+    ) == (
+        None,
+        "test",
+        "1",
+        "official",
+        sha256(b"trimmed").hexdigest(),
+    )
 
 
 def test_packet_required_overflow_persists_nothing(

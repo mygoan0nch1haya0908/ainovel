@@ -178,7 +178,7 @@ class ContextIndexService:
             raise ValueError("workflow artifact kind is not indexable")
         body = self._artifact_text(artifact)
         scope = f"{WORKFLOW_SCOPE_PREFIX}{workflow.id}"
-        source_version = int(artifact.content_hash[:15], 16)
+        source_version = artifact.content_hash
         try:
             prior = self.session.scalars(
                 select(ContextSource).where(
@@ -239,7 +239,7 @@ class ContextIndexService:
             "AND cs.state_scope = 'official' "
             "AND cs.source_type IN :source_types "
             "ORDER BY bm25(context_source_fts), cs.source_type, cs.source_id, "
-            "cs.source_version DESC, cs.id LIMIT :limit"
+            "cs.id LIMIT :limit"
         ).bindparams(bindparam("source_types", expanding=True))
         ids = self.session.execute(
             statement,
@@ -352,7 +352,7 @@ class ContextIndexService:
             "project_id": project_id,
             "source_type": source_type,
             "source_id": source_id,
-            "source_version": source_version,
+            "source_version": str(source_version),
             "state_scope": "official",
             "layer": layer,
             "text": body,
@@ -461,16 +461,22 @@ class ContextBuilder:
             select(WorkflowArtifact).where(WorkflowArtifact.workflow_id == workflow.id)
         ).all()
         artifacts = {artifact.id: artifact for artifact in artifact_rows}
-        max_versions: dict[int, int] = {}
+        chronologies = {
+            row.id: self._chronology(row, artifacts.get(row.source_id)) for row in rows
+        }
+        newest_by_layer: dict[int, int] = {}
         for row in rows:
             layer = SOURCE_LAYERS[row.source_type]
-            max_versions[layer] = max(max_versions.get(layer, row.source_version), row.source_version)
+            chronology = chronologies[row.id]
+            newest_by_layer[layer] = max(
+                newest_by_layer.get(layer, chronology), chronology
+            )
         candidates: dict[str, ContextCandidate] = {}
         sorted_rows = sorted(
             rows,
             key=lambda row: (
                 row.state_scope != workflow_scope,
-                -row.source_version,
+                -chronologies[row.id],
                 row.source_type,
                 row.source_id,
                 row.id,
@@ -483,7 +489,7 @@ class ContextBuilder:
             layer = SOURCE_LAYERS[row.source_type]
             artifact = artifacts.get(row.source_id)
             temporal_distance = self._temporal_distance(
-                row, artifact, step, max_versions[layer]
+                row, artifact, step, newest_by_layer[layer], chronologies[row.id]
             )
             excerpt_start, excerpt_end = self._excerpt_offsets(artifact)
             required = row.source_type in REQUIRED_SOURCE_TYPES
@@ -496,7 +502,7 @@ class ContextBuilder:
                 temporal_distance=temporal_distance,
                 source_id=row.id,
                 source_type=row.source_type,
-                source_version=row.content_hash,
+                source_version=row.source_version,
                 state_scope=row.state_scope,
                 excerpt_start=excerpt_start,
                 excerpt_end=excerpt_end,
@@ -520,7 +526,8 @@ class ContextBuilder:
         row: ContextSource,
         artifact: WorkflowArtifact | None,
         step: WorkflowStep,
-        max_version: int,
+        newest_chronology: int,
+        chronology: int,
     ) -> int:
         if artifact is not None:
             if artifact.ordinal is not None and step.ordinal is not None:
@@ -530,7 +537,17 @@ class ContextBuilder:
                 - (artifact.ordinal if artifact.ordinal is not None else step.position)
             )
             return artifact_step_distance
-        return max(0, max_version - row.source_version)
+        return max(0, newest_chronology - chronology)
+
+    @staticmethod
+    def _chronology(
+        row: ContextSource, artifact: WorkflowArtifact | None
+    ) -> int:
+        if artifact is not None and artifact.ordinal is not None:
+            return artifact.ordinal
+        if row.state_scope == "official" and row.source_version.isdecimal():
+            return int(row.source_version)
+        return int(row.created_at.timestamp() * 1_000_000)
 
     @staticmethod
     def _excerpt_offsets(
@@ -620,12 +637,29 @@ class ContextService:
             ),
         )
         self.session.add(packet)
+        linked_source_ids = {
+            item.source_id for item in ordered if item.source_id is not None
+        }
+        linked_sources = {
+            row.id: row
+            for row in self.session.scalars(
+                select(ContextSource).where(ContextSource.id.in_(linked_source_ids))
+            ).all()
+        }
         self.session.add_all(
             [
                 ContextPacketItem(
                     id=str(uuid4()),
                     packet_id=packet.id,
                     source_id=item.source_id,
+                    source_type=item.source_type,
+                    source_version=item.source_version,
+                    state_scope=item.state_scope,
+                    source_content_hash=(
+                        linked_sources[item.source_id].content_hash
+                        if item.source_id in linked_sources
+                        else sha256(item.text.encode("utf-8")).hexdigest()
+                    ),
                     stable_source_key=item.stable_key,
                     layer=item.layer,
                     text_snapshot=item.text,
