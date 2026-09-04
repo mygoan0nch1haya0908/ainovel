@@ -13,11 +13,18 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option(
-    "sqlalchemy.url",
-    os.getenv("AINOVEL_DATABASE_URL", "sqlite+pysqlite:///./ainovel.db"),
-)
+database_url = os.getenv("AINOVEL_DATABASE_URL")
+if database_url is not None:
+    config.set_main_option("sqlalchemy.url", database_url)
 target_metadata = Base.metadata
+
+
+def include_object(_object, name, type_, reflected, _compare_to) -> bool:
+    return not (
+        reflected
+        and type_ == "table"
+        and name.startswith("context_source_fts")
+    )
 
 
 def run_migrations_offline() -> None:
@@ -28,6 +35,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_server_default=True,
+        include_object=include_object,
     )
 
     with context.begin_transaction():
@@ -47,6 +55,7 @@ def run_migrations_online() -> None:
             connection=connection,
             target_metadata=target_metadata,
             compare_server_default=True,
+            include_object=include_object,
         )
 
         with context.begin_transaction():

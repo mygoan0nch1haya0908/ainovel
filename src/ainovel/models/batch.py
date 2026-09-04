@@ -10,7 +10,10 @@ from ainovel.models.base import Base, TimestampMixin
 
 class WritingBatch(TimestampMixin, Base):
     __tablename__ = "writing_batches"
-    __table_args__ = (UniqueConstraint("project_id", "sequence_number"),)
+    __table_args__ = (
+        UniqueConstraint("project_id", "sequence_number"),
+        UniqueConstraint("source_workflow_id"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     project_id: Mapped[str] = mapped_column(
@@ -22,6 +25,7 @@ class WritingBatch(TimestampMixin, Base):
     sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)
     planned_chapters: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_workflow_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
 
 class Chapter(TimestampMixin, Base):

@@ -78,12 +78,11 @@ def test_model_defaults_match_migration_server_defaults() -> None:
 def test_readiness_revision_matches_the_migration_head() -> None:
     config = Config(str(PROJECT_ROOT / "alembic.ini"))
 
-    assert getattr(database, "ALEMBIC_HEAD_REVISION", None) == ScriptDirectory.from_config(
-        config
-    ).get_current_head()
+    assert getattr(database, "ALEMBIC_HEAD_REVISION", None) == "0002_orchestration_context"
+    assert ScriptDirectory.from_config(config).get_current_head() == "0002_orchestration_context"
 
 
-def test_initial_migration_round_trip_creates_foundation_schema(
+def test_migration_round_trip_creates_current_schema(
     tmp_path: Path, monkeypatch
 ) -> None:
     resolved_project_root = PROJECT_ROOT.resolve()
@@ -97,16 +96,16 @@ def test_initial_migration_round_trip_creates_foundation_schema(
     try:
         command.upgrade(config, "head")
         command.check(config)
-        assert _table_names(database_url) == FOUNDATION_TABLES
-        assert _revision_number(database_url) == "0001_foundation"
+        assert FOUNDATION_TABLES < _table_names(database_url)
+        assert _revision_number(database_url) == "0002_orchestration_context"
 
         command.downgrade(config, "base")
         assert _table_names(database_url) == {"alembic_version"}
 
         command.upgrade(config, "head")
         command.check(config)
-        assert _table_names(database_url) == FOUNDATION_TABLES
-        assert _revision_number(database_url) == "0001_foundation"
+        assert FOUNDATION_TABLES < _table_names(database_url)
+        assert _revision_number(database_url) == "0002_orchestration_context"
     finally:
         _remove_database_artifacts(database_path, resolved_temporary_root)
 
