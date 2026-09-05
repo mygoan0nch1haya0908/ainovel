@@ -65,6 +65,36 @@ def test_runner_returns_a_validated_batch_plan() -> None:
     assert result.chapters[0].ordinal == 1
 
 
+def test_runner_can_return_validated_result_with_original_response_metadata() -> None:
+    request = batch_plan_request()
+    response = ModelResponse(
+        structured={
+            "chapters": [
+                {
+                    "ordinal": 1,
+                    "title": "入局",
+                    "goal": "主角接下委托",
+                    "ending_hook": "发现追踪者",
+                }
+            ]
+        },
+        text=None,
+        provider_response_id="provider-real-id",
+        input_tokens=321,
+        output_tokens=123,
+        latency_ms=47,
+    )
+
+    run = AgentRunner().run_with_response(FakeProvider([response]), request, BatchPlanDraft)
+
+    assert run.result.chapters[0].title == "入局"
+    assert run.response is response
+    assert run.response.input_tokens == 321
+    assert run.response.output_tokens == 123
+    assert run.response.latency_ms == 47
+    assert run.response.provider_response_id == "provider-real-id"
+
+
 def test_runner_rejects_invalid_structured_output() -> None:
     provider = FakeProvider(
         [

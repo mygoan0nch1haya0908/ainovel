@@ -31,10 +31,19 @@ class BatchService:
         self.session = session
 
     def create(
-        self, project_id: str, outline_version_id: str, planned_chapters: int
+        self,
+        project_id: str,
+        outline_version_id: str,
+        planned_chapters: int,
+        *,
+        source_workflow_id: str | None = None,
     ) -> WritingBatch:
         if not MIN_BATCH_CHAPTERS <= planned_chapters <= MAX_BATCH_CHAPTERS:
             raise ValueError("batch size must be between 1 and 5")
+        if source_workflow_id is not None and (
+            not isinstance(source_workflow_id, str) or not source_workflow_id.strip()
+        ):
+            raise ValueError("source workflow id must be nonblank")
         project = self.session.get(NovelProject, project_id)
         if project is None:
             self.session.rollback()
@@ -74,19 +83,23 @@ class BatchService:
             sequence_number=sequence_number,
             planned_chapters=planned_chapters,
             status="draft",
+            source_workflow_id=source_workflow_id,
         )
         self.session.add(batch)
+        audit_details: dict[str, object] = {
+            "base_outline_version_id": outline.id,
+            "planned_chapters": planned_chapters,
+            "sequence_number": sequence_number,
+        }
+        if source_workflow_id is not None:
+            audit_details["source_workflow_id"] = source_workflow_id
         self._add_audit(
             project.id,
             "writing_batch",
             batch.id,
             "batch_created",
             "author",
-            {
-                "base_outline_version_id": outline.id,
-                "planned_chapters": planned_chapters,
-                "sequence_number": sequence_number,
-            },
+            audit_details,
         )
         try:
             self.session.commit()
