@@ -205,6 +205,19 @@ class ContextIndexService:
             raise ValueError("workflow artifact content hash does not match indexed text")
         scope = f"{WORKFLOW_SCOPE_PREFIX}{workflow.id}"
         source_version = artifact.content_hash
+        explicitly_requested = source_type in EXCERPT_SOURCE_TYPES
+        canonical_source_type = (
+            artifact.payload.get("canonical_source_type")
+            if explicitly_requested
+            else None
+        )
+        canonical_source_id = (
+            artifact.payload.get("canonical_source_id") if explicitly_requested else None
+        )
+        excerpt_start = (
+            artifact.payload.get("excerpt_start") if explicitly_requested else None
+        )
+        excerpt_end = artifact.payload.get("excerpt_end") if explicitly_requested else None
         try:
             prior = self.session.scalars(
                 select(ContextSource).where(
@@ -219,6 +232,15 @@ class ContextIndexService:
                     row.source_version == source_version
                     and row.content_hash == artifact.content_hash
                     and row.text == body
+                    and row.project_id == workflow.project_id
+                    and row.source_type == source_type
+                    and row.source_id == artifact.id
+                    and row.state_scope == scope
+                    and row.explicitly_requested is explicitly_requested
+                    and row.canonical_source_type == canonical_source_type
+                    and row.canonical_source_id == canonical_source_id
+                    and row.excerpt_start == excerpt_start
+                    and row.excerpt_end == excerpt_end
                 ):
                     self._mirror(row)
                     self.session.commit()
@@ -230,6 +252,8 @@ class ContextIndexService:
                 )
                 self._delete_fts(row.id)
                 self.session.delete(row)
+            if prior:
+                self.session.flush()
             row = ContextSource(
                 id=str(uuid4()),
                 project_id=workflow.project_id,
@@ -240,27 +264,11 @@ class ContextIndexService:
                 layer=SOURCE_LAYERS[source_type],
                 text=body,
                 content_hash=artifact.content_hash,
-                explicitly_requested=source_type in EXCERPT_SOURCE_TYPES,
-                canonical_source_type=(
-                    artifact.payload.get("canonical_source_type")
-                    if source_type in EXCERPT_SOURCE_TYPES
-                    else None
-                ),
-                canonical_source_id=(
-                    artifact.payload.get("canonical_source_id")
-                    if source_type in EXCERPT_SOURCE_TYPES
-                    else None
-                ),
-                excerpt_start=(
-                    artifact.payload.get("excerpt_start")
-                    if source_type in EXCERPT_SOURCE_TYPES
-                    else None
-                ),
-                excerpt_end=(
-                    artifact.payload.get("excerpt_end")
-                    if source_type in EXCERPT_SOURCE_TYPES
-                    else None
-                ),
+                explicitly_requested=explicitly_requested,
+                canonical_source_type=canonical_source_type,
+                canonical_source_id=canonical_source_id,
+                excerpt_start=excerpt_start,
+                excerpt_end=excerpt_end,
             )
             self.session.add(row)
             self.session.flush()

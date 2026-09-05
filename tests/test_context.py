@@ -1061,3 +1061,70 @@ def test_changed_artifact_hash_clears_old_packet_fk_but_keeps_snapshot(
     assert stored.text_snapshot == first_text
     assert stored.source_version == sha256(first_text.encode("utf-8")).hexdigest()
     assert stored.source_content_hash == sha256(first_text.encode("utf-8")).hexdigest()
+
+
+def test_same_text_excerpt_reindex_replaces_stale_canonical_provenance(
+    session, project, official_outline
+) -> None:
+    _add_fts(session)
+    workflow, step = _workflow(session, project, official_outline)
+    body = "identical excerpt"
+    first_canonical = _source(
+        project.id, "official_chapter", "chapter-a", 1, "official", 7, body
+    )
+    second_canonical = _source(
+        project.id, "official_chapter", "chapter-b", 1, "official", 7, body
+    )
+    session.add_all([first_canonical, second_canonical])
+    session.commit()
+    digest = sha256(body.encode("utf-8")).hexdigest()
+    artifact = WorkflowArtifact(
+        id=str(uuid4()),
+        workflow_id=workflow.id,
+        step_id=step.id,
+        kind="requested_excerpt",
+        ordinal=1,
+        text_content=body,
+        payload={
+            "explicitly_requested": True,
+            "canonical_source_type": "official_chapter",
+            "canonical_source_id": first_canonical.source_id,
+            "excerpt_start": 0,
+            "excerpt_end": len(body),
+        },
+        visible_char_count=len(body),
+        content_hash=digest,
+    )
+    session.add(artifact)
+    session.commit()
+    first_indexed = ContextIndexService(session).index_workflow_artifact(artifact.id)
+    item = next(
+        value
+        for value in ContextBuilder(session).candidates_for_step(workflow.id, step.id)
+        if value.source_id == first_indexed.id
+    )
+    packet = ContextService(session).build_packet(
+        workflow.id,
+        step.id,
+        [],
+        [item],
+        {"input_capacity_tokens": 100, "reserved_output_tokens": 0},
+    )
+
+    artifact.payload = {
+        **artifact.payload,
+        "canonical_source_id": second_canonical.source_id,
+    }
+    session.commit()
+    second_indexed = ContextIndexService(session).index_workflow_artifact(artifact.id)
+    stored = session.scalar(
+        select(ContextPacketItem).where(ContextPacketItem.packet_id == packet.id)
+    )
+
+    assert second_indexed.id != first_indexed.id
+    assert second_indexed.canonical_source_id == second_canonical.source_id
+    assert stored is not None
+    assert stored.source_id is None
+    assert stored.canonical_source_id == first_canonical.source_id
+    assert stored.text_snapshot == body
+    assert stored.source_content_hash == digest
