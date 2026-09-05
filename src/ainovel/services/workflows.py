@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
+import re
 from typing import Any, Protocol
 from uuid import uuid4
 
@@ -14,6 +15,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from ainovel.agents.prompts import AGENT_SCHEMAS
+from ainovel.context import RequiredContextOverflow
 from ainovel.models.audit import AuditEvent
 from ainovel.models.batch import WritingBatch
 from ainovel.models.outline import OutlineVersion
@@ -502,9 +504,12 @@ class WorkflowService:
     def record_attempt_start(
         self, step_id: str, request_digest: str
     ) -> ModelAttempt:
-        normalized_digest = request_digest.strip() if isinstance(request_digest, str) else ""
-        if not normalized_digest:
-            raise ValueError("request digest is required")
+        if (
+            not isinstance(request_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", request_digest) is None
+        ):
+            raise ValueError("request digest must be a canonical SHA-256 hex digest")
+        normalized_digest = request_digest
         now = self._aware_utc(self.clock.now())
         self.session.expire_all()
         step = self.session.get(WorkflowStep, step_id)
@@ -573,6 +578,94 @@ class WorkflowService:
             raise
         return attempt
 
+    def pause_context_overflow(
+        self,
+        step_id: str,
+        worker_id: str,
+        error: RequiredContextOverflow,
+    ) -> GenerationWorkflow:
+        normalized_worker = worker_id.strip() if isinstance(worker_id, str) else ""
+        if not normalized_worker:
+            raise ValueError("worker id is required")
+        if not isinstance(error, RequiredContextOverflow):
+            raise TypeError("context overflow pause requires RequiredContextOverflow")
+        now = self._aware_utc(self.clock.now())
+        self.session.expire_all()
+        step = self.session.get(WorkflowStep, step_id)
+        workflow = (
+            self.session.get(GenerationWorkflow, step.workflow_id)
+            if step is not None
+            else None
+        )
+        if (
+            step is None
+            or workflow is None
+            or workflow.status not in EXECUTABLE_WORKFLOW_STATUSES
+            or workflow.current_position != step.position
+            or step.kind not in _STEP_PROMPT_ROLES
+            or step.status != "RUNNING"
+            or step.active_artifact_id is not None
+            or step.lease_owner != normalized_worker
+            or step.lease_expires_at is None
+            or step.lease_expires_at <= now
+        ):
+            self.session.rollback()
+            raise ValueError("context overflow pause conflict")
+
+        self._require_transition(workflow.status, "PAUSED_CONTEXT_OVERFLOW")
+        try:
+            workflow_claim = self.session.execute(
+                update(GenerationWorkflow)
+                .where(
+                    GenerationWorkflow.id == workflow.id,
+                    GenerationWorkflow.status == workflow.status,
+                    GenerationWorkflow.revision == workflow.revision,
+                    GenerationWorkflow.current_position == step.position,
+                )
+                .values(
+                    status="PAUSED_CONTEXT_OVERFLOW",
+                    revision=workflow.revision + 1,
+                    last_error_code="required_context_overflow",
+                    last_error_detail=(
+                        "required context exceeds the available input budget"
+                    ),
+                )
+            )
+            step_claim = self.session.execute(
+                update(WorkflowStep)
+                .where(
+                    WorkflowStep.id == step.id,
+                    WorkflowStep.workflow_id == workflow.id,
+                    WorkflowStep.status == "RUNNING",
+                    WorkflowStep.revision == step.revision,
+                    WorkflowStep.attempt_count == step.attempt_count,
+                    WorkflowStep.active_artifact_id.is_(None),
+                    WorkflowStep.lease_owner == normalized_worker,
+                    WorkflowStep.lease_expires_at == step.lease_expires_at,
+                    WorkflowStep.lease_expires_at > now,
+                )
+                .values(
+                    status="PAUSED",
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    revision=step.revision + 1,
+                )
+            )
+            if workflow_claim.rowcount != 1 or step_claim.rowcount != 1:
+                raise ValueError("context overflow pause conflict")
+            self._add_audit(
+                workflow.project_id,
+                workflow.id,
+                "workflow_paused",
+                "system",
+                {"reason": "required_context_overflow"},
+            )
+            self.session.commit()
+            return workflow
+        except Exception:
+            self.session.rollback()
+            raise
+
     def complete_attempt(
         self,
         attempt_id: str,
@@ -613,8 +706,20 @@ class WorkflowService:
 
         try:
             artifact_values = self._artifact_values(step, artifact)
+            effective_finalize = finalize_step
+            if not finalize_step:
+                evidence_requested = (
+                    artifact_values.payload.get("passed") is False
+                    and bool(artifact_values.payload.get("evidence_queries"))
+                )
+                if not evidence_requested:
+                    raise ValueError("reviewer evidence request is invalid")
+                if attempt.attempt_number != 1:
+                    effective_finalize = True
             target_status, target_position, target_step_status, make_active = (
-                self._completion_transition(workflow, step, artifact_values, finalize_step)
+                self._completion_transition(
+                    workflow, step, artifact_values, effective_finalize
+                )
             )
             self._require_transition(workflow.status, target_status)
         except Exception:
@@ -716,6 +821,7 @@ class WorkflowService:
         if not isinstance(error, ProviderError):
             raise TypeError("attempt failures must be typed ProviderError instances")
         code, detail, retryable = self._provider_failure(error)
+        now = self._aware_utc(self.clock.now())
         self.session.expire_all()
         attempt = self.session.get(ModelAttempt, attempt_id)
         if attempt is None:
@@ -735,6 +841,7 @@ class WorkflowService:
             or step.status != "RUNNING"
             or step.lease_owner is None
             or step.lease_expires_at is None
+            or step.lease_expires_at <= now
             or workflow.current_position != step.position
         ):
             self.session.rollback()
@@ -775,6 +882,7 @@ class WorkflowService:
                     WorkflowStep.attempt_count == attempt.attempt_number,
                     WorkflowStep.lease_owner == step.lease_owner,
                     WorkflowStep.lease_expires_at == step.lease_expires_at,
+                    WorkflowStep.lease_expires_at > now,
                 )
                 .values(
                     status=target_step_status,
@@ -1084,20 +1192,24 @@ class WorkflowService:
         elif batch.status == "rejected":
             target_status = "REJECTED"
             action = "workflow_rejected"
-        elif batch.status in {"draft", "ready_for_review"}:
+        elif batch.status == "ready_for_review":
             target_status = "AWAITING_CONTENT_APPROVAL"
+            action = "candidate_batch_linked"
+        elif batch.status == "draft":
+            target_status = "CREATING_CANDIDATE_BATCH"
             action = "candidate_batch_linked"
         else:
             self.session.rollback()
             return workflow
 
-        if (
+        workflow_already_reconciled = (
             workflow.status == target_status
             and workflow.candidate_batch_id == batch.id
-        ):
-            self.session.rollback()
-            return workflow
+        )
         if workflow.status in TERMINAL_WORKFLOW_STATUSES:
+            if workflow_already_reconciled:
+                self.session.rollback()
+                return workflow
             self.session.rollback()
             raise ValueError("terminal workflow conflicts with batch decision")
         self._require_transition(workflow.status, target_status)
@@ -1108,6 +1220,14 @@ class WorkflowService:
                 WorkflowStep.kind == "CREATING_CANDIDATE_BATCH",
             )
         )
+        should_update_step = (
+            batch.status != "draft"
+            and candidate_step is not None
+            and candidate_step.status in {"PENDING", "RUNNING"}
+        )
+        if workflow_already_reconciled and not should_update_step:
+            self.session.rollback()
+            return workflow
         try:
             workflow_claim = self.session.execute(
                 update(GenerationWorkflow)
@@ -1115,6 +1235,7 @@ class WorkflowService:
                     GenerationWorkflow.id == workflow.id,
                     GenerationWorkflow.status == workflow.status,
                     GenerationWorkflow.revision == workflow.revision,
+                    GenerationWorkflow.current_position == workflow.current_position,
                 )
                 .values(
                     status=target_status,
@@ -1126,18 +1247,33 @@ class WorkflowService:
             )
             if workflow_claim.rowcount != 1:
                 raise ValueError("batch reconciliation conflict")
-            if candidate_step is not None and candidate_step.status in {
-                "PENDING",
-                "RUNNING",
-            }:
+            if should_update_step:
+                assert candidate_step is not None
+                step_predicates = [
+                    WorkflowStep.id == candidate_step.id,
+                    WorkflowStep.workflow_id == workflow.id,
+                    WorkflowStep.status == candidate_step.status,
+                    WorkflowStep.revision == candidate_step.revision,
+                    WorkflowStep.active_artifact_id.is_(None),
+                ]
+                if candidate_step.status == "RUNNING":
+                    step_predicates.extend(
+                        [
+                            WorkflowStep.lease_owner == candidate_step.lease_owner,
+                            WorkflowStep.lease_expires_at
+                            == candidate_step.lease_expires_at,
+                        ]
+                    )
+                else:
+                    step_predicates.extend(
+                        [
+                            WorkflowStep.lease_owner.is_(None),
+                            WorkflowStep.lease_expires_at.is_(None),
+                        ]
+                    )
                 step_claim = self.session.execute(
                     update(WorkflowStep)
-                    .where(
-                        WorkflowStep.id == candidate_step.id,
-                        WorkflowStep.status == candidate_step.status,
-                        WorkflowStep.revision == candidate_step.revision,
-                        WorkflowStep.active_artifact_id.is_(None),
-                    )
+                    .where(*step_predicates)
                     .values(
                         status="COMPLETED",
                         lease_owner=None,
@@ -1156,13 +1292,14 @@ class WorkflowService:
                     )
                     .values(active_workflow_id=None)
                 )
-            self._add_audit(
-                workflow.project_id,
-                workflow.id,
-                action,
-                "system",
-                {"candidate_batch_id": batch.id, "batch_status": batch.status},
-            )
+            if not workflow_already_reconciled:
+                self._add_audit(
+                    workflow.project_id,
+                    workflow.id,
+                    action,
+                    "system",
+                    {"candidate_batch_id": batch.id, "batch_status": batch.status},
+                )
             self.session.commit()
             return workflow
         except Exception:
@@ -1439,26 +1576,30 @@ class WorkflowService:
             raise ValueError("artifact metadata does not match payload")
         text_content = canonical_text
         visible_char_count = canonical_visible_count
-        canonical = json.dumps(
-            {
-                "kind": kind,
-                "ordinal": ordinal,
-                "text_content": text_content,
-                "payload": payload,
-                "visible_char_count": visible_char_count,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
+        if text_content is not None:
+            content_hash = sha256(text_content.encode("utf-8")).hexdigest()
+        else:
+            canonical = json.dumps(
+                {
+                    "kind": kind,
+                    "ordinal": ordinal,
+                    "text_content": text_content,
+                    "payload": payload,
+                    "visible_char_count": visible_char_count,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            content_hash = sha256(canonical.encode("utf-8")).hexdigest()
         return _ArtifactValues(
             kind=expected_kind,
             ordinal=step.ordinal,
             text_content=text_content,
             payload=payload,
             visible_char_count=visible_char_count,
-            content_hash=sha256(canonical.encode("utf-8")).hexdigest(),
+            content_hash=content_hash,
         )
 
     @staticmethod

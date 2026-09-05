@@ -3,12 +3,14 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 from threading import Barrier
 
 import pytest
-from sqlalchemy import event, func, select, update
+from sqlalchemy import event, func, select, text, update
 
 from ainovel.agents.contracts import BatchPlanDraft, ChapterPlan
+from ainovel.context import RequiredContextOverflow
 from ainovel.models import (
     AuditEvent,
     GenerationWorkflow,
@@ -28,6 +30,8 @@ from ainovel.providers.contracts import (
     ProviderTimeout,
     ProviderUnavailable,
 )
+from ainovel.providers.fake import FakeProvider
+from ainovel.services.context import ContextIndexService
 from ainovel.services.outlines import OutlineNodeInput, OutlineService
 from ainovel.services.projects import ProjectService
 from ainovel.services.prompts import PromptService
@@ -121,6 +125,32 @@ def _complete_plan(
         _response(),
         {"kind": "batch_plan", "payload": _plan_payload(workflow.requested_chapters)},
     )
+
+
+def _prepare_reviewer_step(
+    session, service: WorkflowService, workflow: GenerationWorkflow
+) -> WorkflowStep:
+    _complete_plan(service, workflow)
+    service.approve_plan(workflow.id, "author")
+    reviewer = session.scalar(
+        select(WorkflowStep).where(
+            WorkflowStep.workflow_id == workflow.id,
+            WorkflowStep.kind == "REVIEWING",
+        )
+    )
+    assert reviewer is not None
+    session.execute(
+        update(GenerationWorkflow)
+        .where(GenerationWorkflow.id == workflow.id)
+        .values(status="REVIEWING_BATCH", current_position=reviewer.position)
+    )
+    session.execute(
+        update(WorkflowStep)
+        .where(WorkflowStep.id == reviewer.id)
+        .values(status="PENDING")
+    )
+    session.commit()
+    return reviewer
 
 
 def test_workflow_contract_constants_are_exact_and_budgets_are_frozen() -> None:
@@ -702,7 +732,7 @@ def test_writer_artifact_rejects_text_or_count_that_disagrees_with_validated_pay
         workflow.id, {"GENERATING_CHAPTERS"}, "writer-a"
     )
     assert step is not None and step.kind == "WRITING"
-    attempt = service.record_attempt_start(step.id, "w" * 64)
+    attempt = service.record_attempt_start(step.id, "b" * 64)
 
     with pytest.raises(ValueError, match="artifact metadata does not match payload"):
         service.complete_attempt(
@@ -750,7 +780,7 @@ def test_reviewer_evidence_artifact_is_immutable_nonfinal_and_reclaimable(
 
     claimed = service.claim_step(workflow.id, {"REVIEWING_BATCH"}, "reviewer-a")
     assert claimed is not None and claimed.id == reviewer.id
-    attempt = service.record_attempt_start(claimed.id, "r" * 64)
+    attempt = service.record_attempt_start(claimed.id, "c" * 64)
     evidence = service.complete_attempt(
         attempt.id,
         _response(),
@@ -776,7 +806,7 @@ def test_reviewer_evidence_artifact_is_immutable_nonfinal_and_reclaimable(
         workflow.id, {"REVIEWING_BATCH"}, "reviewer-a"
     )
     assert second_claim is not None
-    second_attempt = service.record_attempt_start(second_claim.id, "s" * 64)
+    second_attempt = service.record_attempt_start(second_claim.id, "d" * 64)
     blocked = service.complete_attempt(
         second_attempt.id,
         _response(),
@@ -1219,3 +1249,320 @@ def test_terminal_reconciliation_never_clears_another_workflows_owner(
         session.get(NovelProject, workflow.project_id).active_workflow_id
         == "another-workflow"
     )
+
+
+def test_summary_completion_produces_text_hash_accepted_by_context_index(
+    session, workflow, clock
+) -> None:
+    service = WorkflowService(session, clock=clock)
+    _complete_plan(service, workflow)
+    service.approve_plan(workflow.id, "author")
+    writer = service.claim_step(
+        workflow.id, {"GENERATING_CHAPTERS"}, "writer-a"
+    )
+    assert writer is not None and writer.kind == "WRITING"
+    writer_attempt = service.record_attempt_start(writer.id, "b" * 64)
+    service.complete_attempt(
+        writer_attempt.id,
+        _response(),
+        {
+            "kind": "chapter_draft",
+            "payload": {"title": "Chapter 1", "body": "甲" * 4_500},
+        },
+    )
+    summarizer = service.claim_step(
+        workflow.id, {"GENERATING_CHAPTERS"}, "summarizer-a"
+    )
+    assert summarizer is not None and summarizer.kind == "SUMMARIZING"
+    summary_attempt = service.record_attempt_start(summarizer.id, "c" * 64)
+    summary_text = "Chapter one closes with the bridge still contested."
+    summary = service.complete_attempt(
+        summary_attempt.id,
+        _response(),
+        {
+            "kind": "chapter_summary_delta",
+            "payload": {
+                "summary": summary_text,
+                "state_delta": {"bridge": "contested"},
+            },
+        },
+    )
+    session.execute(
+        text(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS context_source_fts "
+            "USING fts5(source_id UNINDEXED, project_id UNINDEXED, text)"
+        )
+    )
+    session.commit()
+
+    indexed = ContextIndexService(session).index_workflow_artifact(summary.id)
+
+    assert summary.content_hash == sha256(summary_text.encode("utf-8")).hexdigest()
+    assert indexed.text == summary_text
+    assert indexed.content_hash == summary.content_hash
+
+
+def test_draft_batch_reconciliation_only_binds_and_leaves_crashed_step_recoverable(
+    session, workflow, clock
+) -> None:
+    candidate = WorkflowStep(
+        id="draft-candidate-step",
+        workflow_id=workflow.id,
+        kind="CREATING_CANDIDATE_BATCH",
+        ordinal=None,
+        position=1,
+        status="RUNNING",
+        attempt_count=0,
+        lease_owner="batch-worker",
+        lease_expires_at=clock.now() + timedelta(seconds=300),
+        revision=1,
+    )
+    batch = WritingBatch(
+        id="draft-candidate-batch",
+        project_id=workflow.project_id,
+        base_outline_version_id=workflow.base_outline_version_id,
+        sequence_number=1,
+        planned_chapters=workflow.requested_chapters,
+        status="draft",
+        source_workflow_id=workflow.id,
+    )
+    session.add_all([candidate, batch])
+    session.execute(
+        update(GenerationWorkflow)
+        .where(GenerationWorkflow.id == workflow.id)
+        .values(
+            status="CREATING_CANDIDATE_BATCH",
+            current_position=candidate.position,
+            candidate_batch_id=None,
+        )
+    )
+    session.commit()
+
+    service = WorkflowService(session, clock=clock)
+    first = service.reconcile_batch_decision(workflow.id)
+    second = service.reconcile_batch_decision(workflow.id)
+
+    assert first.status == second.status == "CREATING_CANDIDATE_BATCH"
+    assert first.candidate_batch_id == second.candidate_batch_id == batch.id
+    session.expire_all()
+    stored_step = session.get(WorkflowStep, candidate.id)
+    assert stored_step.status == "RUNNING"
+    assert stored_step.lease_owner == "batch-worker"
+    assert stored_step.lease_expires_at == clock.now() + timedelta(seconds=300)
+    assert session.get(NovelProject, workflow.project_id).active_workflow_id == workflow.id
+    assert session.scalar(
+        select(func.count())
+        .select_from(AuditEvent)
+        .where(
+            AuditEvent.entity_id == workflow.id,
+            AuditEvent.action == "candidate_batch_linked",
+        )
+    ) == 1
+
+    clock.advance(seconds=301)
+    assert service.recover_expired_claims(workflow.id, clock.now()) == 1
+    session.expire_all()
+    recovered = session.get(WorkflowStep, candidate.id)
+    assert recovered.status == "PENDING"
+    assert recovered.lease_owner is None
+    assert recovered.lease_expires_at is None
+
+
+def test_required_context_overflow_pauses_claim_before_attempt_or_provider_call(
+    session, workflow, clock
+) -> None:
+    service = WorkflowService(session, clock=clock)
+    provider = FakeProvider([])
+    step = service.claim_step(
+        workflow.id, {"PLANNING"}, "context-worker", lease_seconds=30
+    )
+    assert step is not None
+    overflow = RequiredContextOverflow(
+        "constitution:sk-secret-material", required_tokens=9_001, capacity=4_000
+    )
+
+    with pytest.raises(ValueError, match="context overflow pause conflict"):
+        service.pause_context_overflow(step.id, "different-worker", overflow)
+    paused = service.pause_context_overflow(step.id, "context-worker", overflow)
+
+    assert paused.status == "PAUSED_CONTEXT_OVERFLOW"
+    assert paused.last_error_code == "required_context_overflow"
+    assert paused.last_error_detail == "required context exceeds the available input budget"
+    assert "secret" not in paused.last_error_detail
+    session.expire_all()
+    stored_step = session.get(WorkflowStep, step.id)
+    assert stored_step.status == "PAUSED"
+    assert stored_step.lease_owner is None
+    assert stored_step.lease_expires_at is None
+    assert session.scalar(
+        select(func.count()).select_from(ModelAttempt).where(ModelAttempt.step_id == step.id)
+    ) == 0
+    assert provider.requests == []
+    audit = session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.entity_id == workflow.id,
+            AuditEvent.action == "workflow_paused",
+        )
+    )
+    assert audit is not None
+    assert audit.details == {"reason": "required_context_overflow"}
+
+
+def test_required_context_overflow_rejects_an_expired_lease(
+    session, workflow, clock
+) -> None:
+    service = WorkflowService(session, clock=clock)
+    step = service.claim_step(
+        workflow.id, {"PLANNING"}, "context-worker", lease_seconds=30
+    )
+    assert step is not None
+    clock.advance(seconds=31)
+
+    with pytest.raises(ValueError, match="context overflow pause conflict"):
+        service.pause_context_overflow(
+            step.id,
+            "context-worker",
+            RequiredContextOverflow("constitution", required_tokens=2, capacity=1),
+        )
+
+    session.expire_all()
+    assert session.get(GenerationWorkflow, workflow.id).status == "PLANNING"
+    assert session.get(WorkflowStep, step.id).status == "RUNNING"
+    assert session.scalar(
+        select(func.count()).select_from(ModelAttempt).where(ModelAttempt.step_id == step.id)
+    ) == 0
+
+
+def test_expired_attempt_failure_is_fenced_and_lease_recovery_wins(
+    session, workflow, clock
+) -> None:
+    service = WorkflowService(session, clock=clock)
+    step = service.claim_step(
+        workflow.id, {"PLANNING"}, "worker-a", lease_seconds=30
+    )
+    assert step is not None
+    attempt = service.record_attempt_start(step.id, "d" * 64)
+    clock.advance(seconds=31)
+
+    with pytest.raises(ValueError, match="attempt failure conflict"):
+        service.fail_attempt(attempt.id, ProviderTimeout("late timeout with secret"))
+
+    assert service.recover_expired_claims(workflow.id, clock.now()) == 1
+    session.expire_all()
+    stored_attempt = session.get(ModelAttempt, attempt.id)
+    stored_step = session.get(WorkflowStep, step.id)
+    assert stored_attempt.status == "FAILED"
+    assert stored_attempt.error_code == "lease_expired"
+    assert stored_step.status == "PENDING"
+    assert stored_step.lease_owner is None
+
+
+@pytest.mark.parametrize(
+    "request_digest",
+    [
+        "A" * 64,
+        "g" * 64,
+        "a" * 63,
+        "a" * 65,
+        "sk-live-secret-material",
+        f" {'a' * 64} ",
+    ],
+)
+def test_attempt_start_rejects_noncanonical_sha256_without_mutation(
+    session, workflow, clock, request_digest
+) -> None:
+    service = WorkflowService(session, clock=clock)
+    step = service.claim_step(workflow.id, {"PLANNING"}, "worker-a")
+    assert step is not None
+    initial_revision = session.get(WorkflowStep, step.id).revision
+
+    with pytest.raises(ValueError, match="canonical SHA-256"):
+        service.record_attempt_start(step.id, request_digest)
+
+    session.expire_all()
+    stored_step = session.get(WorkflowStep, step.id)
+    assert stored_step.attempt_count == 0
+    assert stored_step.revision == initial_revision
+    assert session.scalar(
+        select(func.count()).select_from(ModelAttempt).where(ModelAttempt.step_id == step.id)
+    ) == 0
+
+
+def test_nonfinal_review_requires_first_attempt_with_real_evidence_request(
+    session, workflow, clock
+) -> None:
+    service = WorkflowService(session, clock=clock)
+    reviewer = _prepare_reviewer_step(session, service, workflow)
+    claimed = service.claim_step(workflow.id, {"REVIEWING_BATCH"}, "reviewer-a")
+    assert claimed is not None and claimed.id == reviewer.id
+    attempt = service.record_attempt_start(claimed.id, "e" * 64)
+
+    with pytest.raises(ValueError, match="reviewer evidence request is invalid"):
+        service.complete_attempt(
+            attempt.id,
+            _response(),
+            {
+                "kind": "batch_review",
+                "payload": {"passed": True, "issues": [], "evidence_queries": []},
+            },
+            finalize_step=False,
+        )
+
+    session.expire_all()
+    assert session.get(ModelAttempt, attempt.id).status == "RUNNING"
+    assert session.get(WorkflowStep, reviewer.id).status == "RUNNING"
+    assert session.scalar(
+        select(func.count())
+        .select_from(WorkflowArtifact)
+        .where(WorkflowArtifact.kind == "batch_review")
+    ) == 0
+
+
+def test_second_review_evidence_request_pauses_instead_of_becoming_pending(
+    session, workflow, clock
+) -> None:
+    service = WorkflowService(session, clock=clock)
+    reviewer = _prepare_reviewer_step(session, service, workflow)
+    first_claim = service.claim_step(
+        workflow.id, {"REVIEWING_BATCH"}, "reviewer-a"
+    )
+    assert first_claim is not None and first_claim.id == reviewer.id
+    first_attempt = service.record_attempt_start(first_claim.id, "e" * 64)
+    service.complete_attempt(
+        first_attempt.id,
+        _response(),
+        {
+            "kind": "batch_review",
+            "payload": {
+                "passed": False,
+                "issues": ["timeline unclear"],
+                "evidence_queries": ["chapter 1 bridge"],
+            },
+        },
+        finalize_step=False,
+    )
+    second_claim = service.claim_step(
+        workflow.id, {"REVIEWING_BATCH"}, "reviewer-b"
+    )
+    assert second_claim is not None
+    second_attempt = service.record_attempt_start(second_claim.id, "f" * 64)
+
+    artifact = service.complete_attempt(
+        second_attempt.id,
+        _response(),
+        {
+            "kind": "batch_review",
+            "payload": {
+                "passed": False,
+                "issues": ["timeline still unclear"],
+                "evidence_queries": ["chapter 2 bridge"],
+            },
+        },
+        finalize_step=False,
+    )
+
+    session.expire_all()
+    stored_step = session.get(WorkflowStep, reviewer.id)
+    assert session.get(GenerationWorkflow, workflow.id).status == "PAUSED_REVIEW"
+    assert stored_step.status == "PAUSED"
+    assert stored_step.active_artifact_id == artifact.id
