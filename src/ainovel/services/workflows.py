@@ -206,6 +206,14 @@ class SystemClock:
         return datetime.now(timezone.utc)
 
 
+class StaleOutlineCompletion(RuntimeError):
+    """The provider returned after the workflow's outline snapshot became stale."""
+
+
+class _AttemptCompletionConflict(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class _ArtifactValues:
     kind: str
@@ -704,10 +712,17 @@ class WorkflowService:
             if step is not None
             else None
         )
+        project = (
+            self.session.get(NovelProject, workflow.project_id)
+            if workflow is not None
+            else None
+        )
         now = self._aware_utc(self.clock.now())
         if (
             step is None
             or workflow is None
+            or project is None
+            or project.active_workflow_id != workflow.id
             or attempt.status != "RUNNING"
             or attempt.attempt_number != step.attempt_count
             or step.status != "RUNNING"
@@ -722,6 +737,13 @@ class WorkflowService:
         if not finalize_step and step.kind != "REVIEWING":
             self.session.rollback()
             raise ValueError("only reviewer evidence artifacts may be non-final")
+        if project.official_outline_version_id != workflow.base_outline_version_id:
+            self.session.rollback()
+            if self._pause_stale_attempt_completion(attempt_id, response):
+                raise StaleOutlineCompletion(
+                    "official outline changed during provider call"
+                )
+            raise ValueError("attempt completion conflict")
 
         try:
             artifact_values = self._artifact_values(step, artifact)
@@ -765,6 +787,14 @@ class WorkflowService:
                     GenerationWorkflow.status == workflow.status,
                     GenerationWorkflow.revision == workflow.revision,
                     GenerationWorkflow.current_position == step.position,
+                    select(NovelProject.id)
+                    .where(
+                        NovelProject.id == workflow.project_id,
+                        NovelProject.active_workflow_id == workflow.id,
+                        NovelProject.official_outline_version_id
+                        == workflow.base_outline_version_id,
+                    )
+                    .exists(),
                 )
                 .values(
                     status=target_status,
@@ -827,9 +857,147 @@ class WorkflowService:
                 or step_claim.rowcount != 1
                 or attempt_claim.rowcount != 1
             ):
-                raise ValueError("attempt completion conflict")
+                raise _AttemptCompletionConflict
             self.session.commit()
             return artifact_row
+        except _AttemptCompletionConflict:
+            self.session.rollback()
+            if self._pause_stale_attempt_completion(attempt_id, response):
+                raise StaleOutlineCompletion(
+                    "official outline changed during attempt completion"
+                )
+            raise ValueError("attempt completion conflict") from None
+        except Exception:
+            self.session.rollback()
+            raise
+
+    def _pause_stale_attempt_completion(
+        self, attempt_id: str, response: ModelResponse
+    ) -> bool:
+        self.session.expire_all()
+        attempt = self.session.get(ModelAttempt, attempt_id)
+        step = (
+            self.session.get(WorkflowStep, attempt.step_id)
+            if attempt is not None
+            else None
+        )
+        workflow = (
+            self.session.get(GenerationWorkflow, step.workflow_id)
+            if step is not None
+            else None
+        )
+        project = (
+            self.session.get(NovelProject, workflow.project_id)
+            if workflow is not None
+            else None
+        )
+        now = self._aware_utc(self.clock.now())
+        if (
+            attempt is None
+            or step is None
+            or workflow is None
+            or project is None
+            or project.active_workflow_id != workflow.id
+            or project.official_outline_version_id == workflow.base_outline_version_id
+            or attempt.status != "RUNNING"
+            or attempt.attempt_number != step.attempt_count
+            or step.status != "RUNNING"
+            or step.active_artifact_id is not None
+            or step.lease_owner is None
+            or step.lease_expires_at is None
+            or step.lease_expires_at <= now
+            or workflow.current_position != step.position
+        ):
+            self.session.rollback()
+            return False
+        self._require_transition(workflow.status, "PAUSED_STALE_VERSION")
+        try:
+            stale_project = (
+                select(NovelProject.id)
+                .where(
+                    NovelProject.id == workflow.project_id,
+                    NovelProject.active_workflow_id == workflow.id,
+                    NovelProject.official_outline_version_id
+                    != workflow.base_outline_version_id,
+                )
+                .exists()
+            )
+            workflow_claim = self.session.execute(
+                update(GenerationWorkflow)
+                .where(
+                    GenerationWorkflow.id == workflow.id,
+                    GenerationWorkflow.status == workflow.status,
+                    GenerationWorkflow.revision == workflow.revision,
+                    GenerationWorkflow.current_position == step.position,
+                    stale_project,
+                )
+                .values(
+                    status="PAUSED_STALE_VERSION",
+                    actual_input_tokens=GenerationWorkflow.actual_input_tokens
+                    + (response.input_tokens or 0),
+                    actual_output_tokens=GenerationWorkflow.actual_output_tokens
+                    + (response.output_tokens or 0),
+                    revision=workflow.revision + 1,
+                    last_error_code="stale_outline",
+                    last_error_detail=(
+                        "the official outline changed during the provider call"
+                    ),
+                )
+            )
+            step_claim = self.session.execute(
+                update(WorkflowStep)
+                .where(
+                    WorkflowStep.id == step.id,
+                    WorkflowStep.workflow_id == workflow.id,
+                    WorkflowStep.status == "RUNNING",
+                    WorkflowStep.revision == step.revision,
+                    WorkflowStep.attempt_count == attempt.attempt_number,
+                    WorkflowStep.active_artifact_id.is_(None),
+                    WorkflowStep.lease_owner == step.lease_owner,
+                    WorkflowStep.lease_expires_at == step.lease_expires_at,
+                    WorkflowStep.lease_expires_at > now,
+                )
+                .values(
+                    status="PAUSED",
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    revision=step.revision + 1,
+                )
+            )
+            attempt_claim = self.session.execute(
+                update(ModelAttempt)
+                .where(
+                    ModelAttempt.id == attempt.id,
+                    ModelAttempt.step_id == step.id,
+                    ModelAttempt.attempt_number == step.attempt_count,
+                    ModelAttempt.status == "RUNNING",
+                )
+                .values(
+                    status="FAILED",
+                    provider_response_id=response.provider_response_id,
+                    input_tokens=response.input_tokens,
+                    output_tokens=response.output_tokens,
+                    latency_ms=response.latency_ms,
+                    error_code="stale_outline",
+                    error_detail="official outline changed during provider call",
+                )
+            )
+            if (
+                workflow_claim.rowcount != 1
+                or step_claim.rowcount != 1
+                or attempt_claim.rowcount != 1
+            ):
+                self.session.rollback()
+                return False
+            self._add_audit(
+                workflow.project_id,
+                workflow.id,
+                "workflow_paused",
+                "system",
+                {"reason": "stale_outline", "during": "attempt_completion"},
+            )
+            self.session.commit()
+            return True
         except Exception:
             self.session.rollback()
             raise

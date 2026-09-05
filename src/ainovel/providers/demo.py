@@ -7,6 +7,7 @@ from ainovel.providers.contracts import (
     ProviderDiagnostic,
     ProviderProtocolError,
 )
+from ainovel.services.counting import count_visible_characters
 
 
 class DemoFakeProvider:
@@ -62,4 +63,19 @@ class DemoFakeProvider:
         ordinal = request.input_payload.get("ordinal")
         if not isinstance(ordinal, int) or ordinal < 1:
             raise ProviderProtocolError("chapter writer requires a positive ordinal")
-        return {"title": f"演示第{ordinal}章", "body": "演" * 4500}
+        plan = request.input_payload.get("chapter_plan")
+        if plan is None:
+            goal = f"推进演示情节第{ordinal}步"
+            ending_hook = f"演示悬念{ordinal}"
+        elif not isinstance(plan, dict):
+            raise ProviderProtocolError("chapter writer requires the approved chapter plan")
+        else:
+            goal = plan.get("goal")
+            ending_hook = plan.get("ending_hook")
+        if not isinstance(goal, str) or not isinstance(ending_hook, str):
+            raise ProviderProtocolError("chapter plan requires goal and ending_hook")
+        required = f"{goal}。{ending_hook}。"
+        padding = 4500 - count_visible_characters(required)
+        if padding < 0:
+            raise ProviderProtocolError("chapter plan coverage exceeds chapter length")
+        return {"title": f"演示第{ordinal}章", "body": required + "演" * padding}

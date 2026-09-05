@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import json
 
@@ -7,6 +8,7 @@ import pytest
 from sqlalchemy import func, select, text, update
 
 from ainovel.agents.runner import AgentRunner
+from ainovel.context import ConservativeEstimator
 from ainovel.models import (
     ContextPacket,
     ContextSource,
@@ -81,6 +83,11 @@ def plan_payload(count: int) -> dict[str, object]:
     }
 
 
+def chapter_body(ordinal: int, visible_count: int = 4500) -> str:
+    required = f"推进第{ordinal}章目标。第{ordinal}章悬念。"
+    return required + chr(0x4E00 + ordinal) * (visible_count - len(required))
+
+
 def success_script(count: int = 5) -> list[ModelResponse]:
     scripted = [
         response(
@@ -97,7 +104,7 @@ def success_script(count: int = 5) -> list[ModelResponse]:
             response(
                 {
                     "title": f"第{ordinal}章",
-                    "body": chr(0x4E00 + ordinal) * (4499 + ordinal),
+                    "body": chapter_body(ordinal, 4499 + ordinal),
                 },
                 call,
             )
@@ -299,6 +306,61 @@ def test_provider_call_occurs_after_database_transaction_is_closed(
     assert result.status == "AWAITING_PLAN_APPROVAL"
 
 
+def test_outline_replacement_during_provider_call_atomically_pauses_completion(
+    session_factory, session, ready_project, clock
+) -> None:
+    class OutlineReplacingProvider(FakeProvider):
+        def generate(self, request):
+            with session_factory() as independent:
+                replacement = OutlineService(independent).create_candidate(
+                    ready_project.id,
+                    [
+                        OutlineNodeInput(
+                            key="replacement-during-call",
+                            parent_key=None,
+                            kind="book",
+                            title="调用期间替换的大纲",
+                            order=0,
+                        )
+                    ],
+                    reason="replace during provider call",
+                )
+                OutlineService(independent).approve(replacement.id)
+            return super().generate(request)
+
+    provider = OutlineReplacingProvider(
+        [response(plan_payload(1), 1, input_tokens=321, output_tokens=123, latency_ms=47)]
+    )
+    workflow = WorkflowService(session, clock=clock).start(
+        ready_project.id, "fake", "scripted", 1, DEFAULT_BUDGETS
+    )
+
+    result = make_orchestrator(session_factory, provider, clock).advance(workflow.id)
+
+    session.expire_all()
+    stored = session.get(GenerationWorkflow, workflow.id)
+    step = session.scalar(
+        select(WorkflowStep).where(WorkflowStep.workflow_id == workflow.id)
+    )
+    attempt = session.scalar(select(ModelAttempt).where(ModelAttempt.step_id == step.id))
+    assert result.status == "PAUSED_STALE_VERSION"
+    assert result.completed_step is None
+    assert stored.status == "PAUSED_STALE_VERSION"
+    assert stored.current_position == 0
+    assert stored.actual_input_tokens == 321
+    assert stored.actual_output_tokens == 123
+    assert step.status == "PAUSED"
+    assert step.active_artifact_id is None
+    assert attempt.status == "FAILED"
+    assert attempt.error_code == "stale_outline"
+    assert attempt.provider_response_id == "fake-1"
+    assert attempt.input_tokens == 321
+    assert attempt.output_tokens == 123
+    assert attempt.latency_ms == 47
+    assert session.scalar(select(func.count()).select_from(WorkflowArtifact)) == 0
+    assert session.get(NovelProject, ready_project.id).active_workflow_id == workflow.id
+
+
 def test_context_packet_uses_provider_effective_input_capacity(
     session_factory, session, ready_project, clock
 ) -> None:
@@ -318,6 +380,17 @@ def test_context_packet_uses_provider_effective_input_capacity(
     assert provider.requests[0].max_output_tokens == 1000
     assert packet.max_input_tokens == 2976
     assert packet.reserved_output_tokens == 1000
+    serialized = json.dumps(
+        asdict(provider.requests[0]),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    assert (
+        ConservativeEstimator().estimate(serialized)
+        <= provider.requests[0].max_input_tokens
+    )
 
 
 def test_five_chapters_are_generated_and_copied_to_one_candidate_batch(
@@ -413,6 +486,75 @@ def test_invalid_length_retries_then_pauses_before_candidate_creation(
     ]
 
 
+def test_unrelated_full_length_chapter_fails_deterministic_plan_coverage(
+    session_factory, session, ready_project, clock
+) -> None:
+    unrelated = "无" * 4500
+    provider = FakeProvider(
+        [
+            response(plan_payload(1), 1),
+            response({"title": "第1章", "body": unrelated}, 2),
+        ]
+    )
+    workflow = WorkflowService(session, clock=clock).start(
+        ready_project.id, "fake", "scripted", 1, DEFAULT_BUDGETS
+    )
+    orchestrator = make_orchestrator(session_factory, provider, clock)
+    orchestrator.advance(workflow.id)
+    WorkflowService(session, clock=clock).approve_plan(workflow.id, "author")
+
+    result = orchestrator.advance(workflow.id)
+
+    session.expire_all()
+    writer = session.scalar(
+        select(WorkflowStep).where(
+            WorkflowStep.workflow_id == workflow.id,
+            WorkflowStep.kind == "WRITING",
+        )
+    )
+    attempt = session.scalar(
+        select(ModelAttempt).where(ModelAttempt.step_id == writer.id)
+    )
+    assert result.completed_step is None
+    assert writer.status == "PENDING"
+    assert writer.active_artifact_id is None
+    assert attempt.status == "FAILED"
+
+
+def test_validation_recovery_recomputes_body_coverage_instead_of_hardcoding_success(
+    session_factory, session, ready_project, clock
+) -> None:
+    provider = FakeProvider([response(plan_payload(1), 1)])
+    workflow = WorkflowService(session, clock=clock).start(
+        ready_project.id, "fake", "scripted", 1, DEFAULT_BUDGETS
+    )
+    orchestrator = make_orchestrator(session_factory, provider, clock)
+    orchestrator.advance(workflow.id)
+    WorkflowService(session, clock=clock).approve_plan(workflow.id, "author")
+
+    service = WorkflowService(session, clock=clock)
+    writer = service.claim_step(
+        workflow.id, {"GENERATING_CHAPTERS"}, "recovery-writer"
+    )
+    attempt = service.record_attempt_start(writer.id, "a" * 64)
+    unrelated = "无" * 4500
+    chapter = service.complete_attempt(
+        attempt.id,
+        response({"title": "第1章", "body": unrelated}, 2),
+        {"title": "第1章", "body": unrelated},
+    )
+    assert session.scalar(
+        select(func.count())
+        .select_from(WorkflowArtifact)
+        .where(WorkflowArtifact.kind == "chapter_validation")
+    ) == 0
+
+    recovered = orchestrator._validation_payload(session, chapter)
+
+    assert recovered["approved_goal_present"] is False
+    assert recovered["approved_key_event_present"] is False
+
+
 def test_provider_attempt_exhaustion_pauses_without_skipping_the_step(
     session_factory, session, ready_project, clock
 ) -> None:
@@ -438,6 +580,40 @@ def test_provider_attempt_exhaustion_pauses_without_skipping_the_step(
     assert result.status == "PAUSED_ATTEMPTS"
     assert step.status == "PAUSED"
     assert step.attempt_count == 2
+
+
+def test_two_expired_running_attempts_pause_without_leaking_or_calling_provider(
+    session_factory, session, ready_project, clock
+) -> None:
+    provider = FakeProvider([])
+    workflow = WorkflowService(session, clock=clock).start(
+        ready_project.id, "fake", "scripted", 1, DEFAULT_BUDGETS
+    )
+    service = WorkflowService(session, clock=clock)
+    for attempt_number in (1, 2):
+        step = service.claim_step(workflow.id, {"PLANNING"}, "crashing-worker")
+        service.record_attempt_start(step.id, f"{attempt_number}" * 64)
+        clock.advance(seconds=301)
+        assert service.recover_expired_claims(workflow.id, clock.now()) == 1
+
+    result = make_orchestrator(session_factory, provider, clock).advance(workflow.id)
+
+    session.expire_all()
+    stored = session.get(GenerationWorkflow, workflow.id)
+    step = session.scalar(
+        select(WorkflowStep).where(WorkflowStep.workflow_id == workflow.id)
+    )
+    attempts = session.scalars(
+        select(ModelAttempt)
+        .where(ModelAttempt.step_id == step.id)
+        .order_by(ModelAttempt.attempt_number)
+    ).all()
+    assert result.status == "PAUSED_ATTEMPTS"
+    assert stored.status == "PAUSED_ATTEMPTS"
+    assert step.status == "PAUSED"
+    assert step.attempt_count == 2
+    assert [attempt.status for attempt in attempts] == ["FAILED", "FAILED"]
+    assert provider.requests == []
 
 
 def test_required_overflow_pauses_before_attempt_and_provider_call(
@@ -500,13 +676,13 @@ def test_reviewer_evidence_is_bounded_offset_bearing_and_first_query_is_preserve
     provider = FakeProvider(
         [
             response(plan_payload(1), 1),
-            response({"title": "第1章", "body": "甲" * 4500}, 2),
+            response({"title": "第1章", "body": chapter_body(1)}, 2),
             response({"summary": "候选摘要1", "state_delta": {"stage": 1}}, 3),
             response(
                 {
                     "passed": False,
                     "issues": ["需要核对大纲"],
-                    "evidence_queries": ["全书总纲"],
+                    "evidence_queries": [" 全书总纲 ", "全书总纲"],
                 },
                 4,
             ),
@@ -537,9 +713,9 @@ def test_reviewer_evidence_is_bounded_offset_bearing_and_first_query_is_preserve
     ]
     assert result.status == "AWAITING_CONTENT_APPROVAL"
     assert len(reviews) == 2
-    assert reviews[0].payload["evidence_queries"] == ["全书总纲"]
+    assert reviews[0].payload["evidence_queries"] == [" 全书总纲 ", "全书总纲"]
     evidence = review_requests[1].input_payload["evidence"]
-    assert evidence
+    assert len(evidence) == 1
     assert evidence[0]["query"] == "全书总纲"
     assert evidence[0]["excerpt_start"] >= 0
     assert evidence[0]["excerpt_end"] > evidence[0]["excerpt_start"]
@@ -552,7 +728,7 @@ def test_failed_final_review_keeps_first_evidence_query_and_never_creates_batch(
     provider = FakeProvider(
         [
             response(plan_payload(1), 1),
-            response({"title": "第1章", "body": "甲" * 4500}, 2),
+            response({"title": "第1章", "body": chapter_body(1)}, 2),
             response({"summary": "候选摘要1", "state_delta": {}}, 3),
             response(
                 {
@@ -641,6 +817,152 @@ def test_candidate_batch_creation_is_exactly_once_after_create_then_crash(
     assert BatchService(session).list_chapters(batches[0].id)[0].ordinal == 1
 
 
+def test_committed_candidate_copy_is_reused_exactly_once_after_crash(
+    session_factory, session, ready_project, clock, monkeypatch
+) -> None:
+    provider = FakeProvider(success_script(1))
+    workflow = WorkflowService(session, clock=clock).start(
+        ready_project.id, "fake", "scripted", 1, DEFAULT_BUDGETS
+    )
+    orchestrator = make_orchestrator(session_factory, provider, clock)
+    orchestrator.advance(workflow.id)
+    WorkflowService(session, clock=clock).approve_plan(workflow.id, "author")
+    orchestrator.advance(workflow.id)
+    orchestrator.advance(workflow.id)
+    orchestrator.advance(workflow.id)
+
+    original_save = BatchService.save_candidate_chapter
+    crashed = False
+
+    def crash_after_committed_copy(self, *args, **kwargs):
+        nonlocal crashed
+        chapter = original_save(self, *args, **kwargs)
+        if not crashed:
+            crashed = True
+            raise RuntimeError("simulated committed-copy crash")
+        return chapter
+
+    monkeypatch.setattr(
+        BatchService, "save_candidate_chapter", crash_after_committed_copy
+    )
+    with pytest.raises(RuntimeError, match="committed-copy crash"):
+        orchestrator.advance(workflow.id)
+
+    session.expire_all()
+    batch = session.scalar(
+        select(WritingBatch).where(WritingBatch.source_workflow_id == workflow.id)
+    )
+    assert len(BatchService(session).list_chapters(batch.id)) == 1
+
+    clock.advance(seconds=301)
+    result = orchestrator.advance(workflow.id)
+
+    session.expire_all()
+    assert result.status == "AWAITING_CONTENT_APPROVAL"
+    assert session.scalar(
+        select(func.count())
+        .select_from(WritingBatch)
+        .where(WritingBatch.source_workflow_id == workflow.id)
+    ) == 1
+    assert len(BatchService(session).list_chapters(batch.id)) == 1
+
+
+def test_post_reconcile_commit_crash_is_idempotent_on_next_advance(
+    session_factory, session, ready_project, clock, monkeypatch
+) -> None:
+    provider = FakeProvider(success_script(1))
+    workflow = WorkflowService(session, clock=clock).start(
+        ready_project.id, "fake", "scripted", 1, DEFAULT_BUDGETS
+    )
+    orchestrator = make_orchestrator(session_factory, provider, clock)
+    orchestrator.advance(workflow.id)
+    WorkflowService(session, clock=clock).approve_plan(workflow.id, "author")
+    orchestrator.advance(workflow.id)
+    orchestrator.advance(workflow.id)
+    orchestrator.advance(workflow.id)
+
+    original_reconcile = WorkflowService.reconcile_batch_decision
+    calls = 0
+
+    def crash_after_final_reconcile(self, workflow_id):
+        nonlocal calls
+        result = original_reconcile(self, workflow_id)
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated post-reconcile-commit crash")
+        return result
+
+    monkeypatch.setattr(
+        WorkflowService, "reconcile_batch_decision", crash_after_final_reconcile
+    )
+    with pytest.raises(RuntimeError, match="post-reconcile-commit crash"):
+        orchestrator.advance(workflow.id)
+
+    session.expire_all()
+    stored = session.get(GenerationWorkflow, workflow.id)
+    candidate_step = session.scalar(
+        select(WorkflowStep).where(
+            WorkflowStep.workflow_id == workflow.id,
+            WorkflowStep.kind == "CREATING_CANDIDATE_BATCH",
+        )
+    )
+    assert stored.status == "AWAITING_CONTENT_APPROVAL"
+    assert candidate_step.status == "COMPLETED"
+
+    result = orchestrator.advance(workflow.id)
+
+    assert result.status == "AWAITING_CONTENT_APPROVAL"
+    assert result.candidate_batch_id == stored.candidate_batch_id
+    assert session.scalar(
+        select(func.count())
+        .select_from(WritingBatch)
+        .where(WritingBatch.source_workflow_id == workflow.id)
+    ) == 1
+
+
+def test_terminal_candidate_rejection_seen_by_later_lookup_reconciles_directly(
+    session_factory, session, ready_project, clock, monkeypatch
+) -> None:
+    provider = FakeProvider(success_script(1))
+    workflow = WorkflowService(session, clock=clock).start(
+        ready_project.id, "fake", "scripted", 1, DEFAULT_BUDGETS
+    )
+    orchestrator = make_orchestrator(session_factory, provider, clock)
+    orchestrator.advance(workflow.id)
+    WorkflowService(session, clock=clock).approve_plan(workflow.id, "author")
+    orchestrator.advance(workflow.id)
+    orchestrator.advance(workflow.id)
+    orchestrator.advance(workflow.id)
+
+    original_get = BatchService.get
+    original_reject = BatchService.reject
+    draft_lookups = 0
+    deciding = False
+
+    def reject_on_second_draft_lookup(self, batch_id):
+        nonlocal deciding, draft_lookups
+        batch = original_get(self, batch_id)
+        if not deciding and batch.status == "draft":
+            draft_lookups += 1
+            if draft_lookups == 2:
+                deciding = True
+                try:
+                    original_reject(self, batch_id, "author rejected during copy")
+                finally:
+                    deciding = False
+                return original_get(self, batch_id)
+        return batch
+
+    monkeypatch.setattr(BatchService, "get", reject_on_second_draft_lookup)
+
+    result = orchestrator.advance(workflow.id)
+
+    session.expire_all()
+    assert result.status == "REJECTED"
+    assert session.get(GenerationWorkflow, workflow.id).status == "REJECTED"
+    assert session.get(NovelProject, ready_project.id).active_workflow_id is None
+
+
 def test_ready_candidate_batch_reconciles_once_after_pre_reconcile_crash(
     session_factory, session, ready_project, clock, monkeypatch
 ) -> None:
@@ -681,6 +1003,67 @@ def test_ready_candidate_batch_reconciles_once_after_pre_reconcile_crash(
 
     assert result.status == "AWAITING_CONTENT_APPROVAL"
     assert result.candidate_batch_id == batch.id
+    assert session.scalar(
+        select(func.count())
+        .select_from(WritingBatch)
+        .where(WritingBatch.source_workflow_id == workflow.id)
+    ) == 1
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected_status"),
+    [("approve", "COMPLETED"), ("reject", "REJECTED")],
+)
+def test_terminal_candidate_decision_reconciles_after_ready_before_reconcile_crash(
+    session_factory,
+    session,
+    ready_project,
+    clock,
+    monkeypatch,
+    decision,
+    expected_status,
+) -> None:
+    provider = FakeProvider(success_script(1))
+    workflow = WorkflowService(session, clock=clock).start(
+        ready_project.id, "fake", "scripted", 1, DEFAULT_BUDGETS
+    )
+    orchestrator = make_orchestrator(session_factory, provider, clock)
+    orchestrator.advance(workflow.id)
+    WorkflowService(session, clock=clock).approve_plan(workflow.id, "author")
+    orchestrator.advance(workflow.id)
+    orchestrator.advance(workflow.id)
+    orchestrator.advance(workflow.id)
+
+    original_reconcile = WorkflowService.reconcile_batch_decision
+    calls = 0
+
+    def crash_on_ready(self, workflow_id):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated ready-before-reconcile crash")
+        return original_reconcile(self, workflow_id)
+
+    monkeypatch.setattr(WorkflowService, "reconcile_batch_decision", crash_on_ready)
+    with pytest.raises(RuntimeError, match="ready-before-reconcile"):
+        orchestrator.advance(workflow.id)
+
+    session.expire_all()
+    batch = session.scalar(
+        select(WritingBatch).where(WritingBatch.source_workflow_id == workflow.id)
+    )
+    if decision == "approve":
+        BatchService(session).approve(batch.id, workflow.base_outline_version_id)
+    else:
+        BatchService(session).reject(batch.id, "author rejected candidate")
+
+    clock.advance(seconds=301)
+    result = orchestrator.advance(workflow.id)
+
+    session.expire_all()
+    assert result.status == expected_status
+    assert result.candidate_batch_id == batch.id
+    assert session.get(NovelProject, ready_project.id).active_workflow_id is None
     assert session.scalar(
         select(func.count())
         .select_from(WritingBatch)

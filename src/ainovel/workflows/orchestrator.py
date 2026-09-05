@@ -55,6 +55,7 @@ from ainovel.services.prompts import PromptService
 from ainovel.services.workflows import (
     EXECUTABLE_WORKFLOW_STATUSES,
     Clock,
+    StaleOutlineCompletion,
     SystemClock,
     WorkflowService,
 )
@@ -165,9 +166,15 @@ class WorkflowOrchestrator:
 
         attempt_service = self._workflow_service()
         try:
-            attempt = attempt_service.record_attempt_start(
-                claim.id, digest_request(request)
-            )
+            try:
+                attempt = attempt_service.record_attempt_start(
+                    claim.id, digest_request(request)
+                )
+            except ValueError:
+                current = self._current_result(workflow_id)
+                if current.status == "PAUSED_ATTEMPTS":
+                    return current
+                raise
         finally:
             attempt_service.session.close()
         try:
@@ -348,9 +355,12 @@ class WorkflowOrchestrator:
         )
         service = self._workflow_service()
         try:
-            artifact = service.complete_attempt(
-                attempt_id, response, result, finalize_step=finalize_step
-            )
+            try:
+                artifact = service.complete_attempt(
+                    attempt_id, response, result, finalize_step=finalize_step
+                )
+            except StaleOutlineCompletion:
+                return self._current_result(step.workflow_id)
         finally:
             service.session.close()
 
@@ -779,40 +789,14 @@ class WorkflowOrchestrator:
             workflow = session.get(GenerationWorkflow, step.workflow_id)
             if workflow is None:
                 raise ValueError("workflow not found")
-            chapter_plan = ChapterPlan.model_validate(
-                self._chapter_plan(session, workflow, step.ordinal)
-            )
-            completed_writers = session.scalar(
-                select(func.count())
-                .select_from(WorkflowStep)
-                .where(
-                    WorkflowStep.workflow_id == workflow.id,
-                    WorkflowStep.kind == "WRITING",
-                    WorkflowStep.ordinal < step.ordinal,
-                    WorkflowStep.status == "COMPLETED",
-                    WorkflowStep.active_artifact_id.is_not(None),
-                )
+            validations = self._chapter_validation_results(
+                session,
+                workflow,
+                step.ordinal,
+                result.title,
+                result.body,
             )
             session.rollback()
-        paragraphs = [
-            paragraph.strip()
-            for paragraph in re.split(r"\n\s*\n", result.body)
-            if len(paragraph.strip()) >= 80
-        ]
-        repeated_blocks = len(paragraphs) != len(set(paragraphs))
-        validations: dict[str, object] = {
-            "nonblank_title": bool(result.title.strip()),
-            "nonblank_body": bool(result.body.strip()),
-            "visible_character_count": count_visible_characters(result.body),
-            "visible_length_valid": 4500
-            <= count_visible_characters(result.body)
-            <= 6000,
-            "approved_plan_ordinal": chapter_plan.ordinal == step.ordinal,
-            "approved_goal_present": bool(chapter_plan.goal.strip()),
-            "approved_key_event_present": bool(chapter_plan.ending_hook.strip()),
-            "obvious_repeated_blocks": repeated_blocks,
-            "ordinal_continuity": completed_writers == step.ordinal - 1,
-        }
         if (
             not validations["nonblank_title"]
             or not validations["nonblank_body"]
@@ -825,6 +809,55 @@ class WorkflowOrchestrator:
         ):
             raise ProviderProtocolError("provider chapter failed deterministic validation")
         return validations
+
+    def _chapter_validation_results(
+        self,
+        session: Session,
+        workflow: GenerationWorkflow,
+        ordinal: int,
+        title: str,
+        body: str,
+    ) -> dict[str, object]:
+        chapter_plan = ChapterPlan.model_validate(
+            self._chapter_plan(session, workflow, ordinal)
+        )
+        completed_writers = session.scalar(
+            select(func.count())
+            .select_from(WorkflowStep)
+            .where(
+                WorkflowStep.workflow_id == workflow.id,
+                WorkflowStep.kind == "WRITING",
+                WorkflowStep.ordinal < ordinal,
+                WorkflowStep.status == "COMPLETED",
+                WorkflowStep.active_artifact_id.is_not(None),
+            )
+        )
+        paragraphs = [
+            paragraph.strip()
+            for paragraph in re.split(r"\n\s*\n", body)
+            if len(paragraph.strip()) >= 80
+        ]
+        normalized_body = self._coverage_text(body)
+        visible_count = count_visible_characters(body)
+        return {
+            "nonblank_title": bool(title.strip()),
+            "nonblank_body": bool(body.strip()),
+            "visible_character_count": visible_count,
+            "visible_length_valid": 4500 <= visible_count <= 6000,
+            "approved_plan_ordinal": chapter_plan.ordinal == ordinal,
+            "approved_goal_present": self._coverage_text(chapter_plan.goal)
+            in normalized_body,
+            "approved_key_event_present": self._coverage_text(
+                chapter_plan.ending_hook
+            )
+            in normalized_body,
+            "obvious_repeated_blocks": len(paragraphs) != len(set(paragraphs)),
+            "ordinal_continuity": completed_writers == ordinal - 1,
+        }
+
+    @staticmethod
+    def _coverage_text(value: str) -> str:
+        return re.sub(r"\s+", "", value).casefold()
 
     def _persist_validation_artifact(
         self, chapter_artifact_id: str, validations: dict[str, object]
@@ -873,20 +906,16 @@ class WorkflowOrchestrator:
             )
         )
         if row is None:
-            body = chapter.payload["body"]
-            payload = {
-                "nonblank_title": bool(chapter.payload["title"].strip()),
-                "nonblank_body": bool(body.strip()),
-                "visible_character_count": count_visible_characters(body),
-                "visible_length_valid": 4500
-                <= count_visible_characters(body)
-                <= 6000,
-                "approved_plan_ordinal": True,
-                "approved_goal_present": True,
-                "approved_key_event_present": True,
-                "obvious_repeated_blocks": False,
-                "ordinal_continuity": True,
-            }
+            workflow = session.get(GenerationWorkflow, chapter.workflow_id)
+            if workflow is None or chapter.ordinal is None:
+                raise ValueError("chapter validation context is unavailable")
+            payload = self._chapter_validation_results(
+                session,
+                workflow,
+                chapter.ordinal,
+                chapter.payload["title"],
+                chapter.payload["body"],
+            )
             canonical = _canonical_json(payload)
             row = WorkflowArtifact(
                 id=str(uuid4()),
@@ -936,21 +965,25 @@ class WorkflowOrchestrator:
                 )
             ).all()
             existing_queries = {
-                artifact.payload.get("query")
+                artifact.payload["query"].strip()
                 for artifact in existing
                 if isinstance(artifact.payload.get("query"), str)
+                and artifact.payload["query"].strip()
             }
             to_index.extend(artifact.id for artifact in existing)
             index = ContextIndexService(session)
             searchable = set(SOURCE_LAYERS) - EXCERPT_SOURCE_TYPES
             for query in queries:
-                if not isinstance(query, str) or not query.strip() or query in existing_queries:
+                if not isinstance(query, str):
+                    continue
+                normalized_query = query.strip()
+                if not normalized_query or normalized_query in existing_queries:
                     continue
                 rows = index.search(
-                    workflow.project_id, query.strip(), searchable, limit=2
+                    workflow.project_id, normalized_query, searchable, limit=2
                 )
                 for row in rows:
-                    match_at = row.text.find(query.strip())
+                    match_at = row.text.find(normalized_query)
                     center = match_at if match_at >= 0 else 0
                     start = max(0, center - MAX_L7_VISIBLE_CHARACTERS // 3)
                     end = min(len(row.text), start + MAX_L7_VISIBLE_CHARACTERS)
@@ -959,7 +992,7 @@ class WorkflowOrchestrator:
                     if not excerpt:
                         continue
                     payload = {
-                        "query": query.strip(),
+                        "query": normalized_query,
                         "explicitly_requested": True,
                         "canonical_source_type": row.source_type,
                         "canonical_source_id": row.source_id,
@@ -979,7 +1012,7 @@ class WorkflowOrchestrator:
                     )
                     session.add(artifact)
                     to_index.append(artifact.id)
-                existing_queries.add(query)
+                existing_queries.add(normalized_query)
             if session.new:
                 session.commit()
             else:
@@ -1067,6 +1100,9 @@ class WorkflowOrchestrator:
                 if batch_id is None:
                     raise
 
+        if batch_status in {"approved", "rejected"}:
+            return self._reconcile_terminal_candidate(workflow_id, step.kind)
+
         if batch_status == "draft":
             reconcile = self._workflow_service()
             try:
@@ -1139,13 +1175,19 @@ class WorkflowOrchestrator:
                     batch_id, ordinal, title, body, state_delta
                 )
 
+        terminal_status = False
         with self._session_factory() as session:
             persisted_batch = BatchService(session).get(batch_id)
             if persisted_batch.status == "draft":
-                BatchService(session).mark_ready(batch_id)
+                persisted_batch = BatchService(session).mark_ready(batch_id)
+            if persisted_batch.status in {"approved", "rejected"}:
+                terminal_status = True
+                session.rollback()
             elif persisted_batch.status != "ready_for_review":
                 session.rollback()
                 raise ValueError("candidate batch is not reconcilable")
+        if terminal_status:
+            return self._reconcile_terminal_candidate(workflow_id, step.kind)
 
         with self._session_factory() as session:
             current_step = session.get(WorkflowStep, step.id)
@@ -1163,6 +1205,23 @@ class WorkflowOrchestrator:
             workflow_id=current.workflow_id,
             status=current.status,
             completed_step=step.kind,
+            waiting_for=current.waiting_for,
+            candidate_batch_id=current.candidate_batch_id,
+        )
+
+    def _reconcile_terminal_candidate(
+        self, workflow_id: str, completed_step: str
+    ) -> AdvanceResult:
+        terminal_reconcile = self._workflow_service()
+        try:
+            terminal_reconcile.reconcile_batch_decision(workflow_id)
+        finally:
+            terminal_reconcile.session.close()
+        current = self._current_result(workflow_id)
+        return AdvanceResult(
+            workflow_id=current.workflow_id,
+            status=current.status,
+            completed_step=completed_step,
             waiting_for=current.waiting_for,
             candidate_batch_id=current.candidate_batch_id,
         )
