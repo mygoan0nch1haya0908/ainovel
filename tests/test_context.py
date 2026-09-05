@@ -316,6 +316,12 @@ def test_workflow_artifact_indexing_is_hash_versioned_and_preserves_excerpt_offs
 ) -> None:
     _add_fts(session)
     workflow, step = _workflow(session, project, official_outline)
+    canonical_text = "xxremember this exact lineyy"
+    canonical = _source(
+        project.id, "official_chapter", "chapter", 1, "official", 7, canonical_text
+    )
+    session.add(canonical)
+    session.commit()
     digest = sha256(b"remember this exact line").hexdigest()
     artifact = WorkflowArtifact(
         id=str(uuid4()),
@@ -324,7 +330,13 @@ def test_workflow_artifact_indexing_is_hash_versioned_and_preserves_excerpt_offs
         kind="requested_excerpt",
         ordinal=39,
         text_content="remember this exact line",
-        payload={"explicitly_requested": True, "excerpt_start": 100, "excerpt_end": 124},
+        payload={
+            "explicitly_requested": True,
+            "canonical_source_type": "official_chapter",
+            "canonical_source_id": canonical.source_id,
+            "excerpt_start": 2,
+            "excerpt_end": 26,
+        },
         visible_char_count=24,
         content_hash=digest,
     )
@@ -342,7 +354,7 @@ def test_workflow_artifact_indexing_is_hash_versioned_and_preserves_excerpt_offs
     assert indexed.source_type == "historical_excerpt"
     selected = next(item for item in candidates if item.source_id == indexed.id)
     assert selected.source_version == digest
-    assert (selected.excerpt_start, selected.excerpt_end) == (100, 124)
+    assert (selected.excerpt_start, selected.excerpt_end) == (2, 26)
 
 
 def test_workflow_artifact_indexing_rejects_unvalidated_or_unrequested_content(
@@ -372,13 +384,48 @@ def test_builder_maps_l0_through_l7_with_exact_scope_versions_and_limits(
 ) -> None:
     workflow, step = _workflow(session, project, official_outline)
     other_workflow, _ = _workflow(session, project, official_outline, "two")
+    plan_text = "L6"
+    plan_artifact = WorkflowArtifact(
+        id=str(uuid4()),
+        workflow_id=workflow.id,
+        step_id=step.id,
+        kind="approved_batch_plan",
+        ordinal=1,
+        text_content=plan_text,
+        payload={"chapters": []},
+        visible_char_count=len(plan_text),
+        content_hash=sha256(plan_text.encode("utf-8")).hexdigest(),
+    )
+    step.active_artifact_id = plan_artifact.id
+    step.status = "validated"
+    session.add(plan_artifact)
+    canonical_l7 = _source(
+        project.id, "official_chapter", "canonical-l7", 1, "official", 7, "L7"
+    )
+    excerpt_artifact = WorkflowArtifact(
+        id=str(uuid4()),
+        workflow_id=workflow.id,
+        step_id=step.id,
+        kind="requested_excerpt",
+        ordinal=1,
+        text_content="L7",
+        payload={
+            "explicitly_requested": True,
+            "canonical_source_type": "official_chapter",
+            "canonical_source_id": canonical_l7.source_id,
+            "excerpt_start": 0,
+            "excerpt_end": 2,
+        },
+        visible_char_count=2,
+        content_hash=sha256(b"L7").hexdigest(),
+    )
+    session.add_all([canonical_l7, excerpt_artifact])
     layer_types = {
         0: "constitution",
         1: "world_rule",
         2: "current_stage_goal",
         5: "critical_character_state",
         6: "approved_batch_plan",
-        7: "historical_excerpt",
     }
     rows = [
         _source(project.id, source_type, f"layer-{layer}", 1, "official", 99, f"L{layer}")
@@ -389,13 +436,28 @@ def test_builder_maps_l0_through_l7_with_exact_scope_versions_and_limits(
         _source(
             project.id,
             "approved_batch_plan",
-            "layer-6",
-            1,
+            plan_artifact.id,
+            plan_artifact.content_hash,
             f"workflow:{workflow.id}",
             99,
-            "L6",
+            plan_text,
         )
     )
+    indexed_excerpt = _source(
+        project.id,
+        "historical_excerpt",
+        excerpt_artifact.id,
+        excerpt_artifact.content_hash,
+        f"workflow:{workflow.id}",
+        7,
+        "L7",
+    )
+    indexed_excerpt.explicitly_requested = True
+    indexed_excerpt.canonical_source_type = "official_chapter"
+    indexed_excerpt.canonical_source_id = canonical_l7.source_id
+    indexed_excerpt.excerpt_start = 0
+    indexed_excerpt.excerpt_end = 2
+    rows.append(indexed_excerpt)
     rows.append(
         _source(
             project.id,
@@ -473,6 +535,7 @@ def test_packet_persists_selected_trimmed_snapshots_and_deduplicates_overlap(
         True,
         100,
         source_id=source.id,
+        stable_key="constitution:constitution",
         source_type="constitution",
         source_version="1",
     )
@@ -481,17 +544,15 @@ def test_packet_persists_selected_trimmed_snapshots_and_deduplicates_overlap(
         0,
         False,
         1,
-        stable_key="required",
+        stable_key="constitution:constitution",
         source_id=source.id,
     )
     trimmed = candidate(
         "trimmed",
-        7,
+        6,
         False,
         1,
         temporal_distance=9,
-        excerpt_start=20,
-        excerpt_end=27,
     )
     service = ContextService(
         session,
@@ -531,7 +592,7 @@ def test_packet_persists_selected_trimmed_snapshots_and_deduplicates_overlap(
         items[1].temporal_distance,
         items[1].excerpt_start,
         items[1].excerpt_end,
-    ) == ("trimmed", False, "budget", 9, 20, 27)
+    ) == ("trimmed", False, "budget", 9, None, None)
     assert session.scalar(
         select(func.count()).select_from(ContextPacketItem).where(
             ContextPacketItem.packet_id == packet.id
@@ -587,3 +648,416 @@ def test_packet_required_overflow_persists_nothing(
             },
         )
     assert session.scalar(text("SELECT count(*) FROM context_packets")) == 0
+
+
+@pytest.mark.parametrize("chapter_count", [1, 5])
+def test_packet_rejects_raw_full_official_chapter_candidates_even_when_they_fit(
+    session, project, official_outline, chapter_count
+) -> None:
+    workflow, step = _workflow(session, project, official_outline)
+    rows = [
+        _source(
+            project.id,
+            "official_chapter",
+            f"chapter-{number}",
+            1,
+            "official",
+            7,
+            "章名\n" + "甲" * 4_500,
+        )
+        for number in range(chapter_count)
+    ]
+    session.add_all(rows)
+    session.commit()
+    candidates = [
+        candidate(
+            row.text,
+            7,
+            False,
+            10,
+            stable_key=f"official_chapter:{row.source_id}",
+            source_id=row.id,
+            source_type="official_chapter",
+            source_version="1",
+        )
+        for row in rows
+    ]
+
+    with pytest.raises(ValueError, match="bounded canonical excerpt"):
+        ContextService(session).build_packet(
+            workflow.id,
+            step.id,
+            [],
+            candidates,
+            {"input_capacity_tokens": 100_000, "reserved_output_tokens": 0},
+        )
+    assert session.scalar(text("SELECT count(*) FROM context_packets")) == 0
+
+
+def test_exact_explicit_bounded_canonical_excerpt_can_be_packed(
+    session, project, official_outline
+) -> None:
+    _add_fts(session)
+    workflow, step = _workflow(session, project, official_outline)
+    canonical_text = "prefix:" + "甲" * 1_300 + ":suffix"
+    canonical = _source(
+        project.id,
+        "official_chapter",
+        "chapter-1",
+        1,
+        "official",
+        7,
+        canonical_text,
+    )
+    session.add(canonical)
+    session.commit()
+    start, end = 7, 1_207
+    excerpt = canonical_text[start:end]
+    artifact = WorkflowArtifact(
+        id=str(uuid4()),
+        workflow_id=workflow.id,
+        step_id=step.id,
+        kind="review_evidence_excerpt",
+        ordinal=39,
+        text_content=excerpt,
+        payload={
+            "explicitly_requested": True,
+            "canonical_source_type": "official_chapter",
+            "canonical_source_id": canonical.source_id,
+            "excerpt_start": start,
+            "excerpt_end": end,
+        },
+        visible_char_count=1_200,
+        content_hash=sha256(excerpt.encode("utf-8")).hexdigest(),
+    )
+    session.add(artifact)
+    session.commit()
+
+    indexed = ContextIndexService(session).index_workflow_artifact(artifact.id)
+    assert indexed.explicitly_requested is True
+    assert indexed.canonical_source_type == "official_chapter"
+    assert indexed.canonical_source_id == canonical.source_id
+    assert (indexed.excerpt_start, indexed.excerpt_end) == (start, end)
+    excerpt_candidate = next(
+        item
+        for item in ContextBuilder(session).candidates_for_step(workflow.id, step.id)
+        if item.source_id == indexed.id
+    )
+    packet = ContextService(session).build_packet(
+        workflow.id,
+        step.id,
+        [],
+        [excerpt_candidate],
+        {"input_capacity_tokens": 2_000, "reserved_output_tokens": 0},
+    )
+    stored = session.scalar(
+        select(ContextPacketItem).where(ContextPacketItem.packet_id == packet.id)
+    )
+    assert stored is not None
+    assert stored.explicitly_requested is True
+    assert stored.canonical_source_type == "official_chapter"
+    assert stored.canonical_source_id == canonical.source_id
+    assert stored.text_snapshot == canonical_text[start:end]
+    assert (stored.excerpt_start, stored.excerpt_end) == (start, end)
+
+
+@pytest.mark.parametrize(
+    ("payload_update", "text_update"),
+    [
+        ({"explicitly_requested": False}, None),
+        ({"canonical_source_id": None}, None),
+        ({"excerpt_start": None}, None),
+        ({"excerpt_end": 1_208}, None),
+        ({"excerpt_end": 1_209}, "甲" * 1_202),
+        ({}, "caller supplied text"),
+    ],
+)
+def test_excerpt_indexing_rejects_missing_forged_or_oversized_provenance(
+    session, project, official_outline, payload_update, text_update
+) -> None:
+    _add_fts(session)
+    workflow, step = _workflow(session, project, official_outline)
+    canonical_text = "prefix:" + "甲" * 1_300
+    canonical = _source(
+        project.id, "official_chapter", "chapter", 1, "official", 7, canonical_text
+    )
+    session.add(canonical)
+    session.commit()
+    payload = {
+        "explicitly_requested": True,
+        "canonical_source_type": "official_chapter",
+        "canonical_source_id": canonical.source_id,
+        "excerpt_start": 7,
+        "excerpt_end": 1_207,
+    }
+    payload.update(payload_update)
+    body = canonical_text[7:1_207] if text_update is None else text_update
+    artifact = WorkflowArtifact(
+        id=str(uuid4()),
+        workflow_id=workflow.id,
+        step_id=step.id,
+        kind="requested_excerpt",
+        ordinal=39,
+        text_content=body,
+        payload=payload,
+        visible_char_count=len(body),
+        content_hash=sha256(body.encode("utf-8")).hexdigest(),
+    )
+    session.add(artifact)
+    session.commit()
+    with pytest.raises(ValueError, match="canonical excerpt"):
+        ContextIndexService(session).index_workflow_artifact(artifact.id)
+
+
+@pytest.mark.parametrize("invalid_ownership", ["project", "scope"])
+def test_excerpt_indexing_rejects_nonofficial_or_cross_project_canonical_source(
+    session, project, official_outline, invalid_ownership
+) -> None:
+    _add_fts(session)
+    workflow, step = _workflow(session, project, official_outline)
+    source_project = project
+    if invalid_ownership == "project":
+        source_project = ProjectService(session).create("other canonical", 1, 2)
+    canonical = _source(
+        source_project.id,
+        "official_chapter",
+        "foreign",
+        1,
+        "workflow:unapproved" if invalid_ownership == "scope" else "official",
+        7,
+        "甲" * 100,
+    )
+    session.add(canonical)
+    session.commit()
+    artifact = WorkflowArtifact(
+        id=str(uuid4()),
+        workflow_id=workflow.id,
+        step_id=step.id,
+        kind="requested_excerpt",
+        ordinal=1,
+        text_content="甲" * 10,
+        payload={
+            "explicitly_requested": True,
+            "canonical_source_type": "official_chapter",
+            "canonical_source_id": "foreign",
+            "excerpt_start": 0,
+            "excerpt_end": 10,
+        },
+        visible_char_count=10,
+        content_hash=sha256(("甲" * 10).encode("utf-8")).hexdigest(),
+    )
+    session.add(artifact)
+    session.commit()
+    with pytest.raises(ValueError, match="canonical excerpt"):
+        ContextIndexService(session).index_workflow_artifact(artifact.id)
+
+
+def test_summary_artifact_requires_completed_active_ownership(
+    session, project, official_outline
+) -> None:
+    _add_fts(session)
+    workflow, step = _workflow(session, project, official_outline)
+    body = "validated summary"
+    artifact = WorkflowArtifact(
+        id=str(uuid4()),
+        workflow_id=workflow.id,
+        step_id=step.id,
+        kind="chapter_summary",
+        ordinal=1,
+        text_content=body,
+        payload={"summary": body},
+        visible_char_count=len(body),
+        content_hash=sha256(body.encode("utf-8")).hexdigest(),
+    )
+    session.add(artifact)
+    session.commit()
+    with pytest.raises(ValueError, match="accepted active artifact"):
+        ContextIndexService(session).index_workflow_artifact(artifact.id)
+    step.active_artifact_id = artifact.id
+    step.status = "validated"
+    session.commit()
+    assert ContextIndexService(session).index_workflow_artifact(artifact.id).source_id == artifact.id
+
+
+def test_accepted_artifact_rejects_a_content_hash_that_does_not_match_indexed_text(
+    session, project, official_outline
+) -> None:
+    _add_fts(session)
+    workflow, step = _workflow(session, project, official_outline)
+    artifact = WorkflowArtifact(
+        id=str(uuid4()),
+        workflow_id=workflow.id,
+        step_id=step.id,
+        kind="chapter_summary",
+        ordinal=1,
+        text_content="summary",
+        payload={"summary": "summary"},
+        visible_char_count=7,
+        content_hash="f" * 64,
+    )
+    step.active_artifact_id = artifact.id
+    step.status = "completed"
+    session.add(artifact)
+    session.commit()
+    with pytest.raises(ValueError, match="content hash"):
+        ContextIndexService(session).index_workflow_artifact(artifact.id)
+
+
+def test_approved_plan_is_only_admitted_from_exact_accepted_workflow_scope(
+    session, project, official_outline
+) -> None:
+    _add_fts(session)
+    workflow, step = _workflow(session, project, official_outline)
+    official_plan = _source(
+        project.id, "approved_batch_plan", "official-plan", 1, "official", 6, "leak"
+    )
+    session.add(official_plan)
+    body = "accepted plan"
+    artifact = WorkflowArtifact(
+        id=str(uuid4()),
+        workflow_id=workflow.id,
+        step_id=step.id,
+        kind="approved_batch_plan",
+        ordinal=1,
+        text_content=body,
+        payload={"chapters": []},
+        visible_char_count=len(body),
+        content_hash=sha256(body.encode("utf-8")).hexdigest(),
+    )
+    step.active_artifact_id = artifact.id
+    step.status = "completed"
+    session.add(artifact)
+    session.commit()
+    indexed = ContextIndexService(session).index_workflow_artifact(artifact.id)
+
+    candidates = ContextBuilder(session).candidates_for_step(workflow.id, step.id)
+    assert indexed.id in {item.source_id for item in candidates}
+    assert "leak" not in {item.text for item in candidates}
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "cross_project",
+        "missing",
+        "type",
+        "version",
+        "scope",
+        "stable_key",
+        "text",
+        "hash",
+    ],
+)
+def test_packet_rejects_invalid_linked_source_and_rolls_back(
+    session, project, official_outline, mismatch
+) -> None:
+    workflow, step = _workflow(session, project, official_outline)
+    source_project = project
+    if mismatch == "cross_project":
+        source_project = ProjectService(session).create("foreign", 1, 2)
+    row = _source(
+        source_project.id, "world_rule", "rule", 1, "official", 1, "canonical"
+    )
+    if mismatch == "hash":
+        row.content_hash = "0" * 64
+    session.add(row)
+    session.commit()
+    source_id = "00000000-0000-0000-0000-000000000000" if mismatch == "missing" else row.id
+    item = candidate(
+        "forged" if mismatch == "text" else row.text,
+        1,
+        False,
+        10,
+        stable_key=(
+            "world_rule:forged"
+            if mismatch == "stable_key"
+            else f"world_rule:{row.source_id}"
+        ),
+        source_id=source_id,
+        source_type="character" if mismatch == "type" else "world_rule",
+        source_version="2" if mismatch == "version" else "1",
+        state_scope="workflow:wrong" if mismatch == "scope" else "official",
+    )
+    with pytest.raises(ValueError, match="linked context source"):
+        ContextService(session).build_packet(
+            workflow.id,
+            step.id,
+            [],
+            [item],
+            {"input_capacity_tokens": 100, "reserved_output_tokens": 0},
+        )
+    assert not session.new
+    assert session.scalar(text("SELECT count(*) FROM context_packets")) == 0
+
+
+def test_packet_rejects_nullable_injected_candidate_claiming_another_workflow(
+    session, project, official_outline
+) -> None:
+    workflow, step = _workflow(session, project, official_outline)
+    injected = candidate(
+        "injected",
+        5,
+        False,
+        1,
+        state_scope="workflow:another",
+    )
+    with pytest.raises(ValueError, match="well-formed non-L7"):
+        ContextService(session).build_packet(
+            workflow.id,
+            step.id,
+            [],
+            [injected],
+            {"input_capacity_tokens": 100, "reserved_output_tokens": 0},
+        )
+    assert not session.new
+
+
+def test_changed_artifact_hash_clears_old_packet_fk_but_keeps_snapshot(
+    session, project, official_outline
+) -> None:
+    _add_fts(session)
+    workflow, step = _workflow(session, project, official_outline)
+    first_text = "first summary"
+    artifact = WorkflowArtifact(
+        id=str(uuid4()),
+        workflow_id=workflow.id,
+        step_id=step.id,
+        kind="chapter_summary",
+        ordinal=1,
+        text_content=first_text,
+        payload={"summary": first_text},
+        visible_char_count=len(first_text),
+        content_hash=sha256(first_text.encode("utf-8")).hexdigest(),
+    )
+    step.active_artifact_id = artifact.id
+    step.status = "validated"
+    session.add(artifact)
+    session.commit()
+    first_source = ContextIndexService(session).index_workflow_artifact(artifact.id)
+    item = next(
+        value
+        for value in ContextBuilder(session).candidates_for_step(workflow.id, step.id)
+        if value.source_id == first_source.id
+    )
+    packet = ContextService(session).build_packet(
+        workflow.id,
+        step.id,
+        [],
+        [item],
+        {"input_capacity_tokens": 100, "reserved_output_tokens": 0},
+    )
+    artifact.text_content = "second summary"
+    artifact.payload = {"summary": "second summary"}
+    artifact.content_hash = sha256(b"second summary").hexdigest()
+    session.commit()
+
+    second_source = ContextIndexService(session).index_workflow_artifact(artifact.id)
+    stored = session.scalar(
+        select(ContextPacketItem).where(ContextPacketItem.packet_id == packet.id)
+    )
+    assert second_source.id != first_source.id
+    assert stored is not None
+    assert stored.source_id is None
+    assert stored.text_snapshot == first_text
+    assert stored.source_version == sha256(first_text.encode("utf-8")).hexdigest()
+    assert stored.source_content_hash == sha256(first_text.encode("utf-8")).hexdigest()

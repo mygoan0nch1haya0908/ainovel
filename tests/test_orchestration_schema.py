@@ -219,6 +219,15 @@ def test_stage_two_columns_nullability_and_server_defaults(
     assert item["required"]["default"] == "0"
     source = _column_map(migrated_engine, "context_sources")
     assert source["source_version"]["type"].length == 64
+    assert source["explicitly_requested"]["nullable"] is False
+    assert source["explicitly_requested"]["default"] == "0"
+    assert source["canonical_source_type"]["nullable"] is True
+    assert source["canonical_source_id"]["nullable"] is True
+    assert source["excerpt_start"]["nullable"] is True
+    assert source["excerpt_end"]["nullable"] is True
+    assert item["explicitly_requested"]["nullable"] is False
+    assert item["canonical_source_type"]["nullable"] is True
+    assert item["canonical_source_id"]["nullable"] is True
     assert Base.metadata.tables["context_sources"].c.source_version.type.length == 64
     for column_name in (
         "source_type",

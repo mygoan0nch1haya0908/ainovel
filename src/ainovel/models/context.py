@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import Boolean, ForeignKey, Integer, String, Text, UniqueConstraint, text
+from sqlalchemy import Boolean, ForeignKey, Integer, String, Text, UniqueConstraint, text as sql_text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ainovel.models.base import Base, TimestampMixin
@@ -29,6 +29,13 @@ class ContextSource(TimestampMixin, Base):
     layer: Mapped[int] = mapped_column(Integer, nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    explicitly_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sql_text("0")
+    )
+    canonical_source_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    canonical_source_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    excerpt_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    excerpt_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class ContextPacket(TimestampMixin, Base):
@@ -62,14 +69,19 @@ class ContextPacketItem(TimestampMixin, Base):
     source_version: Mapped[str] = mapped_column(String(64), nullable=False)
     state_scope: Mapped[str] = mapped_column(String(64), nullable=False)
     source_content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    explicitly_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sql_text("0")
+    )
+    canonical_source_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    canonical_source_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     stable_source_key: Mapped[str] = mapped_column(String(255), nullable=False)
     layer: Mapped[int] = mapped_column(Integer, nullable=False)
     text_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
     selected: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default=text("0")
+        Boolean, nullable=False, default=False, server_default=sql_text("0")
     )
     required: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default=text("0")
+        Boolean, nullable=False, default=False, server_default=sql_text("0")
     )
     relevance: Mapped[int] = mapped_column(Integer, nullable=False)
     temporal_distance: Mapped[int] = mapped_column(Integer, nullable=False)

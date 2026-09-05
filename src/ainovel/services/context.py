@@ -20,11 +20,13 @@ from ainovel.models.context import ContextPacket, ContextPacketItem, ContextSour
 from ainovel.models.outline import OutlineNode, OutlineVersion
 from ainovel.models.project import ConstitutionVersion, NovelProject
 from ainovel.models.workflow import GenerationWorkflow, WorkflowArtifact, WorkflowStep
+from ainovel.services.counting import count_visible_characters
 
 
 WORKFLOW_SCOPE_PREFIX = "workflow:"
 EVENT_CHAIN_LIMIT = 30
 RECENT_SUMMARY_LIMIT = 5
+MAX_L7_VISIBLE_CHARACTERS = 1_200
 
 SOURCE_LAYERS: dict[str, int] = {
     "constitution": 0,
@@ -54,6 +56,7 @@ SOURCE_LAYERS: dict[str, int] = {
     "summary_delta": 6,
     "state_delta": 6,
     "historical_excerpt": 7,
+    "review_evidence_excerpt": 7,
     "official_chapter": 7,
 }
 
@@ -72,6 +75,9 @@ AUTO_OFFICIAL_SOURCE_TYPES = set(SOURCE_LAYERS) - {
     "chapter_summary_delta",
     "summary_delta",
     "state_delta",
+    "approved_batch_plan",
+    "historical_excerpt",
+    "review_evidence_excerpt",
     "official_chapter",
 }
 WORKFLOW_SOURCE_TYPES = {
@@ -83,6 +89,7 @@ WORKFLOW_SOURCE_TYPES = {
     "summary_delta",
     "state_delta",
     "historical_excerpt",
+    "review_evidence_excerpt",
 }
 
 ARTIFACT_SOURCE_TYPES = {
@@ -92,8 +99,21 @@ ARTIFACT_SOURCE_TYPES = {
     "chapter_summary_delta": "chapter_summary_delta",
     "summary_delta": "summary_delta",
     "state_delta": "state_delta",
+    "approved_batch_plan": "approved_batch_plan",
     "requested_excerpt": "historical_excerpt",
     "historical_excerpt": "historical_excerpt",
+    "review_evidence_excerpt": "review_evidence_excerpt",
+}
+
+EXCERPT_SOURCE_TYPES = {"historical_excerpt", "review_evidence_excerpt"}
+ACCEPTED_ARTIFACT_KINDS = {
+    "event_chain",
+    "chapter_summary",
+    "scene_summary",
+    "chapter_summary_delta",
+    "summary_delta",
+    "state_delta",
+    "approved_batch_plan",
 }
 
 FTS_WORD = re.compile(r"[^\W_]+", flags=re.UNICODE)
@@ -176,7 +196,13 @@ class ContextIndexService:
         source_type = ARTIFACT_SOURCE_TYPES.get(artifact.kind)
         if source_type is None:
             raise ValueError("workflow artifact kind is not indexable")
-        body = self._artifact_text(artifact)
+        if source_type in EXCERPT_SOURCE_TYPES:
+            body = self._canonical_excerpt_text(artifact, workflow)
+        else:
+            self._require_accepted_active_artifact(artifact, step)
+            body = self._artifact_text(artifact)
+        if artifact.content_hash != sha256(body.encode("utf-8")).hexdigest():
+            raise ValueError("workflow artifact content hash does not match indexed text")
         scope = f"{WORKFLOW_SCOPE_PREFIX}{workflow.id}"
         source_version = artifact.content_hash
         try:
@@ -197,6 +223,11 @@ class ContextIndexService:
                     self._mirror(row)
                     self.session.commit()
                     return row
+                self.session.execute(
+                    update(ContextPacketItem)
+                    .where(ContextPacketItem.source_id == row.id)
+                    .values(source_id=None)
+                )
                 self._delete_fts(row.id)
                 self.session.delete(row)
             row = ContextSource(
@@ -209,6 +240,27 @@ class ContextIndexService:
                 layer=SOURCE_LAYERS[source_type],
                 text=body,
                 content_hash=artifact.content_hash,
+                explicitly_requested=source_type in EXCERPT_SOURCE_TYPES,
+                canonical_source_type=(
+                    artifact.payload.get("canonical_source_type")
+                    if source_type in EXCERPT_SOURCE_TYPES
+                    else None
+                ),
+                canonical_source_id=(
+                    artifact.payload.get("canonical_source_id")
+                    if source_type in EXCERPT_SOURCE_TYPES
+                    else None
+                ),
+                excerpt_start=(
+                    artifact.payload.get("excerpt_start")
+                    if source_type in EXCERPT_SOURCE_TYPES
+                    else None
+                ),
+                excerpt_end=(
+                    artifact.payload.get("excerpt_end")
+                    if source_type in EXCERPT_SOURCE_TYPES
+                    else None
+                ),
             )
             self.session.add(row)
             self.session.flush()
@@ -396,6 +448,115 @@ class ContextIndexService:
         raise ValueError("indexable workflow artifact has no text")
 
     @staticmethod
+    def _require_accepted_active_artifact(
+        artifact: WorkflowArtifact, step: WorkflowStep
+    ) -> None:
+        if (
+            artifact.kind not in ACCEPTED_ARTIFACT_KINDS
+            or step.active_artifact_id != artifact.id
+            or step.status.lower() not in {"completed", "validated"}
+        ):
+            raise ValueError(
+                "workflow source requires the owning step's accepted active artifact"
+            )
+
+    def _canonical_excerpt_text(
+        self, artifact: WorkflowArtifact, workflow: GenerationWorkflow
+    ) -> str:
+        payload = artifact.payload
+        canonical_type = payload.get("canonical_source_type")
+        canonical_id = payload.get("canonical_source_id")
+        start = payload.get("excerpt_start")
+        end = payload.get("excerpt_end")
+        invalid = (
+            payload.get("explicitly_requested") is not True
+            or not isinstance(canonical_type, str)
+            or not canonical_type.strip()
+            or canonical_type in EXCERPT_SOURCE_TYPES
+            or not isinstance(canonical_id, str)
+            or not canonical_id.strip()
+            or not isinstance(start, int)
+            or isinstance(start, bool)
+            or not isinstance(end, int)
+            or isinstance(end, bool)
+            or start < 0
+            or end <= start
+            or end - start > MAX_L7_VISIBLE_CHARACTERS
+        )
+        if invalid:
+            raise ValueError("canonical excerpt provenance is invalid")
+        canonical = self.session.scalar(
+            select(ContextSource)
+            .where(
+                ContextSource.project_id == workflow.project_id,
+                ContextSource.state_scope == "official",
+                ContextSource.source_type == canonical_type,
+                ContextSource.source_id == canonical_id,
+            )
+            .order_by(ContextSource.created_at.desc(), ContextSource.id)
+        )
+        if (
+            canonical is None
+            or canonical.source_type in EXCERPT_SOURCE_TYPES
+            or canonical.content_hash
+            != sha256(canonical.text.encode("utf-8")).hexdigest()
+            or end > len(canonical.text)
+        ):
+            raise ValueError("canonical excerpt source is invalid")
+        excerpt = canonical.text[start:end]
+        if (
+            artifact.text_content != excerpt
+            or count_visible_characters(excerpt) > MAX_L7_VISIBLE_CHARACTERS
+            or artifact.content_hash != sha256(excerpt.encode("utf-8")).hexdigest()
+        ):
+            raise ValueError("canonical excerpt text is invalid")
+        return excerpt
+
+    def validate_workflow_source(
+        self,
+        row: ContextSource,
+        workflow: GenerationWorkflow,
+        artifact: WorkflowArtifact | None,
+        step: WorkflowStep | None,
+    ) -> None:
+        expected_scope = f"{WORKFLOW_SCOPE_PREFIX}{workflow.id}"
+        expected_type = (
+            ARTIFACT_SOURCE_TYPES.get(artifact.kind) if artifact is not None else None
+        )
+        expected_text = None
+        if artifact is not None and expected_type is not None:
+            if expected_type in EXCERPT_SOURCE_TYPES:
+                expected_text = self._canonical_excerpt_text(artifact, workflow)
+            else:
+                self._require_accepted_active_artifact(artifact, step)
+                expected_text = self._artifact_text(artifact)
+        if (
+            artifact is None
+            or step is None
+            or artifact.workflow_id != workflow.id
+            or artifact.step_id != step.id
+            or step.workflow_id != workflow.id
+            or row.project_id != workflow.project_id
+            or row.state_scope != expected_scope
+            or row.source_id != artifact.id
+            or row.source_type != expected_type
+            or row.source_version != artifact.content_hash
+            or row.content_hash != artifact.content_hash
+            or row.text != expected_text
+        ):
+            raise ValueError("workflow context source provenance is invalid")
+        if row.source_type in EXCERPT_SOURCE_TYPES:
+            if (
+                row.explicitly_requested is not True
+                or row.canonical_source_type
+                != artifact.payload.get("canonical_source_type")
+                or row.canonical_source_id != artifact.payload.get("canonical_source_id")
+                or row.excerpt_start != artifact.payload.get("excerpt_start")
+                or row.excerpt_end != artifact.payload.get("excerpt_end")
+            ):
+                raise ValueError("workflow canonical excerpt is invalid")
+
+    @staticmethod
     def _safe_match_query(query: str) -> str | None:
         if len(query) > MAX_FTS_QUERY_CHARACTERS:
             return None
@@ -461,6 +622,23 @@ class ContextBuilder:
             select(WorkflowArtifact).where(WorkflowArtifact.workflow_id == workflow.id)
         ).all()
         artifacts = {artifact.id: artifact for artifact in artifact_rows}
+        artifact_step_ids = {artifact.step_id for artifact in artifact_rows}
+        artifact_steps = {
+            value.id: value
+            for value in self.session.scalars(
+                select(WorkflowStep).where(WorkflowStep.id.in_(artifact_step_ids))
+            ).all()
+        }
+        validator = ContextIndexService(self.session)
+        for row in rows:
+            if row.state_scope == workflow_scope:
+                artifact = artifacts.get(row.source_id)
+                validator.validate_workflow_source(
+                    row,
+                    workflow,
+                    artifact,
+                    artifact_steps.get(artifact.step_id) if artifact is not None else None,
+                )
         chronologies = {
             row.id: self._chronology(row, artifacts.get(row.source_id)) for row in rows
         }
@@ -596,59 +774,120 @@ class ContextService:
         optional: list[ContextCandidate] | tuple[ContextCandidate, ...],
         limits: ContextLimits | Mapping[str, int],
     ) -> ContextPacket:
-        workflow = self.session.get(GenerationWorkflow, workflow_id)
-        step = self.session.get(WorkflowStep, step_id)
-        if workflow is None:
-            raise ValueError("workflow not found")
-        if step is None:
-            raise ValueError("workflow step not found")
-        if step.workflow_id != workflow.id:
-            raise ValueError("step does not belong to workflow")
-        normalized_limits = self._limits(limits)
-        candidates = self._deduplicate(required, optional)
-        packed = self.budgeter.pack(
-            candidates,
-            normalized_limits.input_capacity_tokens,
-            normalized_limits.reserved_output_tokens,
-            normalized_limits.fixed_overhead_tokens,
-        )
-        packet = ContextPacket(
-            id=str(uuid4()),
-            workflow_id=workflow.id,
-            step_id=step.id,
-            max_input_tokens=packed.max_input_tokens,
-            used_input_tokens=packed.used_tokens,
-            fixed_overhead_tokens=normalized_limits.fixed_overhead_tokens,
-            reserved_output_tokens=packed.reserved_output_tokens,
-            status="ready",
-        )
-        selected_keys = {item.stable_key for item in packed.selected}
-        trim_reasons = {
-            item.item.stable_key: item.reason for item in packed.trimmed
-        }
-        ordered = sorted(
-            candidates,
-            key=lambda item: (
-                not item.required,
-                item.layer,
-                -item.relevance,
-                item.temporal_distance,
-                item.stable_key,
-            ),
-        )
-        self.session.add(packet)
-        linked_source_ids = {
-            item.source_id for item in ordered if item.source_id is not None
-        }
-        linked_sources = {
-            row.id: row
-            for row in self.session.scalars(
-                select(ContextSource).where(ContextSource.id.in_(linked_source_ids))
-            ).all()
-        }
-        self.session.add_all(
-            [
-                ContextPacketItem(
+        try:
+            workflow = self.session.get(GenerationWorkflow, workflow_id)
+            step = self.session.get(WorkflowStep, step_id)
+            if workflow is None:
+                raise ValueError("workflow not found")
+            if step is None:
+                raise ValueError("workflow step not found")
+            if step.workflow_id != workflow.id:
+                raise ValueError("step does not belong to workflow")
+            normalized_limits = self._limits(limits)
+            candidates = self._deduplicate(required, optional)
+            packed = self.budgeter.pack(
+                candidates,
+                normalized_limits.input_capacity_tokens,
+                normalized_limits.reserved_output_tokens,
+                normalized_limits.fixed_overhead_tokens,
+            )
+            packet = ContextPacket(
+                id=str(uuid4()),
+                workflow_id=workflow.id,
+                step_id=step.id,
+                max_input_tokens=packed.max_input_tokens,
+                used_input_tokens=packed.used_tokens,
+                fixed_overhead_tokens=normalized_limits.fixed_overhead_tokens,
+                reserved_output_tokens=packed.reserved_output_tokens,
+                status="ready",
+            )
+            selected_keys = {item.stable_key for item in packed.selected}
+            trim_reasons = {
+                item.item.stable_key: item.reason for item in packed.trimmed
+            }
+            ordered = sorted(
+                candidates,
+                key=lambda item: (
+                    not item.required,
+                    item.layer,
+                    -item.relevance,
+                    item.temporal_distance,
+                    item.stable_key,
+                ),
+            )
+            self.session.add(packet)
+            linked_source_ids = {
+                item.source_id for item in ordered if item.source_id is not None
+            }
+            allowed_scopes = ("official", f"{WORKFLOW_SCOPE_PREFIX}{workflow.id}")
+            linked_sources = {
+                row.id: row
+                for row in self.session.scalars(
+                    select(ContextSource).where(
+                        ContextSource.id.in_(linked_source_ids),
+                        ContextSource.project_id == workflow.project_id,
+                        ContextSource.state_scope.in_(allowed_scopes),
+                    )
+                ).all()
+            }
+            if linked_source_ids != set(linked_sources):
+                raise ValueError("linked context source is missing or out of scope")
+            artifacts = {
+                artifact.id: artifact
+                for artifact in self.session.scalars(
+                    select(WorkflowArtifact).where(
+                        WorkflowArtifact.workflow_id == workflow.id
+                    )
+                ).all()
+            }
+            artifact_steps = {
+                value.id: value
+                for value in self.session.scalars(
+                    select(WorkflowStep).where(WorkflowStep.workflow_id == workflow.id)
+                ).all()
+            }
+            validator = ContextIndexService(self.session)
+            for item in ordered:
+                row = linked_sources.get(item.source_id)
+                if row is None:
+                    self._validate_injected_candidate(item, allowed_scopes)
+                    continue
+                expected_key = f"{row.source_type}:{row.source_id}"
+                if (
+                    item.source_type != row.source_type
+                    or item.source_version != row.source_version
+                    or item.state_scope != row.state_scope
+                    or item.stable_key != expected_key
+                    or item.layer != row.layer
+                    or item.text != row.text
+                    or sha256(item.text.encode("utf-8")).hexdigest()
+                    != row.content_hash
+                ):
+                    raise ValueError("linked context source provenance does not match")
+                if row.state_scope.startswith(WORKFLOW_SCOPE_PREFIX):
+                    artifact = artifacts.get(row.source_id)
+                    validator.validate_workflow_source(
+                        row,
+                        workflow,
+                        artifact,
+                        artifact_steps.get(artifact.step_id)
+                        if artifact is not None
+                        else None,
+                    )
+                if item.layer == 7:
+                    if row.source_type not in EXCERPT_SOURCE_TYPES:
+                        raise ValueError("layer 7 requires a bounded canonical excerpt")
+                    artifact = artifacts.get(row.source_id)
+                    if artifact is None:
+                        raise ValueError("layer 7 requires a bounded canonical excerpt")
+                    if (
+                        item.excerpt_start != artifact.payload.get("excerpt_start")
+                        or item.excerpt_end != artifact.payload.get("excerpt_end")
+                    ):
+                        raise ValueError("layer 7 canonical excerpt offsets do not match")
+            self.session.add_all(
+                [
+                    ContextPacketItem(
                     id=str(uuid4()),
                     packet_id=packet.id,
                     source_id=item.source_id,
@@ -659,6 +898,21 @@ class ContextService:
                         linked_sources[item.source_id].content_hash
                         if item.source_id in linked_sources
                         else sha256(item.text.encode("utf-8")).hexdigest()
+                    ),
+                    explicitly_requested=(
+                        linked_sources[item.source_id].explicitly_requested
+                        if item.source_id in linked_sources
+                        else False
+                    ),
+                    canonical_source_type=(
+                        linked_sources[item.source_id].canonical_source_type
+                        if item.source_id in linked_sources
+                        else None
+                    ),
+                    canonical_source_id=(
+                        linked_sources[item.source_id].canonical_source_id
+                        if item.source_id in linked_sources
+                        else None
                     ),
                     stable_source_key=item.stable_key,
                     layer=item.layer,
@@ -673,16 +927,29 @@ class ContextService:
                     excerpt_end=item.excerpt_end,
                     trim_reason=trim_reasons.get(item.stable_key),
                     position=position,
-                )
-                for position, item in enumerate(ordered)
-            ]
-        )
-        try:
+                    )
+                    for position, item in enumerate(ordered)
+                ]
+            )
             self.session.commit()
         except Exception:
             self.session.rollback()
             raise
         return packet
+
+    @staticmethod
+    def _validate_injected_candidate(
+        item: ContextCandidate, allowed_scopes: tuple[str, str]
+    ) -> None:
+        if (
+            item.layer == 7
+            or item.source_type in EXCERPT_SOURCE_TYPES | {"official_chapter"}
+            or not item.source_type
+            or not item.source_version
+            or not item.state_scope
+            or item.state_scope not in allowed_scopes
+        ):
+            raise ValueError("injected context must be well-formed non-L7 data")
 
     @staticmethod
     def _limits(limits: ContextLimits | Mapping[str, int]) -> ContextLimits:
