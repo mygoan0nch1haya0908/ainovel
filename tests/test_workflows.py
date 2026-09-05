@@ -1186,6 +1186,16 @@ def test_batch_reconciliation_uses_terminal_phase_one_decision_and_is_idempotent
 def test_batch_reconciliation_links_nonterminal_batch_without_releasing_owner(
     session, workflow
 ) -> None:
+    candidate = WorkflowStep(
+        id="ready-candidate-step",
+        workflow_id=workflow.id,
+        kind="CREATING_CANDIDATE_BATCH",
+        ordinal=None,
+        position=1,
+        status="PENDING",
+        attempt_count=0,
+        revision=1,
+    )
     batch = WritingBatch(
         id="ready-candidate-batch",
         project_id=workflow.project_id,
@@ -1195,23 +1205,38 @@ def test_batch_reconciliation_links_nonterminal_batch_without_releasing_owner(
         status="ready_for_review",
         source_workflow_id=workflow.id,
     )
-    session.add(batch)
+    session.add_all([candidate, batch])
     session.execute(
         update(GenerationWorkflow)
         .where(GenerationWorkflow.id == workflow.id)
-        .values(status="CREATING_CANDIDATE_BATCH", candidate_batch_id=None)
+        .values(
+            status="CREATING_CANDIDATE_BATCH",
+            current_position=candidate.position,
+            candidate_batch_id=None,
+        )
     )
     session.commit()
 
-    reconciled = WorkflowService(session).reconcile_batch_decision(workflow.id)
+    service = WorkflowService(session)
+    first = service.reconcile_batch_decision(workflow.id)
+    second = service.reconcile_batch_decision(workflow.id)
 
-    assert reconciled.status == "AWAITING_CONTENT_APPROVAL"
-    assert reconciled.candidate_batch_id == batch.id
+    assert first.status == second.status == "AWAITING_CONTENT_APPROVAL"
+    assert first.candidate_batch_id == second.candidate_batch_id == batch.id
     session.expire_all()
+    assert session.get(WorkflowStep, candidate.id).status == "COMPLETED"
     assert (
         session.get(NovelProject, workflow.project_id).active_workflow_id
         == workflow.id
     )
+    assert session.scalar(
+        select(func.count())
+        .select_from(AuditEvent)
+        .where(
+            AuditEvent.entity_id == workflow.id,
+            AuditEvent.action == "candidate_batch_linked",
+        )
+    ) == 1
 
 
 def test_terminal_reconciliation_never_clears_another_workflows_owner(
@@ -1430,6 +1455,64 @@ def test_required_context_overflow_rejects_an_expired_lease(
     assert session.get(WorkflowStep, step.id).status == "RUNNING"
     assert session.scalar(
         select(func.count()).select_from(ModelAttempt).where(ModelAttempt.step_id == step.id)
+    ) == 0
+
+
+def test_required_context_overflow_rejects_step_with_running_attempt_atomically(
+    session, workflow, clock
+) -> None:
+    service = WorkflowService(session, clock=clock)
+    step = service.claim_step(
+        workflow.id, {"PLANNING"}, "context-worker", lease_seconds=30
+    )
+    assert step is not None
+    claimed_step_revision = step.revision
+    attempt = service.record_attempt_start(step.id, "1" * 64)
+    session.expire_all()
+    before_workflow = session.get(GenerationWorkflow, workflow.id)
+    before_step = session.get(WorkflowStep, step.id)
+    workflow_revision = before_workflow.revision
+    step_revision = before_step.revision
+    lease_expires_at = before_step.lease_expires_at
+    assert step_revision == claimed_step_revision + 1
+
+    with pytest.raises(ValueError, match="context overflow pause conflict"):
+        service.pause_context_overflow(
+            step.id,
+            "context-worker",
+            RequiredContextOverflow("constitution", required_tokens=2, capacity=1),
+        )
+
+    session.expire_all()
+    stored_workflow = session.get(GenerationWorkflow, workflow.id)
+    stored_step = session.get(WorkflowStep, step.id)
+    stored_attempt = session.get(ModelAttempt, attempt.id)
+    assert stored_workflow.status == "PLANNING"
+    assert stored_workflow.revision == workflow_revision
+    assert stored_workflow.last_error_code is None
+    assert stored_workflow.last_error_detail is None
+    assert stored_step.status == "RUNNING"
+    assert stored_step.revision == step_revision
+    assert stored_step.attempt_count == 1
+    assert stored_step.active_artifact_id is None
+    assert stored_step.lease_owner == "context-worker"
+    assert stored_step.lease_expires_at == lease_expires_at
+    assert stored_attempt.status == "RUNNING"
+    assert stored_attempt.attempt_number == 1
+    assert stored_attempt.request_digest == "1" * 64
+    assert stored_attempt.provider_response_id is None
+    assert stored_attempt.input_tokens is None
+    assert stored_attempt.output_tokens is None
+    assert stored_attempt.latency_ms is None
+    assert stored_attempt.error_code is None
+    assert stored_attempt.error_detail is None
+    assert session.scalar(
+        select(func.count())
+        .select_from(AuditEvent)
+        .where(
+            AuditEvent.entity_id == workflow.id,
+            AuditEvent.action == "workflow_paused",
+        )
     ) == 0
 
 

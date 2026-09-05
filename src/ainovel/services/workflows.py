@@ -597,6 +597,18 @@ class WorkflowService:
             if step is not None
             else None
         )
+        running_attempt_id = (
+            self.session.scalar(
+                select(ModelAttempt.id)
+                .where(
+                    ModelAttempt.step_id == step.id,
+                    ModelAttempt.status == "RUNNING",
+                )
+                .limit(1)
+            )
+            if step is not None
+            else None
+        )
         if (
             step is None
             or workflow is None
@@ -608,6 +620,7 @@ class WorkflowService:
             or step.lease_owner != normalized_worker
             or step.lease_expires_at is None
             or step.lease_expires_at <= now
+            or running_attempt_id is not None
         ):
             self.session.rollback()
             raise ValueError("context overflow pause conflict")
@@ -643,6 +656,12 @@ class WorkflowService:
                     WorkflowStep.lease_owner == normalized_worker,
                     WorkflowStep.lease_expires_at == step.lease_expires_at,
                     WorkflowStep.lease_expires_at > now,
+                    ~select(ModelAttempt.id)
+                    .where(
+                        ModelAttempt.step_id == step.id,
+                        ModelAttempt.status == "RUNNING",
+                    )
+                    .exists(),
                 )
                 .values(
                     status="PAUSED",
@@ -1206,13 +1225,6 @@ class WorkflowService:
             workflow.status == target_status
             and workflow.candidate_batch_id == batch.id
         )
-        if workflow.status in TERMINAL_WORKFLOW_STATUSES:
-            if workflow_already_reconciled:
-                self.session.rollback()
-                return workflow
-            self.session.rollback()
-            raise ValueError("terminal workflow conflicts with batch decision")
-        self._require_transition(workflow.status, target_status)
         candidate_step = self.session.scalar(
             select(WorkflowStep).where(
                 WorkflowStep.workflow_id == workflow.id,
@@ -1220,6 +1232,24 @@ class WorkflowService:
                 WorkflowStep.kind == "CREATING_CANDIDATE_BATCH",
             )
         )
+        if (
+            batch.status == "ready_for_review"
+            and workflow_already_reconciled
+            and candidate_step is not None
+            and candidate_step.status == "COMPLETED"
+            and candidate_step.active_artifact_id is None
+            and candidate_step.lease_owner is None
+            and candidate_step.lease_expires_at is None
+        ):
+            self.session.rollback()
+            return workflow
+        if workflow.status in TERMINAL_WORKFLOW_STATUSES:
+            if workflow_already_reconciled:
+                self.session.rollback()
+                return workflow
+            self.session.rollback()
+            raise ValueError("terminal workflow conflicts with batch decision")
+        self._require_transition(workflow.status, target_status)
         should_update_step = (
             batch.status != "draft"
             and candidate_step is not None
