@@ -385,6 +385,33 @@ class BrokenGenerateProvider:
         return ProviderDiagnostic(True, "not used", ())
 
 
+class MalformedResponseProvider:
+    def capabilities(self, model: str) -> ProviderCapabilities:
+        return ProviderCapabilities(128_000, 16_000, True, True, True, False)
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        return ModelResponse(
+            structured={
+                "chapters": [
+                    {
+                        "ordinal": 1,
+                        "title": "机密响应",
+                        "goal": "不应保存",
+                        "ending_hook": "不应显示",
+                    }
+                ]
+            },
+            text="Authorization: Bearer malformed-web-secret",
+            provider_response_id="X-Api-Key: malformed-web-secret",
+            input_tokens=-1,
+            output_tokens=5,
+            latency_ms=1,
+        )
+
+    def diagnose(self, model: str | None = None) -> ProviderDiagnostic:
+        return ProviderDiagnostic(True, "not used", ())
+
+
 def install_orchestrator_registry(
     client: TestClient, registry: ProviderRegistry
 ) -> None:
@@ -474,6 +501,53 @@ def test_post_attempt_untyped_provider_failure_records_safe_attempt_and_pause(
     assert secret not in page.text
     assert "Authorization" not in page.text
     assert "Bearer" not in page.text
+
+
+def test_malformed_provider_response_fails_attempts_and_clears_lease_safely(
+    client: TestClient,
+    session,
+    workflow: GenerationWorkflow,
+) -> None:
+    provider = MalformedResponseProvider()
+    install_orchestrator_registry(
+        client,
+        ProviderRegistry({"fake": lambda: provider}),
+    )
+
+    result = post_workflow_action(client, workflow.id, "run")
+
+    assert result.status_code == 303
+    session.expire_all()
+    persisted = session.get(GenerationWorkflow, workflow.id)
+    step = session.scalar(
+        select(WorkflowStep).where(WorkflowStep.workflow_id == workflow.id)
+    )
+    attempts = session.scalars(
+        select(ModelAttempt)
+        .where(ModelAttempt.step_id == step.id)
+        .order_by(ModelAttempt.attempt_number)
+    ).all()
+    assert persisted is not None and step is not None
+    assert persisted.status == "PAUSED_ATTEMPTS"
+    assert persisted.last_error_code == "provider_protocol"
+    assert persisted.last_error_detail == "provider returned an invalid response"
+    assert step.status == "PAUSED"
+    assert step.lease_owner is None and step.lease_expires_at is None
+    assert step.attempt_count == 2
+    assert [attempt.status for attempt in attempts] == ["FAILED", "FAILED"]
+    assert all(attempt.error_code == "provider_protocol" for attempt in attempts)
+    assert all(attempt.error_detail == "provider returned an invalid response" for attempt in attempts)
+    assert all(attempt.provider_response_id is None for attempt in attempts)
+    assert all(attempt.input_tokens is None for attempt in attempts)
+    assert all(attempt.output_tokens is None for attempt in attempts)
+    assert all(attempt.latency_ms is None for attempt in attempts)
+
+    page = client.get(f"/workflows/{workflow.id}")
+    assert page.status_code == 200
+    assert "malformed-web-secret" not in page.text
+    assert "Authorization" not in page.text
+    assert "Bearer" not in page.text
+    assert "X-Api-Key" not in page.text
 
 
 def test_every_workflow_mutation_rejects_missing_csrf(

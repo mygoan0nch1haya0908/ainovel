@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import traceback
 
 import pytest
@@ -11,6 +12,15 @@ from ainovel.providers.contracts import ModelRequest, ModelResponse, ProviderPro
 from ainovel.providers.demo import DemoFakeProvider
 from ainovel.providers.fake import FakeProvider
 from ainovel.services.counting import count_visible_characters
+
+
+SAFE_PROTOCOL_MESSAGE = "provider returned an invalid response"
+MALICIOUS_VALUE = "Authorization: Bearer malformed-response-secret"
+
+
+class WrongProviderResponse:
+    def __repr__(self) -> str:
+        return MALICIOUS_VALUE
 
 
 def chapter_request(ordinal: int) -> ModelRequest:
@@ -93,6 +103,65 @@ def test_runner_can_return_validated_result_with_original_response_metadata() ->
     assert run.response.output_tokens == 123
     assert run.response.latency_ms == 47
     assert run.response.provider_response_id == "provider-real-id"
+
+
+@pytest.mark.parametrize("returned", [None, WrongProviderResponse()])
+def test_runner_rejects_non_model_response_without_leaking_it(returned: object) -> None:
+    provider = FakeProvider([returned])
+
+    with pytest.raises(ProviderProtocolError) as error:
+        AgentRunner().run_with_response(provider, batch_plan_request(), BatchPlanDraft)
+
+    rendered = "".join(traceback.format_exception(error.type, error.value, error.tb))
+    assert str(error.value) == SAFE_PROTOCOL_MESSAGE
+    assert MALICIOUS_VALUE not in rendered
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("input_tokens", -1),
+        ("output_tokens", -1),
+        ("latency_ms", -1),
+        ("input_tokens", True),
+        ("output_tokens", MALICIOUS_VALUE),
+        ("latency_ms", 1.5),
+        ("provider_response_id", WrongProviderResponse()),
+        ("text", WrongProviderResponse()),
+        ("structured", [MALICIOUS_VALUE]),
+    ],
+)
+def test_runner_rejects_model_response_fields_outside_contract_without_leaking_values(
+    field: str,
+    invalid_value: object,
+) -> None:
+    valid = ModelResponse(
+        structured={
+            "chapters": [
+                {
+                    "ordinal": 1,
+                    "title": "入局",
+                    "goal": "主角接下委托",
+                    "ending_hook": "发现追踪者",
+                }
+            ]
+        },
+        text=None,
+        provider_response_id="provider-real-id",
+        input_tokens=321,
+        output_tokens=123,
+        latency_ms=47,
+    )
+    malformed = replace(valid, **{field: invalid_value})
+
+    with pytest.raises(ProviderProtocolError) as error:
+        AgentRunner().run_with_response(
+            FakeProvider([malformed]), batch_plan_request(), BatchPlanDraft
+        )
+
+    rendered = "".join(traceback.format_exception(error.type, error.value, error.tb))
+    assert str(error.value) == SAFE_PROTOCOL_MESSAGE
+    assert MALICIOUS_VALUE not in rendered
 
 
 def test_runner_rejects_invalid_structured_output() -> None:
