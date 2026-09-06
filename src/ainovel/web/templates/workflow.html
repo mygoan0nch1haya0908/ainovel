@@ -39,10 +39,13 @@
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <button type="submit">恢复工作流</button>
   </form>
-  {% elif workflow.status == "AWAITING_CONTENT_APPROVAL" and workflow.candidate_batch_id %}
-  <p><a href="/projects/{{ project.id }}#batch-{{ workflow.candidate_batch_id }}">前往候选批次审批</a></p>
+  {% elif workflow.status == "AWAITING_CONTENT_APPROVAL" %}
+  <p>候选批次已准备好，等待作者审批。</p>
   {% else %}
   <p>当前状态没有可用的作者操作。</p>
+  {% endif %}
+  {% if workflow.candidate_batch_id %}
+  <p><a href="/projects/{{ project.id }}#batch-{{ workflow.candidate_batch_id }}">前往候选批次审批</a></p>
   {% endif %}
 </section>
 
@@ -74,7 +77,15 @@
 <details>
   <summary>技术详情：提示词快照、步骤、尝试和工件</summary>
   <h2>提示词快照</h2>
-  <ul>{% for snapshot in snapshots %}<li>{{ snapshot.role }} · {{ snapshot.prompt_version_id }} · {{ snapshot.parameters }}</li>{% endfor %}</ul>
+  <ol>{% for snapshot in snapshots %}<li>
+    <p>{{ snapshot.role }} · {{ snapshot.prompt_version_id }}</p>
+    <h3>提示词正文</h3>
+    <pre>{{ snapshot.prompt_body }}</pre>
+    <h3>输出结构</h3>
+    <pre>{{ snapshot.output_schema }}</pre>
+    <h3>参数</h3>
+    <pre>{{ snapshot.parameters }}</pre>
+  </li>{% endfor %}</ol>
   <h2>步骤</h2>
   <ol>{% for step in steps %}<li>{{ step.position }} · {{ step.kind }}{% if step.ordinal %} {{ step.ordinal }}{% endif %} · {{ step.status }} · 尝试 {{ step.attempt_count }}</li>{% endfor %}</ol>
   <h2>模型尝试</h2>

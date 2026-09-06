@@ -39,6 +39,7 @@ from ainovel.providers.contracts import (
     ModelResponse,
     ProviderError,
     ProviderProtocolError,
+    ProviderUnavailable,
 )
 from ainovel.providers.registry import ProviderRegistry
 from ainovel.services.batches import BatchService
@@ -163,6 +164,15 @@ class WorkflowOrchestrator:
             finally:
                 overflow_service.session.close()
             return self._current_result(workflow_id)
+        except ProviderError as error:
+            provider_service = self._workflow_service()
+            try:
+                provider_service.pause_provider_failure(
+                    claim.id, self._worker_id, error
+                )
+            finally:
+                provider_service.session.close()
+            return self._current_result(workflow_id)
 
         attempt_service = self._workflow_service()
         try:
@@ -242,8 +252,15 @@ class WorkflowOrchestrator:
                 snapshot, "max_output_tokens"
             )
             provider = self._provider(persisted_step)
-            capabilities = provider.capabilities(workflow.model_name)
-            output_tokens = min(configured_output, capabilities.max_output_tokens)
+            try:
+                capabilities = provider.capabilities(workflow.model_name)
+                output_tokens = min(
+                    configured_output, capabilities.max_output_tokens
+                )
+            except ProviderError:
+                raise
+            except Exception:
+                raise ProviderUnavailable("provider is unavailable") from None
             try:
                 input_capacity = effective_input_capacity(
                     configured_input,

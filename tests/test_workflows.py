@@ -1094,7 +1094,25 @@ def test_resume_whitelist_returns_paused_current_step_to_pending(
     )
     session.commit()
 
-    resumed = WorkflowService(session).resume(workflow.id)
+    service = WorkflowService(session)
+    project = session.get(NovelProject, workflow.project_id)
+    assert project is not None
+    project.title = "uncommitted caller state"
+    before = (
+        session.get(GenerationWorkflow, workflow.id).revision,
+        session.get(WorkflowStep, step.id).revision,
+    )
+    assert service.can_resume(workflow.id) is True
+    assert project.title == "uncommitted caller state"
+    assert session.is_modified(project) is True
+    session.rollback()
+    session.expire_all()
+    assert (
+        session.get(GenerationWorkflow, workflow.id).revision,
+        session.get(WorkflowStep, step.id).revision,
+    ) == before
+
+    resumed = service.resume(workflow.id)
 
     assert resumed.status == "PLANNING"
     session.expire_all()
@@ -1109,6 +1127,61 @@ def test_resume_whitelist_returns_paused_current_step_to_pending(
         "from_status": paused_status,
         "to_status": "PLANNING",
     }
+
+
+@pytest.mark.parametrize(
+    "invalid_state",
+    [
+        "status",
+        "ownership",
+        "outline",
+        "current_step",
+        "step_status",
+        "lease",
+        "active_artifact",
+        "attempts",
+    ],
+)
+def test_can_resume_and_resume_share_the_complete_rejection_predicate(
+    session, workflow, clock, invalid_state
+) -> None:
+    step = session.scalar(
+        select(WorkflowStep).where(WorkflowStep.workflow_id == workflow.id)
+    )
+    project = session.get(NovelProject, workflow.project_id)
+    assert step is not None and project is not None
+    workflow.status = "PAUSED_PROVIDER"
+    step.status = "PAUSED"
+    step.lease_owner = None
+    step.lease_expires_at = None
+
+    if invalid_state == "status":
+        workflow.status = "PAUSED_REVIEW"
+    elif invalid_state == "ownership":
+        project.active_workflow_id = "another-workflow"
+    elif invalid_state == "outline":
+        project.official_outline_version_id = None
+    elif invalid_state == "current_step":
+        workflow.current_position = 99
+    elif invalid_state == "step_status":
+        step.status = "PENDING"
+    elif invalid_state == "lease":
+        step.lease_owner = "stale-worker"
+        step.lease_expires_at = clock.now() + timedelta(minutes=5)
+    elif invalid_state == "active_artifact":
+        step.active_artifact_id = "already-active"
+    elif invalid_state == "attempts":
+        step.attempt_count = 2
+    session.commit()
+
+    service = WorkflowService(session, clock=clock)
+    assert service.can_resume(workflow.id) is False
+    with pytest.raises(ValueError):
+        service.resume(workflow.id)
+
+
+def test_can_resume_returns_false_for_missing_workflow(session) -> None:
+    assert WorkflowService(session).can_resume("missing") is False
 
 
 @pytest.mark.parametrize(

@@ -9,7 +9,9 @@ from ainovel.providers.contracts import (
     ModelProvider,
     ModelRequest,
     ModelResponse,
+    ProviderError,
     ProviderProtocolError,
+    ProviderUnavailable,
 )
 
 ResultType = TypeVar("ResultType", bound=BaseModel)
@@ -30,7 +32,12 @@ class AgentRunner:
     def run_with_response(
         self, provider: ModelProvider, request: ModelRequest, result_type: type[ResultType]
     ) -> AgentRunResult[ResultType]:
-        response = provider.generate(request)
+        try:
+            response = provider.generate(request)
+        except ProviderError:
+            raise
+        except Exception:
+            raise ProviderUnavailable("provider is unavailable") from None
         if response.structured is None:
             raise ProviderProtocolError("provider response did not include structured output")
         try:

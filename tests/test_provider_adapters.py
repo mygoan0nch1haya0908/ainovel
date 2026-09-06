@@ -365,3 +365,17 @@ def test_registry_calls_its_factory_for_each_lookup() -> None:
 
     assert first is not second
     assert created == [first, second]
+
+
+def test_registry_membership_check_never_constructs_a_provider() -> None:
+    calls: list[str] = []
+
+    def factory() -> object:
+        calls.append("constructed")
+        return object()
+
+    registry = ProviderRegistry({"fake": factory})
+
+    assert registry.contains("fake") is True
+    assert registry.contains("missing") is False
+    assert calls == []

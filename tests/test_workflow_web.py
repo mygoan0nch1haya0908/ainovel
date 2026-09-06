@@ -6,22 +6,36 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import func, select, text
 
+import ainovel.app as app_module
 from ainovel.agents.contracts import BatchPlanDraft, ChapterPlan
+from ainovel.agents.runner import AgentRunner
+from ainovel.app import create_app
+from ainovel.models import Base
+from ainovel.models.batch import Chapter
+from ainovel.models.prompt import WorkflowPromptSnapshot
 from ainovel.models.project import NovelProject
-from ainovel.models.workflow import GenerationWorkflow, WorkflowArtifact, WorkflowStep
+from ainovel.models.workflow import (
+    GenerationWorkflow,
+    ModelAttempt,
+    WorkflowArtifact,
+    WorkflowStep,
+)
 from ainovel.providers.contracts import (
     ModelRequest,
     ModelResponse,
     ProviderCapabilities,
     ProviderDiagnostic,
 )
+from ainovel.providers.demo import DemoFakeProvider
 from ainovel.providers.fake import FakeProvider
 from ainovel.providers.registry import ProviderRegistry
 from ainovel.services.counting import count_visible_characters
+from ainovel.services.outlines import OutlineNodeInput, OutlineService
 from ainovel.services.projects import ProjectService
 from ainovel.services.workflows import DEFAULT_BUDGETS, WorkflowService
+from ainovel.workflows.orchestrator import WorkflowOrchestrator
 
 
 def csrf(client: TestClient, path: str) -> str:
@@ -137,6 +151,124 @@ def post_workflow_action(
     )
 
 
+def create_ready_project(session_factory, title: str) -> str:
+    with session_factory() as session:
+        project = ProjectService(session).create(title, 2_000_000, 5_000_000)
+        project_id = project.id
+        outline = OutlineService(session).create_candidate(
+            project_id,
+            [
+                OutlineNodeInput(
+                    key="book",
+                    parent_key=None,
+                    kind="book",
+                    title="全书总纲",
+                    order=0,
+                )
+            ],
+            reason="default registry web e2e",
+        )
+        OutlineService(session).approve(outline.id)
+        ProjectService(session).add_constitution(
+            project_id,
+            {"genre": "offline demo", "voice": "close third"},
+            author_approved=True,
+        )
+        return project_id
+
+
+def run_default_fake_workflow(client: TestClient, project_id: str) -> str:
+    created = client.post(
+        f"/projects/{project_id}/workflows",
+        data={
+            "provider_name": "fake",
+            "model_name": "demo",
+            "requested_chapters": "5",
+            "csrf_token": csrf(client, f"/projects/{project_id}"),
+        },
+        follow_redirects=False,
+    )
+    assert created.status_code == 303
+    workflow_id = created.headers["location"].rsplit("/", 1)[-1]
+    assert post_workflow_action(client, workflow_id, "run").status_code == 303
+    assert (
+        post_workflow_action(client, workflow_id, "plan/approve").status_code
+        == 303
+    )
+    assert post_workflow_action(client, workflow_id, "run").status_code == 303
+    return workflow_id
+
+
+def test_default_registry_runs_two_fresh_offline_five_chapter_web_workflows(
+    database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbid_external_client(*_args, **_kwargs):
+        raise AssertionError("external provider client must not be constructed")
+
+    monkeypatch.setattr(app_module.httpx, "Client", forbid_external_client)
+    monkeypatch.setattr(app_module, "OpenAI", forbid_external_client)
+    app = create_app(database_url)
+    Base.metadata.create_all(app.state.engine)
+    with app.state.engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS context_source_fts "
+                "USING fts5(source_id UNINDEXED, project_id UNINDEXED, text)"
+            )
+        )
+
+    first_project_id = create_ready_project(app.state.session_factory, "默认演示一")
+    second_project_id = create_ready_project(app.state.session_factory, "默认演示二")
+    first_registry_provider = app.state.provider_registry.get("fake")
+    second_registry_provider = app.state.provider_registry.get("fake")
+    assert isinstance(first_registry_provider, DemoFakeProvider)
+    assert isinstance(second_registry_provider, DemoFakeProvider)
+    assert first_registry_provider is not second_registry_provider
+
+    with TestClient(app) as default_client:
+        workflow_ids = [
+            run_default_fake_workflow(default_client, first_project_id),
+            run_default_fake_workflow(default_client, second_project_id),
+        ]
+        with app.state.session_factory() as session:
+            workflows = [
+                session.get(GenerationWorkflow, workflow_id)
+                for workflow_id in workflow_ids
+            ]
+            assert all(workflow is not None for workflow in workflows)
+            candidate_ids = [
+                workflow.candidate_batch_id
+                for workflow in workflows
+                if workflow is not None
+            ]
+            assert len(candidate_ids) == 2
+            assert all(candidate_id is not None for candidate_id in candidate_ids)
+            assert all(
+                workflow.status == "AWAITING_CONTENT_APPROVAL"
+                for workflow in workflows
+                if workflow is not None
+            )
+            for candidate_id in candidate_ids:
+                chapters = session.scalars(
+                    select(Chapter)
+                    .where(Chapter.batch_id == candidate_id)
+                    .order_by(Chapter.ordinal)
+                ).all()
+                assert [chapter.ordinal for chapter in chapters] == [1, 2, 3, 4, 5]
+                assert all(chapter.visible_char_count == 4500 for chapter in chapters)
+
+        orchestrator = app.state.orchestrator_factory()
+        workflow_providers = [
+            provider
+            for (workflow_id, provider_name, _model_name), provider
+            in orchestrator._providers.items()
+            if workflow_id in workflow_ids and provider_name == "fake"
+        ]
+        assert len(workflow_providers) == 2
+        assert workflow_providers[0] is not workflow_providers[1]
+
+
 def test_start_workflow_redirects_without_trusting_form_project_id(
     client: TestClient,
     session,
@@ -199,10 +331,156 @@ def test_start_validation_returns_422_without_taking_project_ownership(
     assert project.active_workflow_id is None
 
 
+def test_start_checks_registry_membership_without_constructing_provider(
+    client: TestClient,
+    ready_project: NovelProject,
+) -> None:
+    calls: list[str] = []
+
+    def broken_factory():
+        calls.append("constructed")
+        raise RuntimeError("Authorization: Bearer create-secret")
+
+    client.app.state.provider_registry = ProviderRegistry({"fake": broken_factory})
+    result = client.post(
+        f"/projects/{ready_project.id}/workflows",
+        data={
+            "provider_name": "fake",
+            "model_name": "scripted",
+            "requested_chapters": "1",
+            "csrf_token": csrf(client, f"/projects/{ready_project.id}"),
+        },
+        follow_redirects=False,
+    )
+
+    assert result.status_code == 303
+    assert calls == []
+
+
+class BrokenCapabilitiesProvider:
+    def __init__(self, secret: str) -> None:
+        self.secret = secret
+
+    def capabilities(self, model: str) -> ProviderCapabilities:
+        raise RuntimeError(f"X-Api-Key: {self.secret}")
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        raise AssertionError("generate must not run after capability failure")
+
+    def diagnose(self, model: str | None = None) -> ProviderDiagnostic:
+        return ProviderDiagnostic(False, "not used", ())
+
+
+class BrokenGenerateProvider:
+    def __init__(self, secret: str) -> None:
+        self.secret = secret
+
+    def capabilities(self, model: str) -> ProviderCapabilities:
+        return ProviderCapabilities(128_000, 16_000, True, True, True, False)
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        raise RuntimeError(f"Authorization: Bearer {self.secret}")
+
+    def diagnose(self, model: str | None = None) -> ProviderDiagnostic:
+        return ProviderDiagnostic(True, "not used", ())
+
+
+def install_orchestrator_registry(
+    client: TestClient, registry: ProviderRegistry
+) -> None:
+    client.app.state.provider_registry = registry
+    orchestrator = WorkflowOrchestrator(
+        client.app.state.session_factory,
+        registry,
+        AgentRunner(),
+        worker_id="web-provider-failure",
+    )
+    client.app.state.orchestrator_factory = lambda: orchestrator
+
+
+@pytest.mark.parametrize("boundary", ["factory", "capabilities"])
+def test_pre_attempt_provider_failure_pauses_safely_and_clears_lease(
+    client: TestClient,
+    session,
+    workflow: GenerationWorkflow,
+    boundary: str,
+) -> None:
+    secret = f"pre-attempt-{boundary}-secret"
+
+    def factory():
+        if boundary == "factory":
+            raise RuntimeError(f"Authorization: Bearer {secret}")
+        return BrokenCapabilitiesProvider(secret)
+
+    install_orchestrator_registry(client, ProviderRegistry({"fake": factory}))
+    result = post_workflow_action(client, workflow.id, "run")
+    assert result.status_code == 303
+
+    session.expire_all()
+    persisted = session.get(GenerationWorkflow, workflow.id)
+    step = session.scalar(
+        select(WorkflowStep).where(WorkflowStep.workflow_id == workflow.id)
+    )
+    assert persisted is not None and step is not None
+    assert persisted.status == "PAUSED_PROVIDER"
+    assert persisted.last_error_code == "provider_unavailable"
+    assert persisted.last_error_detail == "provider is unavailable"
+    assert step.status == "PAUSED"
+    assert step.lease_owner is None and step.lease_expires_at is None
+    assert session.scalar(
+        select(func.count())
+        .select_from(ModelAttempt)
+        .where(ModelAttempt.step_id == step.id)
+    ) == 0
+    page = client.get(f"/workflows/{workflow.id}")
+    assert secret not in page.text
+    assert "Authorization" not in page.text
+    assert "Bearer" not in page.text
+
+
+def test_post_attempt_untyped_provider_failure_records_safe_attempt_and_pause(
+    client: TestClient,
+    session,
+    workflow: GenerationWorkflow,
+) -> None:
+    secret = "post-attempt-generate-secret"
+    provider = BrokenGenerateProvider(secret)
+    install_orchestrator_registry(
+        client,
+        ProviderRegistry({"fake": lambda: provider}),
+    )
+    result = post_workflow_action(client, workflow.id, "run")
+    assert result.status_code == 303
+
+    session.expire_all()
+    persisted = session.get(GenerationWorkflow, workflow.id)
+    step = session.scalar(
+        select(WorkflowStep).where(WorkflowStep.workflow_id == workflow.id)
+    )
+    attempt = session.scalar(
+        select(ModelAttempt).where(ModelAttempt.step_id == step.id)
+    )
+    assert persisted is not None and step is not None and attempt is not None
+    assert persisted.status == "PAUSED_PROVIDER"
+    assert persisted.last_error_code == "provider_unavailable"
+    assert persisted.last_error_detail == "provider is unavailable"
+    assert step.status == "PAUSED"
+    assert step.lease_owner is None and step.lease_expires_at is None
+    assert step.attempt_count == 1
+    assert attempt.status == "FAILED"
+    assert attempt.error_code == "provider_unavailable"
+    assert attempt.error_detail == "provider is unavailable"
+    page = client.get(f"/workflows/{workflow.id}")
+    assert secret not in page.text
+    assert "Authorization" not in page.text
+    assert "Bearer" not in page.text
+
+
 def test_every_workflow_mutation_rejects_missing_csrf(
     client: TestClient, workflow: GenerationWorkflow
 ) -> None:
     paths = [
+        f"/projects/{workflow.project_id}/workflows",
         f"/workflows/{workflow.id}/run",
         f"/workflows/{workflow.id}/plan/approve",
         f"/workflows/{workflow.id}/plan/reject",
@@ -285,6 +563,32 @@ def test_run_renders_plan_snapshots_steps_attempts_budgets_and_usage(
     assert page.text.count('name="csrf_token"') == page.text.count("<form ")
 
 
+def test_workflow_page_renders_complete_immutable_prompt_snapshot_safely(
+    client: TestClient,
+    session,
+    workflow: GenerationWorkflow,
+) -> None:
+    snapshot = session.scalar(
+        select(WorkflowPromptSnapshot).where(
+            WorkflowPromptSnapshot.workflow_id == workflow.id,
+            WorkflowPromptSnapshot.role == "batch_planner",
+        )
+    )
+    assert snapshot is not None
+    snapshot.prompt_body = "<prompt-body-sentinel>"
+    snapshot.output_schema = {"description": "output-schema-sentinel"}
+    snapshot.parameters = {"marker": "parameters-sentinel"}
+    session.commit()
+
+    page = client.get(f"/workflows/{workflow.id}")
+
+    assert page.status_code == 200
+    assert "&lt;prompt-body-sentinel&gt;" in page.text
+    assert "<prompt-body-sentinel>" not in page.text
+    assert "output-schema-sentinel" in page.text
+    assert "parameters-sentinel" in page.text
+
+
 def test_run_and_resume_forms_do_not_require_browser_confirmation(
     client: TestClient,
     session,
@@ -347,6 +651,36 @@ def test_plan_approval_runs_to_candidate_gate_and_links_batch(
     ]
     page = client.get(f"/workflows/{workflow.id}")
     assert f'href="/projects/{workflow.project_id}#batch-{persisted.candidate_batch_id}"' in page.text
+
+
+@pytest.mark.parametrize("terminal_status", ["COMPLETED", "REJECTED"])
+def test_terminal_workflow_page_keeps_candidate_batch_link(
+    client: TestClient,
+    session,
+    workflow: GenerationWorkflow,
+    terminal_status: str,
+) -> None:
+    assert post_workflow_action(client, workflow.id, "run").status_code == 303
+    assert (
+        post_workflow_action(client, workflow.id, "plan/approve").status_code
+        == 303
+    )
+    assert post_workflow_action(client, workflow.id, "run").status_code == 303
+    session.expire_all()
+    persisted = session.get(GenerationWorkflow, workflow.id)
+    assert persisted is not None
+    assert persisted.candidate_batch_id is not None
+    candidate_batch_id = persisted.candidate_batch_id
+    persisted.status = terminal_status
+    session.commit()
+
+    page = client.get(f"/workflows/{workflow.id}")
+
+    assert page.status_code == 200
+    assert (
+        f'href="/projects/{workflow.project_id}#batch-{candidate_batch_id}"'
+        in page.text
+    )
 
 
 def test_workflow_page_renders_persisted_review_issues(
@@ -441,6 +775,35 @@ def test_resume_delegates_strict_whitelist_to_workflow_service(
     session.expire_all()
     persisted = session.get(GenerationWorkflow, workflow.id)
     assert persisted is not None and persisted.status == "PAUSED_REVIEW"
+
+
+def test_exhausted_paused_provider_does_not_offer_resume(
+    client: TestClient,
+    session,
+    workflow: GenerationWorkflow,
+) -> None:
+    step = session.scalar(
+        select(WorkflowStep).where(WorkflowStep.workflow_id == workflow.id)
+    )
+    assert step is not None
+    workflow.status = "PAUSED_PROVIDER"
+    workflow.last_error_code = "provider_unavailable"
+    workflow.last_error_detail = "provider is unavailable"
+    step.status = "PAUSED"
+    step.attempt_count = 2
+    session.commit()
+
+    page = client.get(f"/workflows/{workflow.id}")
+    assert page.status_code == 200
+    assert f'action="/workflows/{workflow.id}/resume"' not in page.text
+    assert WorkflowService(session).can_resume(workflow.id) is False
+
+    refused = client.post(
+        f"/workflows/{workflow.id}/resume",
+        data={"csrf_token": csrf(client, f"/projects/{workflow.project_id}")},
+        follow_redirects=False,
+    )
+    assert refused.status_code == 422
 
 
 class DiagnosticOnlyProvider:

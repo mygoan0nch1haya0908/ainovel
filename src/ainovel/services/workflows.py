@@ -693,6 +693,112 @@ class WorkflowService:
             self.session.rollback()
             raise
 
+    def pause_provider_failure(
+        self,
+        step_id: str,
+        worker_id: str,
+        error: ProviderError,
+    ) -> GenerationWorkflow:
+        normalized_worker = worker_id.strip() if isinstance(worker_id, str) else ""
+        if not normalized_worker:
+            raise ValueError("worker id is required")
+        if not isinstance(error, ProviderError):
+            raise TypeError("provider pause requires a typed ProviderError")
+        code, detail, _retryable = self._provider_failure(error)
+        now = self._aware_utc(self.clock.now())
+        self.session.expire_all()
+        step = self.session.get(WorkflowStep, step_id)
+        workflow = (
+            self.session.get(GenerationWorkflow, step.workflow_id)
+            if step is not None
+            else None
+        )
+        running_attempt_id = (
+            self.session.scalar(
+                select(ModelAttempt.id)
+                .where(
+                    ModelAttempt.step_id == step.id,
+                    ModelAttempt.status == "RUNNING",
+                )
+                .limit(1)
+            )
+            if step is not None
+            else None
+        )
+        if (
+            step is None
+            or workflow is None
+            or workflow.status not in EXECUTABLE_WORKFLOW_STATUSES
+            or workflow.current_position != step.position
+            or step.kind not in _STEP_PROMPT_ROLES
+            or step.status != "RUNNING"
+            or step.active_artifact_id is not None
+            or step.lease_owner != normalized_worker
+            or step.lease_expires_at is None
+            or step.lease_expires_at <= now
+            or running_attempt_id is not None
+        ):
+            self.session.rollback()
+            raise ValueError("provider pause conflict")
+
+        self._require_transition(workflow.status, "PAUSED_PROVIDER")
+        try:
+            workflow_claim = self.session.execute(
+                update(GenerationWorkflow)
+                .where(
+                    GenerationWorkflow.id == workflow.id,
+                    GenerationWorkflow.status == workflow.status,
+                    GenerationWorkflow.revision == workflow.revision,
+                    GenerationWorkflow.current_position == step.position,
+                )
+                .values(
+                    status="PAUSED_PROVIDER",
+                    revision=workflow.revision + 1,
+                    last_error_code=code,
+                    last_error_detail=detail,
+                )
+            )
+            step_claim = self.session.execute(
+                update(WorkflowStep)
+                .where(
+                    WorkflowStep.id == step.id,
+                    WorkflowStep.workflow_id == workflow.id,
+                    WorkflowStep.status == "RUNNING",
+                    WorkflowStep.revision == step.revision,
+                    WorkflowStep.attempt_count == step.attempt_count,
+                    WorkflowStep.active_artifact_id.is_(None),
+                    WorkflowStep.lease_owner == normalized_worker,
+                    WorkflowStep.lease_expires_at == step.lease_expires_at,
+                    WorkflowStep.lease_expires_at > now,
+                    ~select(ModelAttempt.id)
+                    .where(
+                        ModelAttempt.step_id == step.id,
+                        ModelAttempt.status == "RUNNING",
+                    )
+                    .exists(),
+                )
+                .values(
+                    status="PAUSED",
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    revision=step.revision + 1,
+                )
+            )
+            if workflow_claim.rowcount != 1 or step_claim.rowcount != 1:
+                raise ValueError("provider pause conflict")
+            self._add_audit(
+                workflow.project_id,
+                workflow.id,
+                "workflow_paused",
+                "system",
+                {"reason": code},
+            )
+            self.session.commit()
+            return workflow
+        except Exception:
+            self.session.rollback()
+            raise
+
     def complete_attempt(
         self,
         attempt_id: str,
@@ -1278,34 +1384,39 @@ class WorkflowService:
             self.session.rollback()
             raise
 
+    def can_resume(self, workflow_id: str) -> bool:
+        with self.session.no_autoflush:
+            workflow = self.session.get(GenerationWorkflow, workflow_id)
+            if workflow is None:
+                return False
+            try:
+                self._resumable_step(workflow)
+            except ValueError:
+                return False
+            return True
+
     def resume(self, workflow_id: str) -> GenerationWorkflow:
         self.session.expire_all()
         workflow = self._get_workflow(workflow_id)
-        if workflow.status not in RESUMABLE_WORKFLOW_STATUSES:
-            self.session.rollback()
-            raise ValueError("workflow status is not resumable")
         source_status = workflow.status
-        project = self.session.get(NovelProject, workflow.project_id)
-        step = self.session.scalar(
-            select(WorkflowStep).where(
-                WorkflowStep.workflow_id == workflow.id,
-                WorkflowStep.position == workflow.current_position,
-            )
-        )
-        if (
-            project is None
-            or project.active_workflow_id != workflow.id
-            or project.official_outline_version_id != workflow.base_outline_version_id
-            or step is None
-            or step.status != "PAUSED"
-            or step.active_artifact_id is not None
-            or step.attempt_count >= MAX_STEP_ATTEMPTS
-        ):
+        try:
+            step = self._resumable_step(workflow)
+        except ValueError:
             self.session.rollback()
-            raise ValueError("workflow cannot be resumed")
+            raise
         target_status = self._workflow_status_for_step(step.kind)
         self._require_transition(workflow.status, target_status)
         try:
+            resumable_project = (
+                select(NovelProject.id)
+                .where(
+                    NovelProject.id == workflow.project_id,
+                    NovelProject.active_workflow_id == workflow.id,
+                    NovelProject.official_outline_version_id
+                    == workflow.base_outline_version_id,
+                )
+                .exists()
+            )
             workflow_claim = self.session.execute(
                 update(GenerationWorkflow)
                 .where(
@@ -1313,6 +1424,7 @@ class WorkflowService:
                     GenerationWorkflow.status == workflow.status,
                     GenerationWorkflow.revision == workflow.revision,
                     GenerationWorkflow.current_position == step.position,
+                    resumable_project,
                 )
                 .values(
                     status=target_status,
@@ -1327,7 +1439,11 @@ class WorkflowService:
                     WorkflowStep.id == step.id,
                     WorkflowStep.status == "PAUSED",
                     WorkflowStep.revision == step.revision,
+                    WorkflowStep.attempt_count == step.attempt_count,
+                    WorkflowStep.attempt_count < MAX_STEP_ATTEMPTS,
                     WorkflowStep.active_artifact_id.is_(None),
+                    WorkflowStep.lease_owner.is_(None),
+                    WorkflowStep.lease_expires_at.is_(None),
                 )
                 .values(
                     status="PENDING",
@@ -1350,6 +1466,30 @@ class WorkflowService:
         except Exception:
             self.session.rollback()
             raise
+
+    def _resumable_step(self, workflow: GenerationWorkflow) -> WorkflowStep:
+        if workflow.status not in RESUMABLE_WORKFLOW_STATUSES:
+            raise ValueError("workflow status is not resumable")
+        project = self.session.get(NovelProject, workflow.project_id)
+        step = self.session.scalar(
+            select(WorkflowStep).where(
+                WorkflowStep.workflow_id == workflow.id,
+                WorkflowStep.position == workflow.current_position,
+            )
+        )
+        if (
+            project is None
+            or project.active_workflow_id != workflow.id
+            or project.official_outline_version_id != workflow.base_outline_version_id
+            or step is None
+            or step.status != "PAUSED"
+            or step.lease_owner is not None
+            or step.lease_expires_at is not None
+            or step.active_artifact_id is not None
+            or step.attempt_count >= MAX_STEP_ATTEMPTS
+        ):
+            raise ValueError("workflow cannot be resumed")
+        return step
 
     def reconcile_batch_decision(self, workflow_id: str) -> GenerationWorkflow:
         self.session.expire_all()

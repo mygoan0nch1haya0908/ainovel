@@ -15,12 +15,10 @@ from ainovel.models.workflow import (
     WorkflowArtifact,
     WorkflowStep,
 )
-from ainovel.providers.contracts import ProviderError
 from ainovel.services.projects import ProjectService
 from ainovel.services.workflows import (
     DEFAULT_BUDGETS,
     EXECUTABLE_WORKFLOW_STATUSES,
-    RESUMABLE_WORKFLOW_STATUSES,
     WorkflowService,
 )
 from ainovel.web.routes import _project_page, templates
@@ -45,6 +43,7 @@ def _workflow_context(
     session: Session,
     workflow_id: str,
 ) -> dict[str, object]:
+    can_resume = WorkflowService(session).can_resume(workflow_id)
     workflow = _workflow_row(session, workflow_id)
     project = session.get(NovelProject, workflow.project_id)
     assert project is not None
@@ -106,7 +105,7 @@ def _workflow_context(
         "review_issues": review_issues,
         "csrf_token": csrf_token(request),
         "can_run": workflow.status in EXECUTABLE_WORKFLOW_STATUSES,
-        "can_resume": workflow.status in RESUMABLE_WORKFLOW_STATUSES,
+        "can_resume": can_resume,
         "is_paused": workflow.status.startswith("PAUSED_"),
     }
 
@@ -172,9 +171,7 @@ def create_workflow(
         return _project_page(
             request, session, project_id, "计划章节数必须是整数", 422
         )
-    try:
-        request.app.state.provider_registry.get(provider_name)
-    except ProviderError:
+    if not request.app.state.provider_registry.contains(provider_name):
         return _project_page(request, session, project_id, "Provider 未配置", 422)
     try:
         workflow = WorkflowService(session).start(
@@ -278,10 +275,10 @@ def diagnose_provider(
         ProjectService(session).get(project_id)
     except ValueError as error:
         raise HTTPException(status_code=404, detail="项目不存在") from error
+    if not request.app.state.provider_registry.contains(provider_name):
+        return _project_page(request, session, project_id, "Provider 未配置", 422)
     try:
         provider = request.app.state.provider_registry.get(provider_name)
-    except ProviderError:
-        return _project_page(request, session, project_id, "Provider 未配置", 422)
     except Exception:
         return _project_page(
             request,
