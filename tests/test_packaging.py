@@ -41,3 +41,4 @@ def test_wheel_contains_runtime_templates_and_static_assets(tmp_path: Path) -> N
     assert "ainovel/web/templates/base.html" in packaged_files
     assert "ainovel/web/templates/index.html" in packaged_files
     assert "ainovel/web/templates/project.html" in packaged_files
+    assert "ainovel/web/templates/workflow.html" in packaged_files

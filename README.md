@@ -2,7 +2,11 @@
 
 ## Local setup
 
-Phase one stores projects, outlines, and candidate batches locally. It does not call a model API. By default, its SQLite data is stored in `./ainovel.db` in the directory where the server is started.
+AI Novel Studio stores projects, outlines, prompt snapshots, workflow state, and
+candidate batches locally. By default, its SQLite data is stored in
+`./ainovel.db` in the directory where the server is started. The built-in Fake
+Provider is the default deterministic workflow demonstration and makes no model
+or network request.
 
 Create the environment, install dependencies, apply the required Alembic migration, and start the server:
 
@@ -15,7 +19,12 @@ python -m venv .venv
 
 Alembic upgrade is required before starting the application. Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
 
-The Phase 1 server accepts only `127.0.0.1`, `localhost`, and the test host. Do not expose it on a LAN or the public internet: network exposure requires authentication, which Phase 1 does not provide. Browser mutations use signed, session-backed CSRF tokens. By default, a cryptographically random session secret is generated for each server process; set `AINOVEL_SESSION_SECRET` when sessions must survive a local restart.
+The server accepts only `127.0.0.1`, `localhost`, and the test host. Always bind
+Uvicorn to `127.0.0.1`; do not expose it on a LAN or the public internet because
+the local workbench does not provide network-user authentication. Browser
+mutations use signed, session-backed CSRF tokens. By default, a cryptographically
+random session secret is generated for each server process; set
+`AINOVEL_SESSION_SECRET` when sessions must survive a local restart.
 
 ## Migrations
 
@@ -34,6 +43,75 @@ Pytest is configured to keep temporary test artifacts in the worktree-local `.py
 
 ## Tests
 
+The default suite is offline and requires neither Ollama nor an OpenAI API key:
+
 ```powershell
+Remove-Item Env:AINOVEL_RUN_OLLAMA_TESTS -ErrorAction SilentlyContinue
+Remove-Item Env:AINOVEL_OLLAMA_MODEL -ErrorAction SilentlyContinue
+Remove-Item Env:AINOVEL_ALLOW_REAL_OPENAI -ErrorAction SilentlyContinue
+Remove-Item Env:AINOVEL_OPENAI_API_KEY -ErrorAction SilentlyContinue
 .\.venv\Scripts\python -m pytest -q
 ```
+
+## Fake workflow demo
+
+Apply migrations and start the loopback-only workbench:
+
+```powershell
+.\.venv\Scripts\alembic upgrade head
+.\.venv\Scripts\uvicorn ainovel.app:app --host 127.0.0.1 --port 8000
+```
+
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000), create or open a project,
+approve its creation constitution and official outline, then choose Provider
+`fake`, model `demo`, and 1–5 chapters. Run to the plan gate, approve the plan,
+run to the candidate-content gate, and use the existing candidate-batch approval
+before synchronizing the workflow decision.
+
+Fake output verifies orchestration, persistence, crash-safe gates, and approval
+boundaries. It does **not** evaluate or demonstrate literary quality.
+
+## Ollama diagnosis and optional local smoke test
+
+Ollama is optional. AI Novel Studio never downloads or removes a model. Inspect
+the already installed local models and diagnose the loopback service with:
+
+```powershell
+ollama list
+Invoke-RestMethod http://127.0.0.1:11434/api/tags
+```
+
+With the loopback server running, the project page can diagnose Provider
+`ollama` using an installed model name. To opt into the structured-output smoke
+test, copy an exact model name from `ollama list` and run:
+
+```powershell
+$env:AINOVEL_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+$env:AINOVEL_RUN_OLLAMA_TESTS = "1"
+$env:AINOVEL_OLLAMA_MODEL = "<installed-model-name>"
+.\.venv\Scripts\python -m pytest tests\test_ollama_live.py -v
+Remove-Item Env:AINOVEL_OLLAMA_BASE_URL, Env:AINOVEL_RUN_OLLAMA_TESTS, Env:AINOVEL_OLLAMA_MODEL
+```
+
+The smoke test contacts only the configured `127.0.0.1` service, performs one
+diagnostic and one short JSON-Schema request, and never pulls a model or calls a
+cloud endpoint.
+
+## Explicit OpenAI opt-in
+
+Real OpenAI requests are disabled unless both the opt-in and an API key are
+present. The following PowerShell reads the key without echoing it and keeps the
+server loopback-only. Real requests may incur API charges.
+
+```powershell
+$secureOpenAIKey = Read-Host "OpenAI API key" -AsSecureString
+$openAICredential = [pscredential]::new("unused", $secureOpenAIKey)
+$env:AINOVEL_OPENAI_API_KEY = $openAICredential.GetNetworkCredential().Password
+$env:AINOVEL_ALLOW_REAL_OPENAI = "true"
+.\.venv\Scripts\uvicorn ainovel.app:app --host 127.0.0.1 --port 8000
+Remove-Item Env:AINOVEL_OPENAI_API_KEY, Env:AINOVEL_ALLOW_REAL_OPENAI
+```
+
+Do not place credentials in the database, command history, README, screenshots,
+or logs. If either environment variable is absent, OpenAI remains unavailable
+without making application startup fail.

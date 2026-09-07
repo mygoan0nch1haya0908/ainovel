@@ -36,3 +36,6 @@ ainovel = ["static/*.js", "web/templates/*.html"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers --basetemp=.pytest-tmp"
+markers = [
+  "local_model: opt-in tests that call a model installed on the local loopback service",
+]

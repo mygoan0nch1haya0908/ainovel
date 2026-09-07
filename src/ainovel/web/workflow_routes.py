@@ -262,6 +262,23 @@ def resume_workflow(
     return RedirectResponse(f"/workflows/{workflow_id}", status_code=303)
 
 
+@router.post("/workflows/{workflow_id}/reconcile")
+def reconcile_workflow(
+    workflow_id: str,
+    request: Request,
+    session: Session = Depends(get_session),
+    _csrf: None = Depends(require_csrf),
+) -> object:
+    _workflow_row(session, workflow_id)
+    try:
+        WorkflowService(session).reconcile_batch_decision(workflow_id)
+    except (ValueError, PermissionError):
+        return _workflow_page(
+            request, session, workflow_id, "候选批次对账失败，状态已变化", 422
+        )
+    return RedirectResponse(f"/workflows/{workflow_id}", status_code=303)
+
+
 @router.post("/projects/{project_id}/providers/diagnose")
 def diagnose_provider(
     project_id: str,

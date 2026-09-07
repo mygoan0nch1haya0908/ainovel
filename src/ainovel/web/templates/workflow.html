@@ -41,6 +41,10 @@
   </form>
   {% elif workflow.status == "AWAITING_CONTENT_APPROVAL" %}
   <p>候选批次已准备好，等待作者审批。</p>
+  <form action="/workflows/{{ workflow.id }}/reconcile" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">同步候选审批结果</button>
+  </form>
   {% else %}
   <p>当前状态没有可用的作者操作。</p>
   {% endif %}
