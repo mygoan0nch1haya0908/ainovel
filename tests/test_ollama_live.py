@@ -47,7 +47,7 @@ def test_ollama_live_opt_in_gates_skip_before_client_construction(
     model: str | None,
     message: str,
 ) -> None:
-    def forbidden_provider() -> OllamaProvider:
+    def forbidden_client(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("Ollama client must not be constructed before opt-in")
 
     if run_live is None:
@@ -58,9 +58,7 @@ def test_ollama_live_opt_in_gates_skip_before_client_construction(
         monkeypatch.delenv("AINOVEL_OLLAMA_MODEL", raising=False)
     else:
         monkeypatch.setenv("AINOVEL_OLLAMA_MODEL", model)
-    monkeypatch.setattr(
-        "tests.test_ollama_live.ollama_provider_from_settings", forbidden_provider
-    )
+    monkeypatch.setattr(httpx, "Client", forbidden_client)
 
     with pytest.raises(pytest.skip.Exception, match=message):
         test_configured_ollama_model_returns_structured_output()
