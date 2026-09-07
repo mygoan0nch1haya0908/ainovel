@@ -681,7 +681,13 @@ def test_stage_two_migration_downgrades_and_re_upgrades(
     temporary_root = tmp_path.resolve(strict=True)
     assert temporary_root.is_relative_to(PROJECT_ROOT.resolve())
     database_path = temporary_root / "orchestration-round-trip.db"
+    ambient_database_path = temporary_root / "ambient-database-must-not-be-used.db"
     database_url = f"sqlite+pysqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv(
+        "AINOVEL_DATABASE_URL",
+        f"sqlite+pysqlite:///{ambient_database_path.as_posix()}",
+    )
+    monkeypatch.delenv("AINOVEL_DATABASE_URL", raising=False)
     monkeypatch.chdir(temporary_root)
     config = Config(str(PROJECT_ROOT / "alembic.ini"))
     config.set_main_option("sqlalchemy.url", database_url)
@@ -721,5 +727,7 @@ def test_stage_two_migration_downgrades_and_re_upgrades(
                 ).scalar_one() == "context_source_fts"
         finally:
             engine.dispose()
+        assert not ambient_database_path.exists()
     finally:
         _remove_database_artifacts(database_path, temporary_root)
+        _remove_database_artifacts(ambient_database_path, temporary_root)

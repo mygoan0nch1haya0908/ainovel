@@ -13,6 +13,59 @@ from ainovel.providers.contracts import ModelRequest
 from ainovel.providers.ollama import OllamaProvider
 
 
+def test_ollama_live_helper_disables_environment_proxies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def client_constructor(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.setenv(name, "http://proxy.invalid:8080")
+    monkeypatch.setenv("AINOVEL_OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+    monkeypatch.setattr(httpx, "Client", client_constructor)
+
+    provider = ollama_provider_from_settings()
+
+    assert isinstance(provider, OllamaProvider)
+    assert captured["base_url"] == "http://127.0.0.1:11434"
+    assert captured["trust_env"] is False
+
+
+@pytest.mark.parametrize(
+    ("run_live", "model", "message"),
+    [
+        (None, None, "AINOVEL_RUN_OLLAMA_TESTS=1"),
+        ("1", None, "AINOVEL_OLLAMA_MODEL"),
+    ],
+)
+def test_ollama_live_opt_in_gates_skip_before_client_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    run_live: str | None,
+    model: str | None,
+    message: str,
+) -> None:
+    def forbidden_provider() -> OllamaProvider:
+        raise AssertionError("Ollama client must not be constructed before opt-in")
+
+    if run_live is None:
+        monkeypatch.delenv("AINOVEL_RUN_OLLAMA_TESTS", raising=False)
+    else:
+        monkeypatch.setenv("AINOVEL_RUN_OLLAMA_TESTS", run_live)
+    if model is None:
+        monkeypatch.delenv("AINOVEL_OLLAMA_MODEL", raising=False)
+    else:
+        monkeypatch.setenv("AINOVEL_OLLAMA_MODEL", model)
+    monkeypatch.setattr(
+        "tests.test_ollama_live.ollama_provider_from_settings", forbidden_provider
+    )
+
+    with pytest.raises(pytest.skip.Exception, match=message):
+        test_configured_ollama_model_returns_structured_output()
+
+
 def ollama_provider_from_settings() -> OllamaProvider:
     settings = Settings()
     parsed = urlsplit(settings.ollama_base_url)
@@ -28,6 +81,7 @@ def ollama_provider_from_settings() -> OllamaProvider:
     client = httpx.Client(
         base_url=settings.ollama_base_url,
         timeout=settings.provider_timeout_seconds,
+        trust_env=False,
     )
     return OllamaProvider(client, settings.ollama_base_url)
 

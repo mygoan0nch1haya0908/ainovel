@@ -52,7 +52,10 @@ def _default_provider_registry(settings: Settings) -> ProviderRegistry:
 
     def ollama_provider() -> OllamaProvider:
         return OllamaProvider(
-            httpx.Client(timeout=settings.provider_timeout_seconds),
+            httpx.Client(
+                timeout=settings.provider_timeout_seconds,
+                trust_env=False,
+            ),
             ollama_base_url,
             context_window_limit=PROVIDER_CONTEXT_WINDOW_CEILING,
             max_output_tokens_limit=PROVIDER_OUTPUT_TOKEN_CEILING,

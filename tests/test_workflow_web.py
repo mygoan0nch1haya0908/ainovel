@@ -1001,6 +1001,27 @@ def test_default_registry_injects_conservative_provider_capability_ceilings(
     assert openai.capabilities("configured-model").real_calls_allowed is False
 
 
+def test_default_ollama_client_ignores_proxy_environment(
+    database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ainovel.app as app_module
+
+    captured: dict[str, object] = {}
+
+    def client_constructor(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.setenv(name, "http://proxy.invalid:8080")
+    monkeypatch.setattr(app_module.httpx, "Client", client_constructor)
+    app = app_module.create_app(database_url)
+
+    app.state.provider_registry.get("ollama")
+
+    assert captured == {"timeout": 120.0, "trust_env": False}
+
+
 def test_openai_default_provider_requires_both_opt_in_and_key(
     database_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

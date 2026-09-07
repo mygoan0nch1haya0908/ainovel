@@ -50,6 +50,7 @@ Remove-Item Env:AINOVEL_RUN_OLLAMA_TESTS -ErrorAction SilentlyContinue
 Remove-Item Env:AINOVEL_OLLAMA_MODEL -ErrorAction SilentlyContinue
 Remove-Item Env:AINOVEL_ALLOW_REAL_OPENAI -ErrorAction SilentlyContinue
 Remove-Item Env:AINOVEL_OPENAI_API_KEY -ErrorAction SilentlyContinue
+Remove-Item Env:AINOVEL_DATABASE_URL -ErrorAction SilentlyContinue
 .\.venv\Scripts\python -m pytest -q
 ```
 

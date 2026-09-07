@@ -21,7 +21,9 @@ from ainovel.agents.contracts import (
 )
 from ainovel.agents.runner import AgentRunner
 from ainovel.app import create_app
-from ainovel.models.context import ContextPacket
+from ainovel.context import ITEM_FRAMING_TOKENS
+from ainovel.models.audit import AuditEvent
+from ainovel.models.context import ContextPacket, ContextSource
 from ainovel.models.project import NovelProject
 from ainovel.models.workflow import (
     GenerationWorkflow,
@@ -34,9 +36,11 @@ from ainovel.providers.fake import FakeProvider
 from ainovel.providers.registry import ProviderRegistry
 from ainovel.services.batches import BatchService
 from ainovel.services.context import ContextIndexService, ContextService
+from ainovel.services.counting import count_visible_characters
+from ainovel.services.outlines import OutlineNodeInput, OutlineService
 from ainovel.services.prompts import PromptService
 from ainovel.services.projects import ProjectService
-from ainovel.services.workflows import DEFAULT_BUDGETS, WorkflowBudgets, WorkflowService
+from ainovel.services.workflows import DEFAULT_BUDGETS, WorkflowService
 from ainovel.workflows.orchestrator import WorkflowOrchestrator
 
 
@@ -150,12 +154,16 @@ def _one_chapter_script(*extra: ModelResponse) -> list[ModelResponse]:
     ]
 
 
-def _orchestrator(session_factory, provider: FakeProvider) -> WorkflowOrchestrator:
+def _orchestrator(
+    session_factory,
+    provider: FakeProvider,
+    context_service=ContextService,
+) -> WorkflowOrchestrator:
     return WorkflowOrchestrator(
         session_factory,
         ProviderRegistry({"fake": lambda: provider}),
         AgentRunner(),
-        ContextService,
+        context_service,
         PromptService,
         worker_id="acceptance-worker",
     )
@@ -207,6 +215,7 @@ def reconcile_workflow(client: TestClient, workflow_id: str) -> None:
         follow_redirects=False,
     )
     assert response.status_code == 303
+    assert response.headers["location"] == path
 
 
 def approve_candidate_batch(client: TestClient, batch_id: str) -> None:
@@ -430,26 +439,59 @@ def test_required_context_overflow_pauses_before_any_provider_request(
     session, session_factory, ready_project: NovelProject
 ) -> None:
     provider = FakeProvider([_one_chapter_script()[0]])
-    tiny = WorkflowBudgets(
-        planner_input=1,
-        planner_output=1,
-        writer_input=1,
-        writer_output=1,
-        summarizer_input=1,
-        summarizer_output=1,
-        reviewer_input=1,
-        reviewer_output=1,
+    constitution = ProjectService(session).add_constitution(
+        ready_project.id,
+        {"required_world_law": "界" * 9_000},
+        author_approved=True,
     )
     workflow = WorkflowService(session).start(
-        ready_project.id, "fake", "scripted", 1, tiny
+        ready_project.id, "fake", "scripted", 1, DEFAULT_BUDGETS
     )
+    observed: dict[str, object] = {}
 
-    result = _orchestrator(session_factory, provider).advance(workflow.id)
+    class RecordingContextService(ContextService):
+        def build_packet(
+            self, workflow_id, step_id, required, optional, limits
+        ):
+            capacity = limits["input_capacity_tokens"]
+            fixed = limits["fixed_overhead_tokens"]
+            observed["capacity"] = capacity
+            observed["fixed"] = fixed
+            observed["required_keys"] = tuple(item.stable_key for item in required)
+            observed["required_cost"] = sum(
+                self.budgeter.estimator.estimate(item.text) + ITEM_FRAMING_TOKENS
+                for item in required
+            )
+            return super().build_packet(
+                workflow_id, step_id, required, optional, limits
+            )
+
+    result = _orchestrator(
+        session_factory, provider, RecordingContextService
+    ).advance(workflow.id)
 
     assert result.status == "PAUSED_CONTEXT_OVERFLOW"
+    assert observed["required_keys"] == (f"constitution:{constitution.id}",)
+    assert observed["fixed"] < observed["capacity"]
+    assert observed["fixed"] + observed["required_cost"] > observed["capacity"]
     assert provider.requests == []
     assert session.scalar(select(func.count()).select_from(ModelAttempt)) == 0
     assert session.scalar(select(func.count()).select_from(ContextPacket)) == 0
+    stored = load_workflow(session, workflow.id)
+    assert stored.last_error_code == "required_context_overflow"
+    assert (
+        stored.last_error_detail
+        == "required context exceeds the available input budget"
+    )
+    assert "required_world_law" not in stored.last_error_detail
+    pause = session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.entity_id == workflow.id,
+            AuditEvent.action == "workflow_paused",
+        )
+    )
+    assert pause is not None
+    assert pause.details == {"reason": "required_context_overflow"}
 
 
 def test_paused_workflow_uses_its_prompt_snapshot_after_active_prompt_replacement(
@@ -492,21 +534,74 @@ def test_paused_workflow_uses_its_prompt_snapshot_after_active_prompt_replacemen
 def test_reviewer_retrieves_only_deduplicated_bounded_evidence(
     session, session_factory, ready_project: NovelProject
 ) -> None:
-    provider = FakeProvider(
-        _one_chapter_script(
+    query = "evidenceanchor"
+    long_source = "前" * 1_000 + f" {query} " + "后" * 1_000
+    replacement = OutlineService(session).create_candidate(
+        ready_project.id,
+        [
+            OutlineNodeInput(
+                key="evidence",
+                parent_key=None,
+                kind="book",
+                title="长篇证据纲要",
+                order=0,
+                payload={"detail": long_source},
+            )
+        ],
+        reason="review evidence acceptance",
+    )
+    replacement = OutlineService(session).approve(replacement.id)
+    plan = BatchPlanDraft(
+        chapters=[
+            ChapterPlan(
+                ordinal=ordinal,
+                title=f"第{ordinal}章",
+                goal=chr(0x4E00 + ordinal),
+                ending_hook=chr(0x4E00 + ordinal),
+            )
+            for ordinal in range(1, 6)
+        ]
+    )
+    script = [_response(plan, 1)]
+    candidate_bodies: list[str] = []
+    call_number = 2
+    for ordinal in range(1, 6):
+        body = chr(0x4E00 + ordinal) * (4_499 + ordinal)
+        candidate_bodies.append(body)
+        script.extend(
+            [
+                _response(
+                    ChapterDraft(title=f"第{ordinal}章", body=body), call_number
+                ),
+                _response(
+                    ChapterSummaryDelta(
+                        summary=f"候选摘要{ordinal}",
+                        state_delta={"last_completed_ordinal": ordinal},
+                    ),
+                    call_number + 1,
+                ),
+            ]
+        )
+        call_number += 2
+    script.extend(
+        [
             _response(
                 BatchReview(
                     passed=False,
                     issues=["需要核对大纲"],
-                    evidence_queries=[" 全书总纲 ", "全书总纲"],
+                    evidence_queries=[f" {query} ", query],
                 ),
-                4,
+                call_number,
             ),
-            _response(BatchReview(passed=True, issues=[], evidence_queries=[]), 5),
-        )
+            _response(
+                BatchReview(passed=True, issues=[], evidence_queries=[]),
+                call_number + 1,
+            ),
+        ]
     )
+    provider = FakeProvider(script)
     workflow = WorkflowService(session).start(
-        ready_project.id, "fake", "scripted", 1, DEFAULT_BUDGETS
+        ready_project.id, "fake", "scripted", 5, DEFAULT_BUDGETS
     )
     orchestrator = _orchestrator(session_factory, provider)
     assert orchestrator.advance(workflow.id).status == "AWAITING_PLAN_APPROVAL"
@@ -529,16 +624,33 @@ def test_reviewer_retrieves_only_deduplicated_bounded_evidence(
     ).all()
     assert result.status == "AWAITING_CONTENT_APPROVAL"
     assert len(review_requests) == 2
-    assert reviews[0].payload["evidence_queries"] == [" 全书总纲 ", "全书总纲"]
+    assert reviews[0].payload["evidence_queries"] == [f" {query} ", query]
     evidence = review_requests[1].input_payload["evidence"]
     assert len(evidence) == 1
-    assert evidence[0]["query"] == "全书总纲"
+    assert evidence[0]["query"] == query
     assert evidence[0]["excerpt_start"] >= 0
     assert evidence[0]["excerpt_end"] > evidence[0]["excerpt_start"]
     assert evidence[0]["excerpt_end"] - evidence[0]["excerpt_start"] <= 1200
-    assert "甲" * 100 not in json.dumps(
-        review_requests[1].input_payload, ensure_ascii=False
+    assert len(evidence[0]["text"]) <= 1_200
+    assert count_visible_characters(evidence[0]["text"]) <= 1_200
+    canonical = session.scalar(
+        select(ContextSource).where(
+            ContextSource.project_id == ready_project.id,
+            ContextSource.source_type == "outline_node",
+            ContextSource.source_id == f"{replacement.id}:evidence",
+            ContextSource.state_scope == "official",
+        )
     )
+    assert canonical is not None
+    assert len(canonical.text) > 1_200
+    assert evidence[0]["canonical_source_type"] == canonical.source_type
+    assert evidence[0]["canonical_source_id"] == canonical.source_id
+    assert evidence[0]["text"] == canonical.text[
+        evidence[0]["excerpt_start"] : evidence[0]["excerpt_end"]
+    ]
+    for request in review_requests:
+        serialized = json.dumps(request.input_payload, ensure_ascii=False)
+        assert all(body not in serialized for body in candidate_bodies)
 
 
 def test_default_app_constructs_without_network_provider_clients(
