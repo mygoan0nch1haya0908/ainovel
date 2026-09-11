@@ -159,7 +159,7 @@ class WorkflowOrchestrator:
             overflow_service = self._workflow_service()
             try:
                 overflow_service.pause_context_overflow(
-                    claim.id, self._worker_id, error
+                    claim.id, self._worker_id, error, claim_revision=claim.revision
                 )
             finally:
                 overflow_service.session.close()
@@ -168,7 +168,7 @@ class WorkflowOrchestrator:
             provider_service = self._workflow_service()
             try:
                 provider_service.pause_provider_failure(
-                    claim.id, self._worker_id, error
+                    claim.id, self._worker_id, error, claim_revision=claim.revision
                 )
             finally:
                 provider_service.session.close()
@@ -178,7 +178,7 @@ class WorkflowOrchestrator:
         try:
             try:
                 attempt = attempt_service.record_attempt_start(
-                    claim.id, digest_request(request)
+                    claim.id, digest_request(request), claim_revision=claim.revision
                 )
             except ValueError:
                 current = self._current_result(workflow_id)

@@ -24,15 +24,22 @@ def test_batch_size_must_be_between_one_and_five(session, project, official_outl
 def test_batch_create_persists_optional_workflow_provenance(
     session, project, official_outline
 ) -> None:
+    from ainovel.models.workflow import GenerationWorkflow
+    from ainovel.services.workflows import DEFAULT_BUDGETS, WorkflowService
+
+    ProjectService(session).add_constitution(project.id, {"genre": "fantasy"}, author_approved=True)
+    workflow = WorkflowService(session).start(project.id, "fake", "test", 1, DEFAULT_BUDGETS)
+    session.execute(update(GenerationWorkflow).where(GenerationWorkflow.id == workflow.id).values(status="CREATING_CANDIDATE_BATCH"))
+    session.commit()
     batch = BatchService(session).create(
         project.id,
         official_outline.id,
         1,
-        source_workflow_id="workflow-source-1",
+        source_workflow_id=workflow.id,
     )
 
     session.expire_all()
-    assert BatchService(session).get(batch.id).source_workflow_id == "workflow-source-1"
+    assert BatchService(session).get(batch.id).source_workflow_id == workflow.id
 
 
 def test_plain_batch_create_preserves_phase_one_audit_payload(

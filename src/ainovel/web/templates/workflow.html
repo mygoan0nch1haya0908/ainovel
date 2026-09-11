@@ -39,7 +39,7 @@
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <button type="submit">恢复工作流</button>
   </form>
-  {% elif workflow.status == "AWAITING_CONTENT_APPROVAL" %}
+  {% elif workflow.status == "AWAITING_CONTENT_APPROVAL" or (is_paused and candidate_batch_id) %}
   <p>候选批次已准备好，等待作者审批。</p>
   <form action="/workflows/{{ workflow.id }}/reconcile" method="post">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -48,8 +48,14 @@
   {% else %}
   <p>当前状态没有可用的作者操作。</p>
   {% endif %}
-  {% if workflow.candidate_batch_id %}
-  <p><a href="/projects/{{ project.id }}#batch-{{ workflow.candidate_batch_id }}">前往候选批次审批</a></p>
+  {% if candidate_batch_id %}
+  <p><a href="/projects/{{ project.id }}#batch-{{ candidate_batch_id }}">前往候选批次审批</a></p>
+  {% endif %}
+  {% if can_cancel %}
+  <form action="/workflows/{{ workflow.id }}/cancel" method="post" data-confirm="确认取消此暂停工作流？工件与审计将保留，项目可重新启动生成。">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">取消暂停工作流</button>
+  </form>
   {% endif %}
 </section>
 

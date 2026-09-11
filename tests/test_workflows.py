@@ -119,7 +119,7 @@ def _complete_plan(
 ) -> WorkflowArtifact:
     step = service.claim_step(workflow.id, {"PLANNING"}, worker_id)
     assert step is not None
-    attempt = service.record_attempt_start(step.id, "a" * 64)
+    attempt = service.record_attempt_start(step.id, "a" * 64, claim_revision=step.revision)
     return service.complete_attempt(
         attempt.id,
         _response(),
@@ -588,14 +588,14 @@ def test_attempts_are_monotonic_and_second_retryable_failure_pauses(
     service = WorkflowService(session, clock=clock)
     first_step = service.claim_step(workflow.id, {"PLANNING"}, "worker-a")
     assert first_step is not None
-    first = service.record_attempt_start(first_step.id, "1" * 64)
+    first = service.record_attempt_start(first_step.id, "1" * 64, claim_revision=first_step.revision)
     retrying = service.fail_attempt(first.id, ProviderTimeout("secret first timeout"))
     assert first.attempt_number == 1
     assert retrying.status == "PLANNING"
 
     second_step = service.claim_step(workflow.id, {"PLANNING"}, "worker-a")
     assert second_step is not None
-    second = service.record_attempt_start(second_step.id, "2" * 64)
+    second = service.record_attempt_start(second_step.id, "2" * 64, claim_revision=second_step.revision)
     paused = service.fail_attempt(second.id, ProviderProtocolError("secret payload"))
 
     assert second.attempt_number == 2
@@ -618,7 +618,7 @@ def test_claim_and_attempt_start_commit_before_external_provider_execution(
     service = WorkflowService(session, clock=clock)
     step = service.claim_step(workflow.id, {"PLANNING"}, "worker-a")
     assert step is not None
-    attempt = service.record_attempt_start(step.id, "a" * 64)
+    attempt = service.record_attempt_start(step.id, "a" * 64, claim_revision=step.revision)
     assert attempt.status == "RUNNING"
     assert not session.in_transaction()
 
@@ -645,7 +645,7 @@ def test_complete_attempt_atomically_persists_artifact_usage_and_plan_gate(
     service = WorkflowService(session, clock=clock)
     step = service.claim_step(workflow.id, {"PLANNING"}, "worker-a")
     assert step is not None
-    attempt = service.record_attempt_start(step.id, "a" * 64)
+    attempt = service.record_attempt_start(step.id, "a" * 64, claim_revision=step.revision)
 
     artifact = service.complete_attempt(
         attempt.id,
@@ -677,7 +677,7 @@ def test_complete_attempt_rolls_back_all_effects_when_artifact_is_invalid(
     service = WorkflowService(session, clock=clock)
     step = service.claim_step(workflow.id, {"PLANNING"}, "worker-a")
     assert step is not None
-    attempt = service.record_attempt_start(step.id, "a" * 64)
+    attempt = service.record_attempt_start(step.id, "a" * 64, claim_revision=step.revision)
 
     with pytest.raises((TypeError, ValueError)):
         service.complete_attempt(
@@ -703,7 +703,7 @@ def test_complete_attempt_rejects_unvalidated_hidden_reasoning_payload(
     service = WorkflowService(session, clock=clock)
     step = service.claim_step(workflow.id, {"PLANNING"}, "worker-a")
     assert step is not None
-    attempt = service.record_attempt_start(step.id, "a" * 64)
+    attempt = service.record_attempt_start(step.id, "a" * 64, claim_revision=step.revision)
 
     with pytest.raises(ValueError, match="artifact payload failed validation"):
         service.complete_attempt(
@@ -732,7 +732,7 @@ def test_writer_artifact_rejects_text_or_count_that_disagrees_with_validated_pay
         workflow.id, {"GENERATING_CHAPTERS"}, "writer-a"
     )
     assert step is not None and step.kind == "WRITING"
-    attempt = service.record_attempt_start(step.id, "b" * 64)
+    attempt = service.record_attempt_start(step.id, "b" * 64, claim_revision=step.revision)
 
     with pytest.raises(ValueError, match="artifact metadata does not match payload"):
         service.complete_attempt(
@@ -780,7 +780,7 @@ def test_reviewer_evidence_artifact_is_immutable_nonfinal_and_reclaimable(
 
     claimed = service.claim_step(workflow.id, {"REVIEWING_BATCH"}, "reviewer-a")
     assert claimed is not None and claimed.id == reviewer.id
-    attempt = service.record_attempt_start(claimed.id, "c" * 64)
+    attempt = service.record_attempt_start(claimed.id, "c" * 64, claim_revision=claimed.revision)
     evidence = service.complete_attempt(
         attempt.id,
         _response(),
@@ -806,7 +806,7 @@ def test_reviewer_evidence_artifact_is_immutable_nonfinal_and_reclaimable(
         workflow.id, {"REVIEWING_BATCH"}, "reviewer-a"
     )
     assert second_claim is not None
-    second_attempt = service.record_attempt_start(second_claim.id, "d" * 64)
+    second_attempt = service.record_attempt_start(second_claim.id, "d" * 64, claim_revision=second_claim.revision)
     blocked = service.complete_attempt(
         second_attempt.id,
         _response(),
@@ -850,7 +850,7 @@ def test_nonretryable_provider_failures_pause_with_secret_safe_categories(
     service = WorkflowService(session, clock=clock)
     step = service.claim_step(workflow.id, {"PLANNING"}, "worker-a")
     assert step is not None
-    attempt = service.record_attempt_start(step.id, "a" * 64)
+    attempt = service.record_attempt_start(step.id, "a" * 64, claim_revision=step.revision)
 
     failed = service.fail_attempt(attempt.id, error)
 
@@ -934,7 +934,7 @@ def test_completed_steps_advance_through_writer_summary_review_in_strict_order(
         )
         assert claimed is not None
         assert (claimed.kind, claimed.ordinal) == (kind, ordinal)
-        attempt = service.record_attempt_start(claimed.id, f"{index:x}" * 64)
+        attempt = service.record_attempt_start(claimed.id, f"{index:x}" * 64, claim_revision=claimed.revision)
         if kind == "WRITING":
             artifact = {
                 "kind": "chapter_draft",
@@ -956,7 +956,7 @@ def test_completed_steps_advance_through_writer_summary_review_in_strict_order(
         workflow.id, {"REVIEWING_BATCH"}, "sequential-worker"
     )
     assert reviewer is not None and reviewer.kind == "REVIEWING"
-    review_attempt = service.record_attempt_start(reviewer.id, "f" * 64)
+    review_attempt = service.record_attempt_start(reviewer.id, "f" * 64, claim_revision=reviewer.revision)
     service.complete_attempt(
         review_attempt.id,
         _response(),
@@ -1359,7 +1359,7 @@ def test_summary_completion_produces_text_hash_accepted_by_context_index(
         workflow.id, {"GENERATING_CHAPTERS"}, "writer-a"
     )
     assert writer is not None and writer.kind == "WRITING"
-    writer_attempt = service.record_attempt_start(writer.id, "b" * 64)
+    writer_attempt = service.record_attempt_start(writer.id, "b" * 64, claim_revision=writer.revision)
     service.complete_attempt(
         writer_attempt.id,
         _response(),
@@ -1372,7 +1372,7 @@ def test_summary_completion_produces_text_hash_accepted_by_context_index(
         workflow.id, {"GENERATING_CHAPTERS"}, "summarizer-a"
     )
     assert summarizer is not None and summarizer.kind == "SUMMARIZING"
-    summary_attempt = service.record_attempt_start(summarizer.id, "c" * 64)
+    summary_attempt = service.record_attempt_start(summarizer.id, "c" * 64, claim_revision=summarizer.revision)
     summary_text = "Chapter one closes with the bridge still contested."
     summary = service.complete_attempt(
         summary_attempt.id,
@@ -1480,8 +1480,8 @@ def test_required_context_overflow_pauses_claim_before_attempt_or_provider_call(
     )
 
     with pytest.raises(ValueError, match="context overflow pause conflict"):
-        service.pause_context_overflow(step.id, "different-worker", overflow)
-    paused = service.pause_context_overflow(step.id, "context-worker", overflow)
+        service.pause_context_overflow(step.id, "different-worker", overflow, claim_revision=step.revision)
+    paused = service.pause_context_overflow(step.id, "context-worker", overflow, claim_revision=step.revision)
 
     assert paused.status == "PAUSED_CONTEXT_OVERFLOW"
     assert paused.last_error_code == "required_context_overflow"
@@ -1521,6 +1521,7 @@ def test_required_context_overflow_rejects_an_expired_lease(
             step.id,
             "context-worker",
             RequiredContextOverflow("constitution", required_tokens=2, capacity=1),
+            claim_revision=step.revision,
         )
 
     session.expire_all()
@@ -1540,7 +1541,7 @@ def test_required_context_overflow_rejects_step_with_running_attempt_atomically(
     )
     assert step is not None
     claimed_step_revision = step.revision
-    attempt = service.record_attempt_start(step.id, "1" * 64)
+    attempt = service.record_attempt_start(step.id, "1" * 64, claim_revision=step.revision)
     session.expire_all()
     before_workflow = session.get(GenerationWorkflow, workflow.id)
     before_step = session.get(WorkflowStep, step.id)
@@ -1554,6 +1555,7 @@ def test_required_context_overflow_rejects_step_with_running_attempt_atomically(
             step.id,
             "context-worker",
             RequiredContextOverflow("constitution", required_tokens=2, capacity=1),
+            claim_revision=step.revision,
         )
 
     session.expire_all()
@@ -1597,7 +1599,7 @@ def test_expired_attempt_failure_is_fenced_and_lease_recovery_wins(
         workflow.id, {"PLANNING"}, "worker-a", lease_seconds=30
     )
     assert step is not None
-    attempt = service.record_attempt_start(step.id, "d" * 64)
+    attempt = service.record_attempt_start(step.id, "d" * 64, claim_revision=step.revision)
     clock.advance(seconds=31)
 
     with pytest.raises(ValueError, match="attempt failure conflict"):
@@ -1633,7 +1635,7 @@ def test_attempt_start_rejects_noncanonical_sha256_without_mutation(
     initial_revision = session.get(WorkflowStep, step.id).revision
 
     with pytest.raises(ValueError, match="canonical SHA-256"):
-        service.record_attempt_start(step.id, request_digest)
+        service.record_attempt_start(step.id, request_digest, claim_revision=step.revision)
 
     session.expire_all()
     stored_step = session.get(WorkflowStep, step.id)
@@ -1651,7 +1653,7 @@ def test_nonfinal_review_requires_first_attempt_with_real_evidence_request(
     reviewer = _prepare_reviewer_step(session, service, workflow)
     claimed = service.claim_step(workflow.id, {"REVIEWING_BATCH"}, "reviewer-a")
     assert claimed is not None and claimed.id == reviewer.id
-    attempt = service.record_attempt_start(claimed.id, "e" * 64)
+    attempt = service.record_attempt_start(claimed.id, "e" * 64, claim_revision=claimed.revision)
 
     with pytest.raises(ValueError, match="reviewer evidence request is invalid"):
         service.complete_attempt(
@@ -1683,7 +1685,7 @@ def test_second_review_evidence_request_pauses_instead_of_becoming_pending(
         workflow.id, {"REVIEWING_BATCH"}, "reviewer-a"
     )
     assert first_claim is not None and first_claim.id == reviewer.id
-    first_attempt = service.record_attempt_start(first_claim.id, "e" * 64)
+    first_attempt = service.record_attempt_start(first_claim.id, "e" * 64, claim_revision=first_claim.revision)
     service.complete_attempt(
         first_attempt.id,
         _response(),
@@ -1701,7 +1703,7 @@ def test_second_review_evidence_request_pauses_instead_of_becoming_pending(
         workflow.id, {"REVIEWING_BATCH"}, "reviewer-b"
     )
     assert second_claim is not None
-    second_attempt = service.record_attempt_start(second_claim.id, "f" * 64)
+    second_attempt = service.record_attempt_start(second_claim.id, "f" * 64, claim_revision=second_claim.revision)
 
     artifact = service.complete_attempt(
         second_attempt.id,

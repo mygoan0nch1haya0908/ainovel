@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+import json
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema, field_validator, model_validator
 from ainovel.services.counting import count_visible_characters
 
 
@@ -53,7 +56,25 @@ class ChapterDraft(AgentSchema):
 
 class ChapterSummaryDelta(AgentSchema):
     summary: str
-    state_delta: dict[str, object]
+    # The wire contract is a JSON string so strict providers can retain arbitrary
+    # nested keys without an open object schema. Persistence remains a domain dict.
+    state_delta: Annotated[
+        dict[str, object],
+        WithJsonSchema({
+            "type": "string",
+            "description": "A JSON-encoded object containing all state changes, including arbitrary nested keys and values. Use \"{}\" when empty.",
+        }, mode="validation"),
+    ]
+
+    @field_validator("state_delta", mode="before")
+    @classmethod
+    def decode_wire_state_delta(cls, value: object) -> object:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                raise ValueError("state delta must encode a JSON object") from None
+        return value
 
     @field_validator("summary")
     @classmethod

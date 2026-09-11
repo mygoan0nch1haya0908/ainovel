@@ -15,7 +15,8 @@ from ainovel.context import (
     ContextBudgeter,
     ContextCandidate,
 )
-from ainovel.models.batch import Chapter
+from ainovel.models.batch import Chapter, WritingBatch
+from ainovel.agents.contracts import ChapterSummaryDelta
 from ainovel.models.context import ContextPacket, ContextPacketItem, ContextSource
 from ainovel.models.outline import OutlineNode, OutlineVersion
 from ainovel.models.project import ConstitutionVersion, NovelProject
@@ -389,6 +390,84 @@ class ContextIndexService:
                     f"{chapter.title}\n{chapter.body}",
                 )
             )
+        records.extend(self._official_memory_records(project.id))
+        return records
+
+    def _official_memory_records(self, project_id: str) -> list[dict[str, object]]:
+        # Window by formal chapter number, never workflow ordinal, revision or
+        # insertion time. Phase 1 approval is authoritative even before reconcile.
+        chapters = self.session.scalars(
+            select(Chapter).where(
+                Chapter.project_id == project_id,
+                Chapter.status.in_(("official", "published")),
+                Chapter.official_chapter_number.is_not(None),
+            ).order_by(Chapter.official_chapter_number.desc()).limit(EVENT_CHAIN_LIMIT)
+        ).all()
+        records: list[dict[str, object]] = []
+        for distance, chapter in enumerate(chapters):
+            batch = self.session.get(WritingBatch, chapter.batch_id)
+            workflow = (
+                self.session.get(GenerationWorkflow, batch.source_workflow_id)
+                if batch is not None and batch.source_workflow_id is not None
+                else None
+            )
+            if (
+                batch is None or batch.status != "approved"
+                or batch.project_id != project_id
+                or workflow is None or workflow.project_id != project_id
+            ):
+                continue
+            artifacts = {
+                artifact.kind: artifact
+                for artifact in self.session.scalars(
+                    select(WorkflowArtifact).join(
+                        WorkflowStep,
+                        (WorkflowStep.id == WorkflowArtifact.step_id)
+                        & (WorkflowStep.active_artifact_id == WorkflowArtifact.id),
+                    ).where(
+                        WorkflowArtifact.workflow_id == workflow.id,
+                        WorkflowStep.workflow_id == workflow.id,
+                        WorkflowStep.ordinal == chapter.ordinal,
+                        WorkflowArtifact.ordinal == chapter.ordinal,
+                        WorkflowStep.status.in_(("COMPLETED", "validated")),
+                        WorkflowArtifact.kind.in_(("chapter_draft", "chapter_summary_delta")),
+                    )
+                ).all()
+            }
+            draft = artifacts.get("chapter_draft")
+            summary = artifacts.get("chapter_summary_delta")
+            body_hash = sha256(chapter.body.encode("utf-8")).hexdigest()
+            if (
+                draft is None or summary is None
+                or draft.content_hash != body_hash
+                or draft.text_content != chapter.body
+                or draft.payload.get("body") != chapter.body
+                or summary.text_content != summary.payload.get("summary")
+                or summary.content_hash != sha256((summary.text_content or "").encode("utf-8")).hexdigest()
+            ):
+                continue
+            try:
+                delta = ChapterSummaryDelta.model_validate(summary.payload)
+            except ValueError:
+                continue
+            if delta.state_delta != chapter.state_delta:
+                continue
+            version = sha256(self._json_text({
+                "body_hash": body_hash,
+                "chapter_revision": chapter.revision,
+                "official_chapter_number": chapter.official_chapter_number,
+                "summary": summary.payload,
+            }).encode("utf-8")).hexdigest()
+            values = [("event_chain", 3, {"state_delta": chapter.state_delta})]
+            if distance < RECENT_SUMMARY_LIMIT:
+                values.append(("chapter_summary", 4, {"summary": delta.summary}))
+            for source_type, layer, value in values:
+                record = self._record(
+                    project_id, source_type, summary.id, version, layer,
+                    self._json_text({"official_chapter_number": chapter.official_chapter_number, **value}),
+                )
+                record.update(canonical_source_type="official_chapter", canonical_source_id=chapter.id)
+                records.append(record)
         return records
 
     @staticmethod
@@ -404,7 +483,7 @@ class ContextIndexService:
         project_id: str,
         source_type: str,
         source_id: str,
-        source_version: int,
+        source_version: int | str,
         layer: int,
         body: str,
     ) -> dict[str, object]:
@@ -647,8 +726,18 @@ class ContextBuilder:
                     artifact,
                     artifact_steps.get(artifact.step_id) if artifact is not None else None,
                 )
+        official_numbers = dict(self.session.execute(
+            select(Chapter.id, Chapter.official_chapter_number).where(
+                Chapter.project_id == workflow.project_id,
+                Chapter.official_chapter_number.is_not(None),
+            )
+        ).all())
         chronologies = {
-            row.id: self._chronology(row, artifacts.get(row.source_id)) for row in rows
+            row.id: (
+                official_numbers.get(row.canonical_source_id, 0)
+                if row.state_scope == "official" and row.canonical_source_type == "official_chapter"
+                else self._chronology(row, artifacts.get(row.source_id))
+            ) for row in rows
         }
         newest_by_layer: dict[int, int] = {}
         for row in rows:

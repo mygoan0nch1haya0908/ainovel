@@ -510,7 +510,7 @@ class WorkflowService:
         return len(recovered_ids)
 
     def record_attempt_start(
-        self, step_id: str, request_digest: str
+        self, step_id: str, request_digest: str, *, claim_revision: int
     ) -> ModelAttempt:
         if (
             not isinstance(request_digest, str)
@@ -530,6 +530,7 @@ class WorkflowService:
             raise ValueError("workflow not found")
         if (
             step.status != "RUNNING"
+            or step.revision != claim_revision
             or step.lease_owner is None
             or step.lease_expires_at is None
             or step.lease_expires_at <= now
@@ -562,6 +563,12 @@ class WorkflowService:
                 WorkflowStep.attempt_count == step.attempt_count,
                 WorkflowStep.lease_owner == step.lease_owner,
                 WorkflowStep.lease_expires_at == step.lease_expires_at,
+                WorkflowStep.revision == claim_revision,
+                WorkflowStep.lease_expires_at > now,
+                ~select(ModelAttempt.id).where(
+                    ModelAttempt.step_id == step.id,
+                    ModelAttempt.status == "RUNNING",
+                ).exists(),
             )
             .values(
                 attempt_count=attempt_number,
@@ -591,6 +598,8 @@ class WorkflowService:
         step_id: str,
         worker_id: str,
         error: RequiredContextOverflow,
+        *,
+        claim_revision: int,
     ) -> GenerationWorkflow:
         normalized_worker = worker_id.strip() if isinstance(worker_id, str) else ""
         if not normalized_worker:
@@ -624,6 +633,7 @@ class WorkflowService:
             or workflow.current_position != step.position
             or step.kind not in _STEP_PROMPT_ROLES
             or step.status != "RUNNING"
+            or step.revision != claim_revision
             or step.active_artifact_id is not None
             or step.lease_owner != normalized_worker
             or step.lease_expires_at is None
@@ -663,6 +673,7 @@ class WorkflowService:
                     WorkflowStep.active_artifact_id.is_(None),
                     WorkflowStep.lease_owner == normalized_worker,
                     WorkflowStep.lease_expires_at == step.lease_expires_at,
+                    WorkflowStep.revision == claim_revision,
                     WorkflowStep.lease_expires_at > now,
                     ~select(ModelAttempt.id)
                     .where(
@@ -698,6 +709,8 @@ class WorkflowService:
         step_id: str,
         worker_id: str,
         error: ProviderError,
+        *,
+        claim_revision: int,
     ) -> GenerationWorkflow:
         normalized_worker = worker_id.strip() if isinstance(worker_id, str) else ""
         if not normalized_worker:
@@ -732,6 +745,7 @@ class WorkflowService:
             or workflow.current_position != step.position
             or step.kind not in _STEP_PROMPT_ROLES
             or step.status != "RUNNING"
+            or step.revision != claim_revision
             or step.active_artifact_id is not None
             or step.lease_owner != normalized_worker
             or step.lease_expires_at is None
@@ -769,6 +783,7 @@ class WorkflowService:
                     WorkflowStep.active_artifact_id.is_(None),
                     WorkflowStep.lease_owner == normalized_worker,
                     WorkflowStep.lease_expires_at == step.lease_expires_at,
+                    WorkflowStep.revision == claim_revision,
                     WorkflowStep.lease_expires_at > now,
                     ~select(ModelAttempt.id)
                     .where(
@@ -1557,11 +1572,23 @@ class WorkflowService:
                 return workflow
             self.session.rollback()
             raise ValueError("terminal workflow conflicts with batch decision")
-        self._require_transition(workflow.status, target_status)
+        paused_candidate_decision = (
+            workflow.status == "PAUSED_STALE_VERSION"
+            and batch.status in {"approved", "rejected"}
+            and candidate_step is not None
+            and candidate_step.status == "PAUSED"
+            and candidate_step.active_artifact_id is None
+            and candidate_step.lease_owner is None
+            and candidate_step.lease_expires_at is None
+        )
+        # Only a persisted Phase 1 decision may close a stale candidate pause.
+        # This does not make paused workflows resumable or bypass either gate.
+        if not paused_candidate_decision:
+            self._require_transition(workflow.status, target_status)
         should_update_step = (
             batch.status != "draft"
             and candidate_step is not None
-            and candidate_step.status in {"PENDING", "RUNNING"}
+            and (candidate_step.status in {"PENDING", "RUNNING"} or paused_candidate_decision)
         )
         if workflow_already_reconciled and not should_update_step:
             self.session.rollback()
@@ -1574,6 +1601,12 @@ class WorkflowService:
                     GenerationWorkflow.status == workflow.status,
                     GenerationWorkflow.revision == workflow.revision,
                     GenerationWorkflow.current_position == workflow.current_position,
+                    select(WritingBatch.id).where(
+                        WritingBatch.id == batch.id,
+                        WritingBatch.project_id == workflow.project_id,
+                        WritingBatch.source_workflow_id == workflow.id,
+                        WritingBatch.status == batch.status,
+                    ).exists(),
                 )
                 .values(
                     status=target_status,
@@ -1638,6 +1671,66 @@ class WorkflowService:
                     "system",
                     {"candidate_batch_id": batch.id, "batch_status": batch.status},
                 )
+            self.session.commit()
+            return workflow
+        except Exception:
+            self.session.rollback()
+            raise
+
+    def can_cancel(self, workflow_id: str) -> bool:
+        with self.session.no_autoflush:
+            workflow = self.session.get(GenerationWorkflow, workflow_id)
+            if workflow is None:
+                return False
+            return self.session.scalar(
+                select(GenerationWorkflow.id).where(
+                    GenerationWorkflow.id == workflow.id,
+                    *self._cancel_predicates(workflow),
+                )
+            ) is not None
+
+    @staticmethod
+    def _cancel_predicates(workflow: GenerationWorkflow) -> tuple:
+        return (
+            GenerationWorkflow.status.in_(
+                [status for status in WORKFLOW_STATUSES if status.startswith("PAUSED_")]
+            ),
+            GenerationWorkflow.candidate_batch_id.is_(None),
+            ~select(WritingBatch.id).where(
+                WritingBatch.source_workflow_id == workflow.id,
+            ).exists(),
+            select(NovelProject.id).where(
+                NovelProject.id == workflow.project_id,
+                NovelProject.active_workflow_id == workflow.id,
+                NovelProject.active_batch_id.is_(None),
+            ).exists(),
+        )
+
+    def cancel(self, workflow_id: str, actor: str) -> GenerationWorkflow:
+        if not isinstance(actor, str) or not actor.strip():
+            raise ValueError("cancel actor is required")
+        self.session.expire_all()
+        workflow = self._get_workflow(workflow_id)
+        try:
+            cancelled = self.session.execute(
+                update(GenerationWorkflow).where(
+                    GenerationWorkflow.id == workflow.id,
+                    GenerationWorkflow.revision == workflow.revision,
+                    *self._cancel_predicates(workflow),
+                ).values(status="CANCELLED", revision=workflow.revision + 1)
+            )
+            if cancelled.rowcount != 1:
+                raise ValueError("cancel conflict: owner changed or candidate requires batch decision")
+            released = self.session.execute(
+                update(NovelProject).where(
+                    NovelProject.id == workflow.project_id,
+                    NovelProject.active_workflow_id == workflow.id,
+                    NovelProject.active_batch_id.is_(None),
+                ).values(active_workflow_id=None)
+            )
+            if released.rowcount != 1:
+                raise ValueError("cancel owner conflict")
+            self._add_audit(workflow.project_id, workflow.id, "workflow_cancelled", actor.strip(), {})
             self.session.commit()
             return workflow
         except Exception:

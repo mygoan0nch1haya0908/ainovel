@@ -11,6 +11,7 @@ from ainovel.models.audit import AuditEvent
 from ainovel.models.batch import Chapter, WritingBatch
 from ainovel.models.outline import OutlineVersion
 from ainovel.models.project import NovelProject
+from ainovel.models.workflow import GenerationWorkflow
 from ainovel.services.counting import count_visible_characters
 
 MIN_BATCH_CHAPTERS = 1
@@ -60,6 +61,18 @@ class BatchService:
             raise ValueError("batch requires an official outline")
         batch_id = str(uuid4())
         sequence_number = project.next_batch_sequence
+        workflow_guard = (
+            NovelProject.active_workflow_id.is_(None)
+            if source_workflow_id is None
+            else (
+                (NovelProject.active_workflow_id == source_workflow_id)
+                & exists().where(
+                    GenerationWorkflow.id == source_workflow_id,
+                    GenerationWorkflow.project_id == project.id,
+                    GenerationWorkflow.status == "CREATING_CANDIDATE_BATCH",
+                )
+            )
+        )
         ownership = self.session.execute(
             update(NovelProject)
             .where(
@@ -67,6 +80,7 @@ class BatchService:
                 NovelProject.active_batch_id.is_(None),
                 NovelProject.next_batch_sequence == sequence_number,
                 NovelProject.official_outline_version_id == outline.id,
+                workflow_guard,
             )
             .values(
                 active_batch_id=batch_id,

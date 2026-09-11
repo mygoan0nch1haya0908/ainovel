@@ -72,6 +72,10 @@ before synchronizing the workflow decision.
 Fake output verifies orchestration, persistence, crash-safe gates, and approval
 boundaries. It does **not** evaluate or demonstrate literary quality.
 
+See [Phase 2 operational boundaries](docs/phase-two-operational-boundaries.md)
+for claim ownership, strict summary encoding, cross-batch approved memory,
+model budgets, and cancellation of paused workflows.
+
 ## Ollama diagnosis and optional local smoke test
 
 Ollama is optional. AI Novel Studio never downloads or removes a model. Inspect

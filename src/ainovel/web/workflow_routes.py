@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from ainovel.db import get_session
 from ainovel.models.prompt import WorkflowPromptSnapshot
 from ainovel.models.project import NovelProject
+from ainovel.models.batch import WritingBatch
 from ainovel.models.workflow import (
     GenerationWorkflow,
     ModelAttempt,
@@ -44,6 +45,7 @@ def _workflow_context(
     workflow_id: str,
 ) -> dict[str, object]:
     can_resume = WorkflowService(session).can_resume(workflow_id)
+    can_cancel = WorkflowService(session).can_cancel(workflow_id)
     workflow = _workflow_row(session, workflow_id)
     project = session.get(NovelProject, workflow.project_id)
     assert project is not None
@@ -106,6 +108,13 @@ def _workflow_context(
         "csrf_token": csrf_token(request),
         "can_run": workflow.status in EXECUTABLE_WORKFLOW_STATUSES,
         "can_resume": can_resume,
+        "can_cancel": can_cancel,
+        "candidate_batch_id": workflow.candidate_batch_id or session.scalar(
+            select(WritingBatch.id).where(
+                WritingBatch.source_workflow_id == workflow.id,
+                WritingBatch.project_id == workflow.project_id,
+            )
+        ),
         "is_paused": workflow.status.startswith("PAUSED_"),
     }
 
@@ -275,6 +284,24 @@ def reconcile_workflow(
     except (ValueError, PermissionError):
         return _workflow_page(
             request, session, workflow_id, "候选批次对账失败，状态已变化", 422
+        )
+    return RedirectResponse(f"/workflows/{workflow_id}", status_code=303)
+
+
+@router.post("/workflows/{workflow_id}/cancel")
+def cancel_workflow(
+    workflow_id: str,
+    request: Request,
+    session: Session = Depends(get_session),
+    _csrf: None = Depends(require_csrf),
+) -> object:
+    _workflow_row(session, workflow_id)
+    try:
+        WorkflowService(session).cancel(workflow_id, "author")
+    except (ValueError, PermissionError):
+        return _workflow_page(
+            request, session, workflow_id,
+            "无法取消：状态或所有权已变化；已有候选批次请先完成正文审批并同步结果。", 422,
         )
     return RedirectResponse(f"/workflows/{workflow_id}", status_code=303)
 

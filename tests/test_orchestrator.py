@@ -536,7 +536,7 @@ def test_validation_recovery_recomputes_body_coverage_instead_of_hardcoding_succ
     writer = service.claim_step(
         workflow.id, {"GENERATING_CHAPTERS"}, "recovery-writer"
     )
-    attempt = service.record_attempt_start(writer.id, "a" * 64)
+    attempt = service.record_attempt_start(writer.id, "a" * 64, claim_revision=writer.revision)
     unrelated = "无" * 4500
     chapter = service.complete_attempt(
         attempt.id,
@@ -592,7 +592,7 @@ def test_two_expired_running_attempts_pause_without_leaking_or_calling_provider(
     service = WorkflowService(session, clock=clock)
     for attempt_number in (1, 2):
         step = service.claim_step(workflow.id, {"PLANNING"}, "crashing-worker")
-        service.record_attempt_start(step.id, f"{attempt_number}" * 64)
+        service.record_attempt_start(step.id, f"{attempt_number}" * 64, claim_revision=step.revision)
         clock.advance(seconds=301)
         assert service.recover_expired_claims(workflow.id, clock.now()) == 1
 

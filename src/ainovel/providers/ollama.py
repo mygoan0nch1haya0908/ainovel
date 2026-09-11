@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from ainovel.context import effective_input_capacity
 from ainovel.providers.contracts import (
     ModelRequest,
     ModelResponse,
@@ -54,6 +55,16 @@ class OllamaProvider:
         )
 
     def generate(self, request: ModelRequest) -> ModelResponse:
+        capability = self.capabilities(request.model)
+        try:
+            capacity = effective_input_capacity(
+                request.max_input_tokens, capability.context_window,
+                request.max_output_tokens,
+            )
+        except ValueError:
+            raise ProviderProtocolError("Ollama request budget exceeds capability") from None
+        if request.max_input_tokens > capacity or request.max_output_tokens > capability.max_output_tokens:
+            raise ProviderProtocolError("Ollama request budget exceeds capability")
         payload = {
             "model": request.model,
             "stream": False,
@@ -63,7 +74,7 @@ class OllamaProvider:
             ],
             "format": request.output_schema,
             "options": {
-                "num_ctx": request.max_input_tokens,
+                "num_ctx": capability.context_window,
                 "num_predict": request.max_output_tokens,
             },
         }

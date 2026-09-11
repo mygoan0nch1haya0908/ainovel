@@ -31,7 +31,7 @@ def make_summary_request() -> ModelRequest:
         system_prompt="Return a chapter summary.",
         input_payload={"chapter": "第一章"},
         output_schema=ChapterSummaryDelta.model_json_schema(),
-        max_input_tokens=16_000,
+        max_input_tokens=10_976,
         max_output_tokens=4_000,
         timeout_seconds=5.0,
         metadata={"schema_name": "chapter_summary"},

@@ -101,7 +101,7 @@ def live_summary_request(model: str) -> ModelRequest:
             },
         },
         output_schema=ChapterSummaryDelta.model_json_schema(),
-        max_input_tokens=16_000,
+        max_input_tokens=10_976,
         max_output_tokens=4_000,
         timeout_seconds=Settings().provider_timeout_seconds,
         metadata={
