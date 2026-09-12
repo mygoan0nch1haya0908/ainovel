@@ -86,6 +86,52 @@ def test_default_registry_constructs_qwen_lazily_with_bounded_sdk_options(
     assert capabilities.real_calls_allowed is True
 
 
+@pytest.mark.parametrize(
+    ("allow_real", "api_key", "detail_fragment", "real_calls_allowed"),
+    [
+        (False, "qwen-test-key", "disabled", False),
+        (True, None, "API key is not configured", False),
+        (True, "qwen-test-key", "configuration is ready", True),
+    ],
+)
+def test_default_qwen_diagnosis_preserves_opt_in_and_key_presence_states(
+    database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    allow_real: bool,
+    api_key: str | None,
+    detail_fragment: str,
+    real_calls_allowed: bool,
+) -> None:
+    class Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.api_key = kwargs.get("api_key")
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=lambda **_kwargs: pytest.fail(
+                        "configuration diagnosis must not call the network"
+                    )
+                )
+            )
+
+    monkeypatch.setenv("AINOVEL_ALLOW_REAL_QWEN", str(allow_real).lower())
+    monkeypatch.delenv("AINOVEL_QWEN_API_KEY", raising=False)
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    if api_key is not None:
+        monkeypatch.setenv("AINOVEL_QWEN_API_KEY", api_key)
+    monkeypatch.setattr(app_module, "OpenAI", Client)
+
+    provider = app_module.create_app(database_url).state.provider_registry.get("qwen")
+    diagnostic = provider.diagnose("qwen-flash")
+
+    assert diagnostic.available is real_calls_allowed
+    assert detail_fragment in diagnostic.detail
+    assert "not an online connectivity check" in diagnostic.detail
+    assert (
+        provider.capabilities("qwen-flash").real_calls_allowed
+        is real_calls_allowed
+    )
+
+
 def test_workflow_accepts_qwen_and_retains_author_plan_approval_gate(
     client, session, project, official_outline
 ) -> None:

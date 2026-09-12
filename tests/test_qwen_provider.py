@@ -183,6 +183,62 @@ def test_qwen_maps_response_id_and_usage() -> None:
     assert isinstance(response.latency_ms, int) and response.latency_ms >= 0
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        SimpleNamespace(
+            choices=chat_response().choices,
+            usage=SimpleNamespace(prompt_tokens=37, completion_tokens=14),
+        ),
+        SimpleNamespace(
+            id=None,
+            choices=chat_response().choices,
+            usage=SimpleNamespace(prompt_tokens=37, completion_tokens=14),
+        ),
+        SimpleNamespace(
+            id="",
+            choices=chat_response().choices,
+            usage=SimpleNamespace(prompt_tokens=37, completion_tokens=14),
+        ),
+        SimpleNamespace(
+            id=17,
+            choices=chat_response().choices,
+            usage=SimpleNamespace(prompt_tokens=37, completion_tokens=14),
+        ),
+        SimpleNamespace(id="chatcmpl-qwen-1", choices=chat_response().choices),
+        SimpleNamespace(
+            id="chatcmpl-qwen-1",
+            choices=chat_response().choices,
+            usage=SimpleNamespace(completion_tokens=14),
+        ),
+        SimpleNamespace(
+            id="chatcmpl-qwen-1",
+            choices=chat_response().choices,
+            usage=SimpleNamespace(prompt_tokens=37),
+        ),
+        SimpleNamespace(
+            id="chatcmpl-qwen-1",
+            choices=chat_response().choices,
+            usage=SimpleNamespace(prompt_tokens=-1, completion_tokens=14),
+        ),
+        SimpleNamespace(
+            id="chatcmpl-qwen-1",
+            choices=chat_response().choices,
+            usage=SimpleNamespace(prompt_tokens=37, completion_tokens=True),
+        ),
+    ],
+)
+def test_qwen_rejects_missing_or_malformed_response_id_and_usage(
+    response: object,
+) -> None:
+    with pytest.raises(
+        ProviderProtocolError, match="Qwen returned malformed response metadata"
+    ):
+        QwenProvider(FakeQwenClient(response), allow_real_calls=True).generate(
+            summary_request()
+        )
+
+
 def test_qwen_advertises_truthful_conservative_capabilities() -> None:
     provider = QwenProvider(
         FakeQwenClient(chat_response()),

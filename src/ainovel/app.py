@@ -55,7 +55,6 @@ def _default_provider_registry(settings: Settings) -> ProviderRegistry:
         if settings.qwen_api_key is not None
         else None
     )
-    allow_qwen = bool(settings.allow_real_qwen and qwen_api_key)
 
     def ollama_provider() -> OllamaProvider:
         return OllamaProvider(
@@ -90,9 +89,10 @@ def _default_provider_registry(settings: Settings) -> ProviderRegistry:
                 timeout=settings.provider_timeout_seconds,
                 max_retries=0,
             ),
-            allow_real_calls=allow_qwen,
+            allow_real_calls=settings.allow_real_qwen,
             context_window_limit=PROVIDER_CONTEXT_WINDOW_CEILING,
             max_output_tokens_limit=PROVIDER_OUTPUT_TOKEN_CEILING,
+            api_key_configured=bool(qwen_api_key),
         )
 
     return ProviderRegistry(
