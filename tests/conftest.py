@@ -3,8 +3,10 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
 from ainovel.app import create_app
+from ainovel.providers.registry import ProviderRegistry
 
 from ainovel.models import Base
 
@@ -14,9 +16,23 @@ def database_url(tmp_path: Path) -> str:
 
 
 @pytest.fixture
-def client(database_url: str) -> Iterator[TestClient]:
-    app = create_app(database_url)
+def provider_registry() -> ProviderRegistry | None:
+    return None
+
+
+@pytest.fixture
+def client(
+    database_url: str, provider_registry: ProviderRegistry | None
+) -> Iterator[TestClient]:
+    app = create_app(database_url, provider_registry=provider_registry)
     Base.metadata.create_all(app.state.engine)
+    with app.state.engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS context_source_fts "
+                "USING fts5(source_id UNINDEXED, project_id UNINDEXED, text)"
+            )
+        )
     with TestClient(app) as test_client:
         yield test_client
 

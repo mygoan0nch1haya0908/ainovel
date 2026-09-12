@@ -6,7 +6,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 
-ALEMBIC_HEAD_REVISION = "0001_foundation"
+ALEMBIC_HEAD_REVISION = "0002_orchestration_context"
 
 
 def create_engine_for_url(database_url: str) -> Engine:

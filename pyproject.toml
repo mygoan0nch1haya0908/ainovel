@@ -7,6 +7,8 @@ name = "ainovel"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
+  "httpx>=0.28,<1",
+  "openai>=3.8,<4",
   "fastapi>=0.115",
   "jinja2>=3.1",
   "itsdangerous>=2.2",
@@ -20,7 +22,6 @@ dependencies = [
 [project.optional-dependencies]
 test = [
   "build>=1.3",
-  "httpx>=0.28",
   "pytest>=8.3",
   "pytest-cov>=6.0",
   "setuptools>=75",
@@ -35,3 +36,6 @@ ainovel = ["static/*.js", "web/templates/*.html"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers --basetemp=.pytest-tmp"
+markers = [
+  "local_model: opt-in tests that call a model installed on the local loopback service",
+]

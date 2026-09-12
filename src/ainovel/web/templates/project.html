@@ -10,12 +10,38 @@
 <section aria-labelledby="official-heading"><h2 id="official-heading">官方正文</h2>
   <p>官方章节：{{ statistics.chapter_count }} 章</p><p>可见字数：{{ statistics.visible_character_count }}</p>
 </section>
-<aside><p>模型生成将在第二阶段引入；当前仅提供本地项目与审批流程。</p></aside>
+<section aria-labelledby="workflow-heading"><h2 id="workflow-heading">模型生成工作流</h2>
+{% if active_workflow %}
+  <p>活动工作流：<a href="/workflows/{{ active_workflow.id }}">{{ active_workflow.status }}</a></p>
+{% elif summary.project.active_batch_id %}
+  <p>当前候选批次完成审批后才能启动新的生成工作流。</p>
+{% elif official_outline and summary.current_constitution_version_number %}
+  <form action="/projects/{{ summary.project.id }}/workflows" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p><label for="provider_name">Provider</label><select id="provider_name" name="provider_name"><option value="fake">Fake 演示</option><option value="ollama">Ollama</option><option value="openai">OpenAI</option></select></p>
+    <p><label for="model_name">模型名称</label><input id="model_name" name="model_name" value="demo" required></p>
+    <p><label for="requested_chapters">计划章节数（1 至 5）</label><input id="requested_chapters" name="requested_chapters" type="number" min="1" max="5" value="1" required></p>
+    <p>预算上限：规划 16000/4000，主笔 32000/12000，摘要 16000/4000，审核 32000/6000（输入/输出 Token）。</p>
+    <button type="submit">启动工作流</button>
+  </form>
+{% else %}
+  <p>请先确认创作宪法和官方大纲后再启动生成工作流。</p>
+{% endif %}
+</section>
+<section aria-labelledby="diagnostic-heading"><h2 id="diagnostic-heading">Provider 诊断</h2>
+  <form action="/projects/{{ summary.project.id }}/providers/diagnose" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p><label for="diagnostic_provider_name">Provider</label><select id="diagnostic_provider_name" name="provider_name"><option value="fake">Fake 演示</option><option value="ollama">Ollama</option><option value="openai">OpenAI</option></select></p>
+    <p><label for="diagnostic_model_name">模型名称（可选）</label><input id="diagnostic_model_name" name="model_name"></p>
+    <button type="submit">运行诊断</button>
+  </form>
+  {% if diagnostic %}<p>{{ diagnostic.message }}</p>{% if diagnostic.models %}<p>可用模型：{{ diagnostic.models | join(", ") }}</p>{% endif %}{% endif %}
+</section>
 <section aria-labelledby="batch-create-heading"><h2 id="batch-create-heading">创建候选批次</h2>
-{% if official_outline %}<form action="/projects/{{ summary.project.id }}/batches" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><p><label for="planned_chapters">计划章节数（1 至 5）</label><input id="planned_chapters" name="planned_chapters" type="number" min="1" max="5" required></p><button type="submit">创建候选批次</button></form>{% else %}<p>请先创建并确认官方大纲后再创建批次。</p>{% endif %}
+{% if official_outline and not summary.project.active_batch_id and not summary.project.active_workflow_id %}<form action="/projects/{{ summary.project.id }}/batches" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><p><label for="planned_chapters">计划章节数（1 至 5）</label><input id="planned_chapters" name="planned_chapters" type="number" min="1" max="5" required></p><button type="submit">创建候选批次</button></form>{% elif not official_outline %}<p>请先创建并确认官方大纲后再创建批次。</p>{% else %}<p>项目已有活动工作流或候选批次。</p>{% endif %}
 </section>
 <section aria-labelledby="batches-heading"><h2 id="batches-heading">候选批次</h2>
-{% if batches %}<ul>{% for batch in batches %}<li>
+{% if batches %}<ul>{% for batch in batches %}<li id="batch-{{ batch.id }}">
 <p>批次 {{ batch.id }}：{{ batch.planned_chapters }} 章，状态：{{ batch_status_labels[batch.status] }}</p>
 {% if batch.status == "draft" %}<form action="/batches/{{ batch.id }}/ready" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">提交审批</button></form>{% endif %}
 {% if batch.status == "ready_for_review" %}<form action="/batches/{{ batch.id }}/approve" method="post" data-confirm="确认批准此批次？"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">批准</button></form>{% endif %}

@@ -8,6 +8,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from ainovel.db import get_session
+from ainovel.models.workflow import GenerationWorkflow
 from ainovel.services.batches import BatchService
 from ainovel.services.outlines import OutlineService
 from ainovel.services.projects import ProjectService
@@ -32,19 +33,35 @@ def _project_context(request: Request, session: Session, project_id: str) -> dic
     except ValueError as error:
         raise HTTPException(status_code=404, detail="项目不存在") from error
     batches = BatchService(session)
+    active_workflow = (
+        session.get(GenerationWorkflow, summary.project.active_workflow_id)
+        if summary.project.active_workflow_id is not None
+        else None
+    )
+    if active_workflow is not None and active_workflow.project_id != summary.project.id:
+        active_workflow = None
     return {
         "request": request, "summary": summary, "official_outline": official_outline,
         "csrf_token": csrf_token(request),
         "batches": batches.list_for_project(project_id),
         "statistics": batches.official_chapter_statistics(project_id),
         "audit_events": batches.list_audit_events(project_id),
+        "active_workflow": active_workflow,
         "batch_status_labels": BATCH_STATUS_LABELS, "audit_action_labels": AUDIT_ACTION_LABELS,
     }
 
 
-def _project_page(request: Request, session: Session, project_id: str, error: str | None = None, status_code: int = 200) -> object:
+def _project_page(
+    request: Request,
+    session: Session,
+    project_id: str,
+    error: str | None = None,
+    status_code: int = 200,
+    diagnostic: dict[str, object] | None = None,
+) -> object:
     context = _project_context(request, session, project_id)
     context["error"] = error
+    context["diagnostic"] = diagnostic
     return templates.TemplateResponse(request, "project.html", context, status_code=status_code)
 
 

@@ -18,6 +18,7 @@ class NovelProject(TimestampMixin, Base):
     official_outline_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     current_constitution_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     active_batch_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    active_workflow_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     next_batch_sequence: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default=text("1")
     )

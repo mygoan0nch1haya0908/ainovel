@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block title %}工作流 {{ workflow.id }} · AI 小说工作台{% endblock %}
+{% block content %}
+<p><a href="/projects/{{ project.id }}">返回项目：{{ project.title }}</a></p>
+<h1>生成工作流</h1>
+<section aria-labelledby="workflow-status-heading">
+  <h2 id="workflow-status-heading">当前状态</h2>
+  <p><strong>{{ workflow.status }}</strong></p>
+  <p>Provider / 模型：{{ workflow.provider_name }} / {{ workflow.model_name }}</p>
+  <p>计划章节：{{ workflow.requested_chapters }}；当前位置：{{ workflow.current_position }}</p>
+  {% if is_paused %}
+  <details open>
+    <summary>暂停原因（需要处理）</summary>
+    <p>错误类别：{{ workflow.last_error_code or "未分类" }}</p>
+    <p>{{ workflow.last_error_detail or "没有可公开的详细信息" }}</p>
+  </details>
+  {% endif %}
+</section>
+
+<section aria-labelledby="workflow-action-heading">
+  <h2 id="workflow-action-heading">下一步</h2>
+  {% if can_run %}
+  <form action="/workflows/{{ workflow.id }}/run" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">运行至下一道门</button>
+  </form>
+  {% elif workflow.status == "AWAITING_PLAN_APPROVAL" %}
+  <form action="/workflows/{{ workflow.id }}/plan/approve" method="post" data-confirm="确认批准此计划并开始按顺序生成章节？">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">批准计划</button>
+  </form>
+  <form action="/workflows/{{ workflow.id }}/plan/reject" method="post" data-confirm="确认驳回此计划？">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p><label for="plan-reject-reason">驳回原因</label><input id="plan-reject-reason" name="reason" required></p>
+    <button type="submit">驳回计划</button>
+  </form>
+  {% elif can_resume %}
+  <form action="/workflows/{{ workflow.id }}/resume" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">恢复工作流</button>
+  </form>
+  {% elif workflow.status == "AWAITING_CONTENT_APPROVAL" or (is_paused and candidate_batch_id) %}
+  <p>候选批次已准备好，等待作者审批。</p>
+  <form action="/workflows/{{ workflow.id }}/reconcile" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">同步候选审批结果</button>
+  </form>
+  {% else %}
+  <p>当前状态没有可用的作者操作。</p>
+  {% endif %}
+  {% if candidate_batch_id %}
+  <p><a href="/projects/{{ project.id }}#batch-{{ candidate_batch_id }}">前往候选批次审批</a></p>
+  {% endif %}
+  {% if can_cancel %}
+  <form action="/workflows/{{ workflow.id }}/cancel" method="post" data-confirm="确认取消此暂停工作流？工件与审计将保留，项目可重新启动生成。">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">取消暂停工作流</button>
+  </form>
+  {% endif %}
+</section>
+
+{% if plan_chapters %}
+<section aria-labelledby="plan-heading">
+  <h2 id="plan-heading">批次计划</h2>
+  <ol>{% for chapter in plan_chapters %}<li><strong>{{ chapter.title }}</strong>（第 {{ chapter.ordinal }} 章）<br>目标：{{ chapter.goal }}<br>结尾悬念：{{ chapter.ending_hook }}</li>{% endfor %}</ol>
+</section>
+{% endif %}
+
+<section aria-labelledby="budget-heading">
+  <h2 id="budget-heading">预算与实际用量</h2>
+  <table>
+    <thead><tr><th>角色</th><th>输入上限</th><th>输出上限</th></tr></thead>
+    <tbody>
+      <tr><td>规划</td><td>{{ workflow.planner_input_tokens }}</td><td>{{ workflow.planner_output_tokens }}</td></tr>
+      <tr><td>主笔</td><td>{{ workflow.writer_input_tokens }}</td><td>{{ workflow.writer_output_tokens }}</td></tr>
+      <tr><td>摘要</td><td>{{ workflow.summarizer_input_tokens }}</td><td>{{ workflow.summarizer_output_tokens }}</td></tr>
+      <tr><td>审核</td><td>{{ workflow.reviewer_input_tokens }}</td><td>{{ workflow.reviewer_output_tokens }}</td></tr>
+    </tbody>
+  </table>
+  <p>累计实际输入 Token：{{ workflow.actual_input_tokens }}；累计实际输出 Token：{{ workflow.actual_output_tokens }}</p>
+</section>
+
+{% if review_issues %}
+<section aria-labelledby="review-heading"><h2 id="review-heading">审核问题</h2><ul>{% for issue in review_issues %}<li>{{ issue }}</li>{% endfor %}</ul></section>
+{% endif %}
+
+<details>
+  <summary>技术详情：提示词快照、步骤、尝试和工件</summary>
+  <h2>提示词快照</h2>
+  <ol>{% for snapshot in snapshots %}<li>
+    <p>{{ snapshot.role }} · {{ snapshot.prompt_version_id }}</p>
+    <h3>提示词正文</h3>
+    <pre>{{ snapshot.prompt_body }}</pre>
+    <h3>输出结构</h3>
+    <pre>{{ snapshot.output_schema }}</pre>
+    <h3>参数</h3>
+    <pre>{{ snapshot.parameters }}</pre>
+  </li>{% endfor %}</ol>
+  <h2>步骤</h2>
+  <ol>{% for step in steps %}<li>{{ step.position }} · {{ step.kind }}{% if step.ordinal %} {{ step.ordinal }}{% endif %} · {{ step.status }} · 尝试 {{ step.attempt_count }}</li>{% endfor %}</ol>
+  <h2>模型尝试</h2>
+  {% if attempt_rows %}<ol>{% for row in attempt_rows %}<li>{{ row.step.kind }}{% if row.step.ordinal %} {{ row.step.ordinal }}{% endif %} · #{{ row.attempt.attempt_number }} · {{ row.attempt.status }} · {{ row.attempt.provider_response_id or "无响应编号" }} · 输入 {{ row.attempt.input_tokens if row.attempt.input_tokens is not none else "未知" }} / 输出 {{ row.attempt.output_tokens if row.attempt.output_tokens is not none else "未知" }} · {{ row.attempt.latency_ms if row.attempt.latency_ms is not none else "未知" }} ms{% if row.attempt.error_code %} · {{ row.attempt.error_code }}{% endif %}</li>{% endfor %}</ol>{% else %}<p>尚无模型尝试。</p>{% endif %}
+  <h2>工件</h2>
+  {% if artifacts %}<ol>{% for artifact in artifacts %}<li>{{ artifact.kind }}{% if artifact.ordinal %} {{ artifact.ordinal }}{% endif %} · 可见字符 {{ artifact.visible_char_count if artifact.visible_char_count is not none else "不适用" }} · SHA-256 {{ artifact.content_hash }}</li>{% endfor %}</ol>{% else %}<p>尚无工件。</p>{% endif %}
+  <h2>作者计划决策</h2>
+  {% if decisions %}<ol>{% for decision in decisions %}<li>{{ decision.decision }} · {{ decision.actor }}{% if decision.reason %} · {{ decision.reason }}{% endif %}</li>{% endfor %}</ol>{% else %}<p>尚无计划决策。</p>{% endif %}
+</details>
+{% endblock %}

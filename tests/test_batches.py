@@ -21,6 +21,45 @@ def test_batch_size_must_be_between_one_and_five(session, project, official_outl
         BatchService(session).create(project.id, official_outline.id, planned)
 
 
+def test_batch_create_persists_optional_workflow_provenance(
+    session, project, official_outline
+) -> None:
+    from ainovel.models.workflow import GenerationWorkflow
+    from ainovel.services.workflows import DEFAULT_BUDGETS, WorkflowService
+
+    ProjectService(session).add_constitution(project.id, {"genre": "fantasy"}, author_approved=True)
+    workflow = WorkflowService(session).start(project.id, "fake", "test", 1, DEFAULT_BUDGETS)
+    session.execute(update(GenerationWorkflow).where(GenerationWorkflow.id == workflow.id).values(status="CREATING_CANDIDATE_BATCH"))
+    session.commit()
+    batch = BatchService(session).create(
+        project.id,
+        official_outline.id,
+        1,
+        source_workflow_id=workflow.id,
+    )
+
+    session.expire_all()
+    assert BatchService(session).get(batch.id).source_workflow_id == workflow.id
+
+
+def test_plain_batch_create_preserves_phase_one_audit_payload(
+    session, project, official_outline
+) -> None:
+    batch = BatchService(session).create(project.id, official_outline.id, 1)
+
+    event = session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.entity_id == batch.id,
+            AuditEvent.action == "batch_created",
+        )
+    )
+    assert event.details == {
+        "base_outline_version_id": official_outline.id,
+        "planned_chapters": 1,
+        "sequence_number": 1,
+    }
+
+
 def test_batch_requires_the_projects_official_outline(session, project, official_outline) -> None:
     candidate = OutlineService(session).create_candidate(
         project.id,
