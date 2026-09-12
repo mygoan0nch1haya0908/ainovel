@@ -10,7 +10,12 @@ import httpx2
 import pytest
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AuthenticationError
 
-from ainovel.agents.contracts import ChapterSummaryDelta
+from ainovel.agents.contracts import (
+    BatchPlanDraft,
+    BatchReview,
+    ChapterDraft,
+    ChapterSummaryDelta,
+)
 from ainovel.agents.runner import AgentRunner
 from ainovel.context import ConservativeEstimator
 from ainovel.providers.contracts import (
@@ -76,7 +81,7 @@ class FakeQwenClient:
         self.chat = SimpleNamespace(completions=CapturingCompletions(result))
 
 
-def test_qwen_chat_wire_includes_json_object_mode_schema_and_bounded_input() -> None:
+def test_qwen_summary_wire_includes_json_object_mode_schema_and_bounded_input() -> None:
     request = summary_request()
     client = FakeQwenClient(chat_response())
 
@@ -108,6 +113,53 @@ def test_qwen_chat_wire_includes_json_object_mode_schema_and_bounded_input() -> 
             "timeout": 5.0,
         }
     ]
+    estimator = ConservativeEstimator()
+    wire_messages = json.dumps(
+        client.chat.completions.calls[0]["messages"],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    budgeted_request = json.dumps(
+        asdict(request), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    assert estimator.estimate(wire_messages) <= estimator.estimate(budgeted_request)
+
+
+@pytest.mark.parametrize(
+    ("role", "schema_name", "result_type", "ordinal"),
+    [
+        ("batch_planner", "batch_plan", BatchPlanDraft, ""),
+        ("chapter_writer", "chapter_draft", ChapterDraft, "1"),
+        ("chapter_summarizer", "chapter_summary_delta", ChapterSummaryDelta, "1"),
+        ("batch_reviewer", "batch_review", BatchReview, ""),
+    ],
+)
+def test_qwen_production_workflow_request_shapes_fit_existing_input_accounting(
+    role: str,
+    schema_name: str,
+    result_type: type,
+    ordinal: str,
+) -> None:
+    request = ModelRequest(
+        model="qwen-flash",
+        system_prompt="test",
+        input_payload={},
+        output_schema=result_type.model_json_schema(),
+        max_input_tokens=10_976,
+        max_output_tokens=4_000,
+        timeout_seconds=60.0,
+        metadata={
+            "agent_role": role,
+            "schema_name": schema_name,
+            "workflow_id": "0" * 36,
+            "step_id": "1" * 36,
+            "ordinal": ordinal,
+        },
+    )
+    client = FakeQwenClient(chat_response(content="{}"))
+
+    QwenProvider(client, allow_real_calls=True).generate(request)
+
     estimator = ConservativeEstimator()
     wire_messages = json.dumps(
         client.chat.completions.calls[0]["messages"],
