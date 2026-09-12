@@ -102,6 +102,41 @@ The smoke test contacts only the configured `127.0.0.1` service, performs one
 diagnostic and one short JSON-Schema request, and never pulls a model or calls a
 cloud endpoint.
 
+## Explicit Qwen opt-in
+
+Qwen uses Alibaba Cloud's OpenAI-compatible Beijing endpoint and defaults to
+model `qwen-flash`. It is a remote API: AI Novel Studio does not download a
+model, and requests may incur external charges. Real requests remain disabled
+unless both an API key and `AINOVEL_ALLOW_REAL_QWEN=true` are present.
+
+```powershell
+$secureQwenKey = Read-Host "DashScope API key" -AsSecureString
+$qwenCredential = [pscredential]::new("unused", $secureQwenKey)
+$env:AINOVEL_QWEN_API_KEY = $qwenCredential.GetNetworkCredential().Password
+$env:AINOVEL_ALLOW_REAL_QWEN = "true"
+$env:AINOVEL_QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+.\.venv\Scripts\uvicorn ainovel.app:app --host 127.0.0.1 --port 8000
+Remove-Item Env:AINOVEL_QWEN_API_KEY, Env:AINOVEL_ALLOW_REAL_QWEN, Env:AINOVEL_QWEN_BASE_URL
+```
+
+`DASHSCOPE_API_KEY` is accepted as a fallback; `AINOVEL_QWEN_API_KEY` takes
+precedence when both are set. Keep credentials in the process environment, not
+in files, logs, screenshots, or the database. Restart an already-running server
+after changing environment variables so the process inherits them.
+
+The project-page Qwen diagnosis checks configuration only; it is explicitly not
+an online connectivity test. Qwen is requested with JSON Object mode and
+thinking disabled. JSON Object mode is not strict schema enforcement, so the
+application still validates every result against its Pydantic contract. The
+adapter retains a 16,000-token context ceiling and a 4,000-token output ceiling;
+the latter is generally too small for this application's full-length chapter
+contract, so use Qwen here only for smaller structured steps unless budgets and
+product requirements are separately revisited.
+
+Any live smoke validation must be explicitly opted in and limited to one small,
+synthetic structured request. It must not create, approve, or publish novel
+chapters and must not be part of the default offline test suite.
+
 ## Explicit OpenAI opt-in
 
 Real OpenAI requests are disabled unless both the opt-in and an API key are

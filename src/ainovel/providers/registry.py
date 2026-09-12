@@ -11,7 +11,7 @@ from ainovel.providers.contracts import (
 )
 
 
-ProviderName = Literal["fake", "ollama", "openai"]
+ProviderName = Literal["fake", "ollama", "openai", "qwen"]
 
 
 class ProviderRegistry:

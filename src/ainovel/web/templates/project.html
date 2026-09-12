@@ -18,7 +18,7 @@
 {% elif official_outline and summary.current_constitution_version_number %}
   <form action="/projects/{{ summary.project.id }}/workflows" method="post">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <p><label for="provider_name">Provider</label><select id="provider_name" name="provider_name"><option value="fake">Fake 演示</option><option value="ollama">Ollama</option><option value="openai">OpenAI</option></select></p>
+    <p><label for="provider_name">Provider</label><select id="provider_name" name="provider_name"><option value="fake">Fake 演示</option><option value="ollama">Ollama</option><option value="openai">OpenAI</option><option value="qwen">Qwen</option></select></p>
     <p><label for="model_name">模型名称</label><input id="model_name" name="model_name" value="demo" required></p>
     <p><label for="requested_chapters">计划章节数（1 至 5）</label><input id="requested_chapters" name="requested_chapters" type="number" min="1" max="5" value="1" required></p>
     <p>预算上限：规划 16000/4000，主笔 32000/12000，摘要 16000/4000，审核 32000/6000（输入/输出 Token）。</p>
@@ -31,7 +31,7 @@
 <section aria-labelledby="diagnostic-heading"><h2 id="diagnostic-heading">Provider 诊断</h2>
   <form action="/projects/{{ summary.project.id }}/providers/diagnose" method="post">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <p><label for="diagnostic_provider_name">Provider</label><select id="diagnostic_provider_name" name="provider_name"><option value="fake">Fake 演示</option><option value="ollama">Ollama</option><option value="openai">OpenAI</option></select></p>
+    <p><label for="diagnostic_provider_name">Provider</label><select id="diagnostic_provider_name" name="provider_name"><option value="fake">Fake 演示</option><option value="ollama">Ollama</option><option value="openai">OpenAI</option><option value="qwen">Qwen</option></select></p>
     <p><label for="diagnostic_model_name">模型名称（可选）</label><input id="diagnostic_model_name" name="model_name"></p>
     <button type="submit">运行诊断</button>
   </form>

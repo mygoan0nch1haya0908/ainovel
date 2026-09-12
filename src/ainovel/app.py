@@ -19,6 +19,7 @@ from ainovel.db import create_engine_for_url, create_session_factory, database_r
 from ainovel.providers.demo import DemoFakeProvider
 from ainovel.providers.ollama import OllamaProvider
 from ainovel.providers.openai import OpenAIProvider
+from ainovel.providers.qwen import QwenProvider
 from ainovel.providers.registry import ProviderRegistry
 from ainovel.workflows.orchestrator import WorkflowOrchestrator
 
@@ -49,6 +50,12 @@ def _default_provider_registry(settings: Settings) -> ProviderRegistry:
         else None
     )
     allow_openai = bool(settings.allow_real_openai and api_key)
+    qwen_api_key = (
+        settings.qwen_api_key.get_secret_value()
+        if settings.qwen_api_key is not None
+        else None
+    )
+    allow_qwen = bool(settings.allow_real_qwen and qwen_api_key)
 
     def ollama_provider() -> OllamaProvider:
         return OllamaProvider(
@@ -75,11 +82,25 @@ def _default_provider_registry(settings: Settings) -> ProviderRegistry:
             max_output_tokens_limit=PROVIDER_OUTPUT_TOKEN_CEILING,
         )
 
+    def qwen_provider() -> QwenProvider:
+        return QwenProvider(
+            OpenAI(
+                api_key=qwen_api_key or "not-configured",
+                base_url=settings.qwen_base_url,
+                timeout=settings.provider_timeout_seconds,
+                max_retries=0,
+            ),
+            allow_real_calls=allow_qwen,
+            context_window_limit=PROVIDER_CONTEXT_WINDOW_CEILING,
+            max_output_tokens_limit=PROVIDER_OUTPUT_TOKEN_CEILING,
+        )
+
     return ProviderRegistry(
         {
             "fake": DemoFakeProvider,
             "ollama": ollama_provider,
             "openai": openai_provider,
+            "qwen": qwen_provider,
         }
     )
 

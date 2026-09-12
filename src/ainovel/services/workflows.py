@@ -52,7 +52,7 @@ class WorkflowBudgets:
 
 
 DEFAULT_BUDGETS = WorkflowBudgets()
-PROVIDER_NAMES = frozenset({"fake", "ollama", "openai"})
+PROVIDER_NAMES = frozenset({"fake", "ollama", "openai", "qwen"})
 WORKFLOW_STATUSES = frozenset(
     {
         "PREPARING",
