@@ -138,6 +138,52 @@ Any live smoke validation must be explicitly opted in and limited to one small,
 synthetic structured request. It must not create, approve, or publish novel
 chapters and must not be part of the default offline test suite.
 
+## Isolated single-chapter Qwen author test
+
+This opt-in author test uses a separate SQLite database at exactly
+`D:/ainovel/.worktrees/qwen-adapter/.superpowers/runtime/chapter-test/chapter-test.db`.
+The dedicated factory ignores the ordinary `AINOVEL_DATABASE_URL` default, fixes
+the workflow at one chapter, and raises only Qwen's test ceilings to 32,000
+context tokens and 12,000 output tokens. It does not download anything. Real
+Qwen calls require both an API key and explicit opt-in and may incur charges.
+
+From `D:\ainovel\.worktrees\qwen-adapter`, migrate that exact database, remove
+the migration override, securely load the key, and start only on loopback:
+
+```powershell
+$env:AINOVEL_DATABASE_URL = "sqlite+pysqlite:///D:/ainovel/.worktrees/qwen-adapter/.superpowers/runtime/chapter-test/chapter-test.db"
+python -m alembic upgrade head
+Remove-Item Env:AINOVEL_DATABASE_URL
+
+$secureQwenKey = Read-Host "DashScope API key" -AsSecureString
+$qwenCredential = [pscredential]::new("unused", $secureQwenKey)
+$env:AINOVEL_QWEN_API_KEY = $qwenCredential.GetNetworkCredential().Password
+$env:AINOVEL_ALLOW_REAL_QWEN = "true"
+python -m uvicorn ainovel.chapter_test:create_chapter_test_app --factory --host 127.0.0.1 --port 8001
+```
+
+Open [http://127.0.0.1:8001/chapter-test](http://127.0.0.1:8001/chapter-test),
+then follow the explicit gates:
+
+1. Enter the project setting/style, provisional ending, and first-chapter
+   outline; check the author confirmation and create the workflow. This setup
+   step performs no model call.
+2. On the workflow page, click “运行至下一道门” to generate a plan, inspect it,
+   and explicitly approve or reject it.
+3. After approval, click “运行至下一道门” again to generate, summarize, and
+   review exactly one 4,500–6,000-visible-character candidate chapter.
+4. Read the full candidate body and visible count before using the existing
+   candidate-batch approval or rejection controls. Nothing is approved or
+   published automatically.
+
+The test verifies orchestration, budgets, persistence, validation, and author
+approval boundaries. It makes no claim that actual literary quality has been
+tested. Stop the server before clearing credentials, then run:
+
+```powershell
+Remove-Item Env:AINOVEL_QWEN_API_KEY, Env:AINOVEL_ALLOW_REAL_QWEN -ErrorAction SilentlyContinue
+```
+
 ## Explicit OpenAI opt-in
 
 Real OpenAI requests are disabled unless both the opt-in and an API key are

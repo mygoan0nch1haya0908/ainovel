@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 from sqlalchemy import func, select, text, update
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
@@ -269,6 +270,9 @@ class PromptService:
 
     def _begin_builtin_transaction(self) -> None:
         if self.session.get_bind().dialect.name == "sqlite":
+            bind = self.session.get_bind()
+            if isinstance(bind, Connection) and bind.in_transaction():
+                return
             self.session.execute(text("BEGIN IMMEDIATE"))
 
     @staticmethod

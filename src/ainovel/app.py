@@ -42,7 +42,12 @@ def _loopback_provider_url(value: str) -> str:
     return value.rstrip("/")
 
 
-def _default_provider_registry(settings: Settings) -> ProviderRegistry:
+def _default_provider_registry(
+    settings: Settings,
+    *,
+    qwen_context_window_ceiling: int = PROVIDER_CONTEXT_WINDOW_CEILING,
+    qwen_output_token_ceiling: int = PROVIDER_OUTPUT_TOKEN_CEILING,
+) -> ProviderRegistry:
     ollama_base_url = _loopback_provider_url(settings.ollama_base_url)
     api_key = (
         settings.openai_api_key.get_secret_value()
@@ -90,8 +95,8 @@ def _default_provider_registry(settings: Settings) -> ProviderRegistry:
                 max_retries=0,
             ),
             allow_real_calls=settings.allow_real_qwen,
-            context_window_limit=PROVIDER_CONTEXT_WINDOW_CEILING,
-            max_output_tokens_limit=PROVIDER_OUTPUT_TOKEN_CEILING,
+            context_window_limit=qwen_context_window_ceiling,
+            max_output_tokens_limit=qwen_output_token_ceiling,
             api_key_configured=bool(qwen_api_key),
         )
 
@@ -108,6 +113,8 @@ def _default_provider_registry(settings: Settings) -> ProviderRegistry:
 def create_app(
     database_url: str | None = None,
     provider_registry: ProviderRegistry | None = None,
+    *,
+    orchestrator_request_timeout_seconds: float = 60.0,
 ) -> FastAPI:
     settings = Settings(database_url=database_url) if database_url else Settings()
 
@@ -127,6 +134,7 @@ def create_app(
         app.state.session_factory,
         app.state.provider_registry,
         AgentRunner(),
+        request_timeout_seconds=orchestrator_request_timeout_seconds,
     )
     app.state.orchestrator_factory = lambda: orchestrator
     app.state.csrf_signer = URLSafeSerializer(session_secret, salt="ainovel-csrf")

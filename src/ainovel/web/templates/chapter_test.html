@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}单章写作测试 · AI 小说工作台{% endblock %}
+{% block content %}
+<aside aria-label="测试环境提示">
+  <h1>TEST · 单章写作测试</h1>
+  <p><strong>这是独立测试数据库，不是正式出版或发布入口。</strong></p>
+  <p>数据库位置：<code>{{ database_path }}</code></p>
+  <p><strong>付费调用警告：</strong>只有您在工作流页面明确点击“运行至下一道门”时才会调用 Qwen，可能产生 API 费用；失败步骤最多尝试 2 次，每次都可能计费。</p>
+  <p>本测试固定生成 1 章。主笔输出上限为 12000 Token，请求超时为 180 秒；规划、摘要、审核输出上限均为 4000 Token。</p>
+  <p>现有确定性校验要求正文逐字包含获批计划里的 goal 与 ending_hook（忽略空白差异）。本入口不会放宽该限制，也不会自动批准计划或章节。</p>
+</aside>
+
+<section aria-labelledby="setup-heading">
+  <h2 id="setup-heading">设置与章节提纲</h2>
+  <form action="/chapter-test" method="post" data-confirm="确认这些设置与提纲，并创建一个尚未运行的单章工作流？">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="submission_token" value="{{ submission_token }}">
+    <p><label for="project_title">项目名称</label><input id="project_title" name="project_title" maxlength="{{ field_limits.project_title }}" value="{{ chapter_form.project_title }}" required></p>
+    <p><label for="setting_style">世界设定与文风约束</label><textarea id="setting_style" name="setting_style" maxlength="{{ field_limits.setting_style }}" rows="6" required>{{ chapter_form.setting_style }}</textarea></p>
+    <p><label for="provisional_ending">暂定结局</label><textarea id="provisional_ending" name="provisional_ending" maxlength="{{ field_limits.provisional_ending }}" rows="4" required>{{ chapter_form.provisional_ending }}</textarea></p>
+    <p><label for="chapter_outline">第一章提纲</label><textarea id="chapter_outline" name="chapter_outline" maxlength="{{ field_limits.chapter_outline }}" rows="8" required>{{ chapter_form.chapter_outline }}</textarea></p>
+    <details>
+      <summary>可选：作者建议的章节标题、目标与章末钩子</summary>
+      <p>这些建议会进入获批官方大纲，但模型生成的批次计划仍须单独审批。</p>
+      <p><label for="chapter_title">章节标题</label><input id="chapter_title" name="chapter_title" maxlength="{{ field_limits.chapter_title }}" value="{{ chapter_form.chapter_title }}"></p>
+      <p><label for="chapter_goal">章节目标</label><textarea id="chapter_goal" name="chapter_goal" maxlength="{{ field_limits.chapter_goal }}" rows="3">{{ chapter_form.chapter_goal }}</textarea></p>
+      <p><label for="chapter_hook">章末钩子</label><textarea id="chapter_hook" name="chapter_hook" maxlength="{{ field_limits.chapter_hook }}" rows="3">{{ chapter_form.chapter_hook }}</textarea></p>
+    </details>
+    <p><label for="model_name">Qwen 模型</label><input id="model_name" name="model_name" maxlength="{{ field_limits.model_name }}" value="{{ chapter_form.model_name }}" required></p>
+    <p><label><input type="checkbox" name="author_confirm" value="yes"{% if chapter_form.author_confirm == "yes" %} checked{% endif %} required> 我确认以上设定、暂定结局与章节提纲作为本次测试的已批准输入。</label></p>
+    <button type="submit">创建单章测试工作流（不会调用模型）</button>
+  </form>
+</section>
+
+{% if projects %}
+<section aria-labelledby="saved-tests-heading">
+  <h2 id="saved-tests-heading">已创建的测试</h2>
+  <ul>{% for project in projects %}<li><a href="/chapter-test?project_id={{ project.id }}">{{ project.title }}</a>{% if project.active_workflow_id %} · <a href="/workflows/{{ project.active_workflow_id }}">打开工作流</a>{% endif %}</li>{% endfor %}</ul>
+</section>
+{% endif %}
+
+{% if confirmed_input %}
+<section aria-labelledby="confirmed-input-heading">
+  <h2 id="confirmed-input-heading">作者已确认的测试输入</h2>
+  <p>项目：{{ confirmed_input.project.title }}</p>
+  <h3>设定与文风</h3><div style="white-space: pre-wrap">{{ confirmed_input.setting_style }}</div>
+  <h3>暂定结局</h3><div style="white-space: pre-wrap">{{ confirmed_input.provisional_ending }}</div>
+  <h3>章节提纲</h3><div style="white-space: pre-wrap">{{ confirmed_input.chapter_outline }}</div>
+  {% if confirmed_input.chapter_title %}<p>建议标题：{{ confirmed_input.chapter_title }}</p>{% endif %}
+  {% if confirmed_input.chapter_goal %}<p>建议目标：{{ confirmed_input.chapter_goal }}</p>{% endif %}
+  {% if confirmed_input.chapter_hook %}<p>建议钩子：{{ confirmed_input.chapter_hook }}</p>{% endif %}
+</section>
+{% endif %}
+{% endblock %}
