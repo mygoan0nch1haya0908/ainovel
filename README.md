@@ -151,6 +151,7 @@ From `D:\ainovel\.worktrees\qwen-adapter`, migrate that exact database, remove
 the migration override, securely load the key, and start only on loopback:
 
 ```powershell
+New-Item -ItemType Directory -Force -Path "D:\ainovel\.worktrees\qwen-adapter\.superpowers\runtime\chapter-test" | Out-Null
 $env:AINOVEL_DATABASE_URL = "sqlite+pysqlite:///D:/ainovel/.worktrees/qwen-adapter/.superpowers/runtime/chapter-test/chapter-test.db"
 python -m alembic upgrade head
 Remove-Item Env:AINOVEL_DATABASE_URL

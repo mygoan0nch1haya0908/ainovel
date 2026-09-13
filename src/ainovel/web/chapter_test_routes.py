@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from secrets import compare_digest, token_urlsafe
 
 from fastapi import APIRouter, Depends, Form, Request
@@ -18,6 +19,7 @@ from ainovel.web.security import csrf_token, require_csrf
 
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 SUBMISSION_SESSION_KEY = "chapter_test_submission_token"
 FIELD_LIMITS = {
     "project_title": 120,
@@ -267,6 +269,29 @@ def _create_workflow_atomically(
             connection.close()
 
 
+def _setup_failure_response(
+    request: Request,
+    session: Session,
+    error: Exception,
+    *,
+    status_code: int,
+) -> object:
+    event_id = token_urlsafe(12)
+    logger.error(
+        "chapter_test_setup_failed event_id=%s exception_type=%s",
+        event_id,
+        type(error).__name__,
+    )
+    return _render(
+        request,
+        session,
+        _empty_form(),
+        _new_submission_token(request),
+        error=f"测试项目创建失败；未保留半完成设置，请重试。参考编号：{event_id}",
+        status_code=status_code,
+    )
+
+
 @router.get("/chapter-test")
 def chapter_test_page(
     request: Request,
@@ -333,13 +358,18 @@ def create_chapter_test(
         )
     try:
         _project_id, workflow_id = _create_workflow_atomically(request, values)
-    except Exception:
-        return _render(
+    except (ValueError, PermissionError) as error:
+        return _setup_failure_response(
             request,
             session,
-            values,
-            _new_submission_token(request),
-            error="测试项目创建失败；未保留半完成设置，请重试",
             status_code=422,
+            error=error,
+        )
+    except Exception as error:
+        return _setup_failure_response(
+            request,
+            session,
+            status_code=500,
+            error=error,
         )
     return RedirectResponse(f"/workflows/{workflow_id}", status_code=303)

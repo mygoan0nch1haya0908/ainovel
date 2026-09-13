@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from html import unescape
 import importlib.util
+import logging
 from pathlib import Path
 import re
 from types import SimpleNamespace
@@ -455,21 +456,38 @@ def test_workflow_start_failure_rolls_back_entire_setup(
     chapter_test_app,
     bounded_provider: BoundedFakeProvider,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     import ainovel.web.chapter_test_routes as route_module
 
     original_start = route_module.WorkflowService.start
+    sensitive_input = "不得进入日志的作者私密设定"
+    sensitive_error = "Authorization: Bearer diagnostic-secret"
+    data = valid_setup_data(chapter_client)
+    data["setting_style"] = sensitive_input
 
     def fail_after_start(self, *args, **kwargs):
         original_start(self, *args, **kwargs)
-        raise RuntimeError("synthetic failure after service commits")
+        raise RuntimeError(f"{sensitive_error}; input={sensitive_input}")
 
     monkeypatch.setattr(route_module.WorkflowService, "start", fail_after_start)
+    monkeypatch.setattr(route_module, "token_urlsafe", lambda _size: "setup-event-123")
 
-    result = chapter_client.post("/chapter-test", data=valid_setup_data(chapter_client))
+    with caplog.at_level(logging.ERROR, logger=route_module.__name__):
+        result = chapter_client.post("/chapter-test", data=data)
 
-    assert result.status_code == 422
+    assert result.status_code == 500
     assert "测试项目创建失败" in result.text
+    assert "setup-event-123" in result.text
+    assert sensitive_error not in result.text
+    assert sensitive_input not in result.text
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == [
+        "chapter_test_setup_failed event_id=setup-event-123 "
+        "exception_type=RuntimeError"
+    ]
+    assert sensitive_error not in caplog.text
+    assert sensitive_input not in caplog.text
     assert bounded_provider.requests == []
     with chapter_test_app.state.session_factory() as session:
         for model in (
@@ -508,7 +526,7 @@ def test_busy_setup_releases_connection_without_partial_state(
             locker_transaction.rollback()
             locker.close()
 
-        assert result.status_code == 422
+        assert result.status_code == 500
         assert app.state.engine.pool.checkedout() == 0
         assert provider.requests == []
         with app.state.session_factory() as session:
