@@ -104,8 +104,9 @@ cloud endpoint.
 
 ## Explicit Qwen opt-in
 
-Qwen uses Alibaba Cloud's OpenAI-compatible Beijing endpoint and defaults to
-model `qwen-flash`. It is a remote API: AI Novel Studio does not download a
+Qwen uses Alibaba Cloud's OpenAI-compatible Beijing endpoint. After selecting
+Qwen on the project page, enter `qwen-flash` in the model-name field. It is a
+remote API: AI Novel Studio does not download a
 model, and requests may incur external charges. Real requests remain disabled
 unless both an API key and `AINOVEL_ALLOW_REAL_QWEN=true` are present.
 
