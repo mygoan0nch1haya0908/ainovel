@@ -4,6 +4,7 @@ import json
 from collections.abc import Mapping
 from time import perf_counter
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AuthenticationError, OpenAI
+from ainovel.providers.diagnostics import FailureReason, ResponseFailure
 
 from ainovel.providers.contracts import (
     ModelRequest,
@@ -109,26 +110,33 @@ class QwenProvider:
         except APIConnectionError:
             raise ProviderUnavailable("Qwen service is unavailable") from None
         except APIStatusError:
-            raise ProviderProtocolError("Qwen returned an unsuccessful response") from None
+            raise ResponseFailure(FailureReason.HTTP) from None
 
         try:
             choices = response.choices
             if not isinstance(choices, list) or not choices:
-                raise ValueError("choices are missing")
+                raise ResponseFailure(FailureReason.ENVELOPE)
             choice = choices[0]
+            if choice.finish_reason == "length":
+                raise ResponseFailure(FailureReason.TRUNCATED)
+            if choice.finish_reason == "content_filter":
+                raise ResponseFailure(FailureReason.REFUSED)
             if choice.finish_reason != "stop":
-                raise ValueError("response did not finish normally")
+                raise ResponseFailure(FailureReason.FINISH)
             message = choice.message
             if getattr(message, "refusal", None) is not None:
-                raise ValueError("response was refused")
+                raise ResponseFailure(FailureReason.REFUSED)
             content = message.content
             if not isinstance(content, str) or not content.strip():
-                raise ValueError("message content is missing")
-            structured = json.loads(content)
+                raise ResponseFailure(FailureReason.EMPTY)
+            try:
+                structured = json.loads(content)
+            except ValueError:
+                raise ResponseFailure(FailureReason.JSON) from None
             if not isinstance(structured, dict):
-                raise ValueError("structured response is not an object")
+                raise ResponseFailure(FailureReason.JSON)
         except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
-            raise ProviderProtocolError("Qwen returned malformed structured output") from None
+            raise ResponseFailure(FailureReason.ENVELOPE) from None
 
         try:
             provider_response_id = response.id
@@ -142,7 +150,7 @@ class QwenProvider:
             if type(output_tokens) is not int or output_tokens < 0:
                 raise ValueError("completion token count is invalid")
         except (AttributeError, TypeError, ValueError):
-            raise ProviderProtocolError("Qwen returned malformed response metadata") from None
+            raise ResponseFailure(FailureReason.METADATA) from None
 
         return ModelResponse(
             structured=structured,

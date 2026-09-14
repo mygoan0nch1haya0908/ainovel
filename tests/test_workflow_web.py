@@ -177,6 +177,7 @@ def test_cancelled_workflow_remains_accessible_from_project(client, session, wor
     detail = client.get(f'/workflows/{workflow.id}')
     assert '已取消' in detail.text
     assert 'provider_protocol' in detail.text
+    assert '未记录细分原因' in detail.text
     assert f'action="/workflows/{workflow.id}/run"' not in detail.text
 
 

@@ -26,6 +26,9 @@
     <summary>最近的暂停 / 失败原因</summary>
     <p>错误类别：{{ workflow.last_error_code or "未分类" }}</p>
     <p>{{ workflow.last_error_detail or "没有可公开的详细信息" }}</p>
+    {% if workflow.last_error_code == "provider_protocol" and workflow.last_error_detail in [none, "provider returned an invalid response"] %}
+    <p>此记录未记录细分原因，无法追溯具体是格式、截断还是字数 / 内容校验失败。新增诊断只对更新后的调用生效，不会自动重试。</p>
+    {% endif %}
   </details>
   {% endif %}
 </section>
@@ -74,6 +77,19 @@
   </form>
   {% endif %}
 </section>
+
+{% set failed_attempts = attempt_rows | selectattr('attempt.status', 'equalto', 'FAILED') | list %}
+{% if failed_attempts %}
+<section aria-labelledby="failure-attempts-heading">
+  <h2 id="failure-attempts-heading">每次失败的诊断</h2>
+  <p class="muted">仅展示脱敏原因，不保存失败响应正文。没有 Token 用量记录不代表没有计费。若存在多项不合格条件，先报告首项。</p>
+  <ol>{% for row in failed_attempts %}<li>
+    <strong>{{ {'PLANNING': '生成计划', 'WRITING': '生成正文', 'SUMMARIZING': '生成摘要', 'REVIEWING': '检查正文'}.get(row.step.kind, row.step.kind) }}{% if row.step.ordinal %} · 第 {{ row.step.ordinal }} 章{% endif %} · 第 {{ row.attempt.attempt_number }} 次</strong>
+    <p>{{ row.attempt.error_code or "未分类" }} · {{ row.attempt.error_detail or "没有详细记录" }}</p>
+    {% if row.attempt.error_code == 'provider_protocol' and row.attempt.error_detail in [none, 'provider returned an invalid response'] %}<p class="muted">未记录细分原因，不能从这条旧记录还原根因。</p>{% endif %}
+  </li>{% endfor %}</ol>
+</section>
+{% endif %}
 
 {% if plan_chapters %}
 <section aria-labelledby="plan-heading">

@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from typing import Generic, TypeVar
 
 from pydantic import BaseModel, ValidationError
+from ainovel.agents.contracts import ChapterDraft
+from ainovel.services.counting import count_visible_characters
+from ainovel.providers.diagnostics import FailureReason, ResponseFailure
 
 from ainovel.providers.contracts import (
     ModelProvider,
@@ -43,7 +46,21 @@ class AgentRunner:
         try:
             result = result_type.model_validate(response.structured)
         except ValidationError:
-            raise ProviderProtocolError(INVALID_PROVIDER_RESPONSE) from None
+            reason = FailureReason.SCHEMA
+            count = None
+            if result_type is ChapterDraft:
+                title = response.structured.get('title')
+                body = response.structured.get('body')
+                if isinstance(title, str) and isinstance(body, str):
+                    if not title.strip() or not body.strip():
+                        reason = FailureReason.CHAPTER_EMPTY
+                    else:
+                        count = count_visible_characters(body)
+                        if count < 4500:
+                            reason = FailureReason.TOO_SHORT
+                        elif count > 6000:
+                            reason = FailureReason.TOO_LONG
+            raise ResponseFailure(reason, visible_count=count) from None
         return AgentRunResult(result=result, response=response)
 
     @staticmethod

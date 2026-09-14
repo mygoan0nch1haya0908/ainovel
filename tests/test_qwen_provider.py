@@ -42,6 +42,72 @@ def summary_request() -> ModelRequest:
     )
 
 
+@pytest.mark.parametrize(('reply', 'reason'), [
+    ('length', 'response_truncated'),
+    ('refusal', 'response_refused'), ('json', 'response_json'),
+    ('empty', 'response_empty'), ('metadata', 'response_metadata'),
+    ('finish', 'response_finish'), ('envelope', 'response_envelope'),
+])
+def test_qwen_protocol_failures_keep_safe_reason(reply, reason, caplog):
+    from ainovel.services.workflows import WorkflowService
+    secret = 'diagnostic-secret-author-text'
+    result = chat_response(content=secret)
+    if reply == 'length':
+        result = chat_response(content=secret, finish_reason='length')
+    elif reply == 'refusal':
+        result = chat_response(refusal=secret)
+    elif reply == 'empty':
+        result = chat_response(content='')
+    elif reply == 'metadata':
+        result = chat_response()
+        result.id = None
+    elif reply == 'finish':
+        result = chat_response(finish_reason=secret)
+    elif reply == 'envelope':
+        result.choices = []
+    with pytest.raises(ProviderProtocolError) as caught:
+        QwenProvider(FakeQwenClient(result), allow_real_calls=True).generate(summary_request())
+    code, detail, retryable = WorkflowService._provider_failure(caught.value)
+    assert code == 'provider_protocol' and retryable is True
+    assert reason in detail
+    assert secret not in detail + str(caught.value) + caplog.text
+
+
+@pytest.mark.parametrize(('payload', 'reason', 'count'), [
+    ({'title': '章', 'body': '甲' * 17}, 'chapter_too_short', 17),
+    ({'title': '章', 'body': '甲' * 6001}, 'chapter_too_long', 6001),
+    ({'title': '章', 'body': '  '}, 'chapter_empty', None),
+    ({'title': '章', 'body': 17}, 'schema_mismatch', None),
+])
+def test_chapter_schema_diagnostics_do_not_copy_response(payload, reason, count):
+    from ainovel.services.workflows import WorkflowService
+    result = chat_response(content=json.dumps(payload, ensure_ascii=False))
+    with pytest.raises(ProviderProtocolError) as caught:
+        AgentRunner().run(QwenProvider(FakeQwenClient(result), allow_real_calls=True), summary_request(), ChapterDraft)
+    detail = WorkflowService._provider_failure(caught.value)[1]
+    assert reason in detail
+    if count is not None:
+        assert f'实际可见字数：{count}' in detail
+    assert '甲甲' not in detail
+
+
+def test_diagnostic_persistence_revalidates_tampered_error_metadata():
+    from ainovel.providers.diagnostics import FailureReason, ResponseFailure
+    from ainovel.services.workflows import WorkflowService
+    secret = 'Bearer diagnostic-credential-do-not-store'
+    error = ResponseFailure(FailureReason.TOO_SHORT, visible_count=17)
+    error.reason = secret
+    error.visible_count = secret
+    error.args = (secret,)
+    detail = WorkflowService._provider_failure(error)[1]
+    assert '[unknown]' in detail
+    assert secret not in detail
+    error.reason = FailureReason.TOO_SHORT
+    for invalid_count in (True, -1, 10**20, secret):
+        error.visible_count = invalid_count
+        assert '实际可见字数' not in WorkflowService._provider_failure(error)[1]
+
+
 def chat_response(
     content: object = '{"summary":"有效","state_delta":{"chapter":1}}',
     *,

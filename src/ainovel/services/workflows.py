@@ -1,4 +1,5 @@
 from __future__ import annotations
+from ainovel.providers.diagnostics import ResponseFailure, safe_failure_detail
 
 from collections.abc import Mapping
 from copy import deepcopy
@@ -2045,6 +2046,8 @@ class WorkflowService:
 
     @staticmethod
     def _provider_failure(error: ProviderError) -> tuple[str, str, bool]:
+        if isinstance(error, ResponseFailure):
+            return "provider_protocol", safe_failure_detail(error), True
         for error_type, code, detail, retryable in _SAFE_PROVIDER_FAILURES:
             if isinstance(error, error_type):
                 return code, detail, retryable

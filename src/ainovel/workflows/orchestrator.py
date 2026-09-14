@@ -1,4 +1,5 @@
 from __future__ import annotations
+from ainovel.providers.diagnostics import FailureReason, ResponseFailure
 
 from collections.abc import Callable
 from copy import deepcopy
@@ -803,17 +804,17 @@ class WorkflowOrchestrator:
     ) -> dict[str, object]:
         if step.kind == "PLANNING":
             if not isinstance(result, BatchPlanDraft):
-                raise ProviderProtocolError("provider returned an invalid plan")
+                raise ResponseFailure(FailureReason.PLAN)
             with self._session_factory() as session:
                 workflow = session.get(GenerationWorkflow, step.workflow_id)
                 if workflow is None or len(result.chapters) != workflow.requested_chapters:
-                    raise ProviderProtocolError("provider returned an invalid plan")
+                    raise ResponseFailure(FailureReason.PLAN)
                 session.rollback()
             return {}
         if step.kind != "WRITING":
             return {}
         if not isinstance(result, ChapterDraft) or step.ordinal is None:
-            raise ProviderProtocolError("provider returned an invalid chapter")
+            raise ResponseFailure(FailureReason.PLAN)
         with self._session_factory() as session:
             workflow = session.get(GenerationWorkflow, step.workflow_id)
             if workflow is None:
@@ -826,17 +827,22 @@ class WorkflowOrchestrator:
                 result.body,
             )
             session.rollback()
-        if (
-            not validations["nonblank_title"]
-            or not validations["nonblank_body"]
-            or not validations["visible_length_valid"]
-            or not validations["approved_plan_ordinal"]
-            or not validations["approved_goal_present"]
-            or not validations["approved_key_event_present"]
-            or validations["obvious_repeated_blocks"]
-            or not validations["ordinal_continuity"]
+        if not validations['nonblank_title'] or not validations['nonblank_body']:
+            raise ResponseFailure(FailureReason.CHAPTER_EMPTY)
+        if not validations['visible_length_valid']:
+            count = validations['visible_character_count']
+            reason = FailureReason.TOO_SHORT if count < 4500 else FailureReason.TOO_LONG
+            raise ResponseFailure(reason, visible_count=count)
+        for key, reason in (
+            ('approved_plan_ordinal', FailureReason.PLAN),
+            ('approved_goal_present', FailureReason.GOAL),
+            ('approved_key_event_present', FailureReason.HOOK),
+            ('ordinal_continuity', FailureReason.ORDINAL),
         ):
-            raise ProviderProtocolError("provider chapter failed deterministic validation")
+            if not validations[key]:
+                raise ResponseFailure(reason)
+        if validations['obvious_repeated_blocks']:
+            raise ResponseFailure(FailureReason.REPEATED)
         return validations
 
     def _chapter_validation_results(

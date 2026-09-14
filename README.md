@@ -183,6 +183,17 @@ body; creating it never generates text. Review submission stays disabled until
 all planned chapters meet the existing length checks. Diagnostic, budget, and
 audit details are collapsed; chapter bodies remain visible in the reading view.
 
+Response failures keep the existing `provider_protocol` category and bounded
+retry behavior, but new failures include an allowlisted reason in their detail:
+truncation, refusal, JSON/envelope/metadata, schema, chapter length, literal
+goal/hook coverage, repeated paragraphs, or chapter order. Length failures show
+the visible character count. The workflow page shows each failed attempt.
+Diagnostics exclude response text, submitted prose, SDK errors, and secrets;
+only fixed explanations and validated counts are stored. The first failing
+check is reported; it is not a claim that other checks passed. Older generic
+records cannot be reconstructed and are labeled accordingly. This change does
+not reset attempts, relax validation, or retry existing work automatically.
+
 The test verifies orchestration, budgets, persistence, validation, and author
 approval boundaries. It makes no claim that actual literary quality has been
 tested. Stop the server before clearing credentials, then run:
