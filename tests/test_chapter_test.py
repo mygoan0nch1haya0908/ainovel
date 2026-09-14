@@ -669,8 +669,9 @@ def test_cleanup_failures_do_not_replace_primary_stage_and_all_cleanup_is_attemp
     assert "secret" not in str(raised.value)
 
 
-def test_standalone_connection_cleanup_failure_uses_safe_fixed_stage(
+def test_standalone_connection_cleanup_failure_preserves_committed_success(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     import ainovel.web.chapter_test_routes as route_module
 
@@ -680,15 +681,79 @@ def test_standalone_connection_cleanup_failure_uses_safe_fixed_stage(
         cleanup_errors={"connection_close"},
     )
 
-    with pytest.raises(route_module.ChapterTestSetupFailure) as raised:
-        route_module._create_workflow_atomically(request, atomic_setup_values())
+    monkeypatch.setattr(route_module, "token_urlsafe", lambda _size: "cleanup-event-123")
 
-    assert raised.value.stage == "connection_cleanup"
-    assert raised.value.exception_type == "RuntimeError"
-    assert raised.value.__context__ is None
-    assert raised.value.__cause__ is None
+    with caplog.at_level(logging.WARNING, logger=route_module.__name__):
+        result = route_module._create_workflow_atomically(request, atomic_setup_values())
+
+    assert result == ("project-id", "workflow-id")
     assert events[-3:] == ["session_close", "transaction_commit", "connection_close"]
-    assert "cleanup-secret" not in str(raised.value)
+    assert [record.getMessage() for record in caplog.records] == [
+        "chapter_test_setup_cleanup_failed event_id=cleanup-event-123 "
+        "stage=connection_cleanup exception_type=RuntimeError"
+    ]
+    assert all(record.exc_info is None for record in caplog.records)
+    assert "cleanup-secret" not in caplog.text
+    assert "Traceback" not in caplog.text
+
+
+def test_connection_cleanup_failure_redirects_to_once_persisted_workflow(
+    chapter_client: TestClient,
+    chapter_test_app,
+    bounded_provider: BoundedFakeProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import ainovel.web.chapter_test_routes as route_module
+
+    data = valid_setup_data(chapter_client)
+    sensitive_input = "private author setting"
+    data["setting_style"] = sensitive_input
+    original_connect = chapter_test_app.state.engine.connect
+    inject_failure = True
+
+    def connect_with_cleanup_failure():
+        nonlocal inject_failure
+        connection = original_connect()
+        if inject_failure:
+            inject_failure = False
+            original_close = connection.close
+
+            def close_then_fail():
+                original_close()
+                raise RuntimeError(
+                    f"SQL input={sensitive_input}; Authorization: Bearer cleanup-secret"
+                )
+
+            monkeypatch.setattr(connection, "close", close_then_fail)
+        return connection
+
+    monkeypatch.setattr(chapter_test_app.state.engine, "connect", connect_with_cleanup_failure)
+    monkeypatch.setattr(route_module, "token_urlsafe", lambda _size: "cleanup-event-123")
+
+    with caplog.at_level(logging.WARNING, logger=route_module.__name__):
+        result = chapter_client.post("/chapter-test", data=data, follow_redirects=False)
+
+    assert result.status_code == 303
+    assert result.headers["location"].startswith("/workflows/")
+    workflow_id = result.headers["location"].rsplit("/", 1)[1]
+    duplicate = chapter_client.post("/chapter-test", data=data, follow_redirects=False)
+    assert duplicate.status_code == 409
+    assert bounded_provider.requests == []
+    with chapter_test_app.state.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(NovelProject)) == 1
+        assert session.scalar(select(func.count()).select_from(GenerationWorkflow)) == 1
+        workflow = session.get(GenerationWorkflow, workflow_id)
+        assert workflow is not None and workflow.status == "PLANNING"
+    assert [record.getMessage() for record in caplog.records] == [
+        "chapter_test_setup_cleanup_failed event_id=cleanup-event-123 "
+        "stage=connection_cleanup exception_type=RuntimeError"
+    ]
+    assert all(record.exc_info is None for record in caplog.records)
+    assert sensitive_input not in caplog.text
+    assert "cleanup-secret" not in caplog.text
+    assert "SQL input=" not in caplog.text
+    assert "Traceback" not in caplog.text
 
 
 def test_test_app_existing_workflow_route_rejects_more_than_one_chapter(

@@ -310,11 +310,20 @@ def _create_workflow_atomically(
                     "connection_cleanup", type(error).__name__
                 )
 
-    failure = primary_failure or cleanup_failure
-    if failure is not None:
-        raise failure from None
+    if primary_failure is not None:
+        raise primary_failure from None
     if result is None:
+        if cleanup_failure is not None:
+            raise cleanup_failure from None
         raise ChapterTestSetupFailure("result_validation", "RuntimeError") from None
+    if cleanup_failure is not None:
+        # The outer commit succeeded; cleanup cannot undo the persisted setup.
+        logger.warning(
+            "chapter_test_setup_cleanup_failed event_id=%s stage=%s exception_type=%s",
+            token_urlsafe(12),
+            cleanup_failure.stage,
+            cleanup_failure.exception_type,
+        )
     return result
 
 
