@@ -5,10 +5,12 @@
   <h1>TEST · 单章写作测试</h1>
   <p><strong>这是独立测试数据库，不是正式出版或发布入口。</strong></p>
   <p>数据库位置：<code>{{ database_path }}</code></p>
-  <p><strong>付费调用警告：</strong>只有您在工作流页面明确点击“运行至下一道门”时才会调用 Qwen，可能产生 API 费用；失败步骤最多尝试 2 次，每次都可能计费。</p>
+  <p><strong>付费调用警告：</strong>只有您明确点击“生成章节计划”“生成正文”或继续检查时才会调用 Qwen，可能产生 API 费用；失败步骤最多尝试 2 次，每次都可能计费。</p>
   <p>本测试固定生成 1 章。主笔输出上限为 12000 Token，请求超时为 180 秒；规划、摘要、审核输出上限均为 4000 Token。</p>
   <p>现有确定性校验要求正文逐字包含获批计划里的 goal 与 ending_hook（忽略空白差异）。本入口不会放宽该限制，也不会自动批准计划或章节。</p>
 </aside>
+<ol class="progress" aria-label="创作进度"><li aria-current="step">1 · 确认输入</li><li>2 · 生成计划</li><li>3 · 确认计划</li><li>4 · 生成正文</li><li>5 · 审阅正文</li></ol>
+{% if projects %}<p><a class="button secondary" href="#saved-tests-heading">继续已有测试，不重复创建</a></p>{% endif %}
 
 <section aria-labelledby="setup-heading">
   <h2 id="setup-heading">设置与章节提纲</h2>
@@ -35,7 +37,7 @@
 {% if projects %}
 <section aria-labelledby="saved-tests-heading">
   <h2 id="saved-tests-heading">已创建的测试</h2>
-  <ul>{% for project in projects %}<li><a href="/chapter-test?project_id={{ project.id }}">{{ project.title }}</a>{% if project.active_workflow_id %} · <a href="/workflows/{{ project.active_workflow_id }}">打开工作流</a>{% endif %}</li>{% endfor %}</ul>
+  <ul>{% for project in projects %}<li><a href="/projects/{{ project.id }}">{{ project.title }} · 查看正文与进度</a> · <a href="/chapter-test?project_id={{ project.id }}">已确认输入</a>{% if project.active_workflow_id %} · <a href="/workflows/{{ project.active_workflow_id }}">继续创作</a>{% endif %}</li>{% endfor %}</ul>
 </section>
 {% endif %}
 

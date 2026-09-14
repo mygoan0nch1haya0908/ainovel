@@ -169,13 +169,19 @@ then follow the explicit gates:
 1. Enter the project setting/style, provisional ending, and first-chapter
    outline; check the author confirmation and create the workflow. This setup
    step performs no model call.
-2. On the workflow page, click “运行至下一道门” to generate a plan, inspect it,
+2. On the workflow page, click “生成章节计划” to generate a plan, inspect it,
    and explicitly approve or reject it.
-3. After approval, click “运行至下一道门” again to generate, summarize, and
+3. After approval, click “生成正文” to generate, summarize, and
    review exactly one 4,500–6,000-visible-character candidate chapter.
 4. Read the full candidate body and visible count before using the existing
    candidate-batch approval or rejection controls. Nothing is approved or
    published automatically.
+
+The project page links to a full chapter preview and recent generation history,
+including cancelled workflows. An empty manual batch is labeled as having no
+body; creating it never generates text. Review submission stays disabled until
+all planned chapters meet the existing length checks. Diagnostic, budget, and
+audit details are collapsed; chapter bodies remain visible in the reading view.
 
 The test verifies orchestration, budgets, persistence, validation, and author
 approval boundaries. It makes no claim that actual literary quality has been

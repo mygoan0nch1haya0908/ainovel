@@ -10,14 +10,20 @@
 </aside>
 {% endif %}
 <h1>生成工作流</h1>
+<ol class="progress" aria-label="创作进度">
+{% for label in ["确认输入", "生成计划", "确认计划", "生成正文", "审阅正文"] %}
+<li{% if loop.index0 == progress_step %} aria-current="step"{% elif loop.index0 < progress_step %} class="done"{% endif %}>{{ loop.index }} · {{ label }}</li>
+{% endfor %}
+</ol>
 <section aria-labelledby="workflow-status-heading">
   <h2 id="workflow-status-heading">当前状态</h2>
-  <p><strong>{{ workflow.status }}</strong></p>
+  <p><strong>{{ workflow_labels.get(workflow.status, workflow.status) }}</strong> <span class="muted">{{ workflow.status }}</span></p>
+  {% if workflow.status in ["CANCELLED", "FAILED", "REJECTED"] %}<p class="notice error">本次生成已结束，不会继续自动生成。已有计划和正文（如有）仍保留在此页。请返回项目处理候选批次后，按需创建新任务。</p>{% endif %}
   <p>Provider / 模型：{{ workflow.provider_name }} / {{ workflow.model_name }}</p>
   <p>计划章节：{{ workflow.requested_chapters }}；当前位置：{{ workflow.current_position }}</p>
-  {% if is_paused %}
+  {% if is_paused or workflow.last_error_code %}
   <details open>
-    <summary>暂停原因（需要处理）</summary>
+    <summary>最近的暂停 / 失败原因</summary>
     <p>错误类别：{{ workflow.last_error_code or "未分类" }}</p>
     <p>{{ workflow.last_error_detail or "没有可公开的详细信息" }}</p>
   </details>
@@ -29,12 +35,14 @@
   {% if can_run %}
   <form action="/workflows/{{ workflow.id }}/run" method="post">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <button type="submit">运行至下一道门</button>
+    <button type="submit">{{ run_label }}</button>
   </form>
+  <p class="muted">点击后运行至下一次作者确认；模型调用可能收费，请等待响应，不要重复提交。</p>
   {% elif workflow.status == "AWAITING_PLAN_APPROVAL" %}
-  <form action="/workflows/{{ workflow.id }}/plan/approve" method="post" data-confirm="确认批准此计划并开始按顺序生成章节？">
+  <p>请先阅读下方计划。确认计划不会调用模型，之后还需点击“生成正文”。</p>
+  <form action="/workflows/{{ workflow.id }}/plan/approve" method="post" data-confirm="确认采用下方计划？此操作不会调用模型。">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <button type="submit">批准计划</button>
+    <button type="submit">确认计划（不会调用模型）</button>
   </form>
   <form action="/workflows/{{ workflow.id }}/plan/reject" method="post" data-confirm="确认驳回此计划？">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -44,7 +52,7 @@
   {% elif can_resume %}
   <form action="/workflows/{{ workflow.id }}/resume" method="post">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <button type="submit">恢复工作流</button>
+    <button type="submit">恢复工作流（恢复后再手动运行）</button>
   </form>
   {% elif workflow.status == "AWAITING_CONTENT_APPROVAL" or (is_paused and candidate_batch_id) %}
   <p>候选批次已准备好，等待作者审批。</p>
@@ -56,7 +64,8 @@
   <p>当前状态没有可用的作者操作。</p>
   {% endif %}
   {% if candidate_batch_id %}
-  <p><a href="/projects/{{ project.id }}#batch-{{ candidate_batch_id }}">前往候选批次审批</a></p>
+  <p><a class="button secondary" href="/batches/{{ candidate_batch_id }}">查看正文并审阅批次</a></p>
+  <p><a href="/projects/{{ project.id }}#batch-{{ candidate_batch_id }}">返回项目批次列表</a></p>
   {% endif %}
   {% if can_cancel %}
   <form action="/workflows/{{ workflow.id }}/cancel" method="post" data-confirm="确认取消此暂停工作流？工件与审计将保留，项目可重新启动生成。">
@@ -73,6 +82,12 @@
 </section>
 {% endif %}
 
+{% if not candidate_chapters %}
+<section class="empty-state"><h2>尚未生成正文</h2><p>计划不等于正文。请根据上方“下一步”操作；若已暂停或取消，请先查看状态和原因。</p></section>
+{% else %}
+<p><a class="button secondary" href="#candidate-chapters-heading">阅读已生成正文 · {{ candidate_chapters | length }} 章</a></p>
+{% endif %}
+<details><summary>Token 预算与实际用量</summary>
 <section aria-labelledby="budget-heading">
   <h2 id="budget-heading">预算与实际用量</h2>
   <table>
@@ -86,6 +101,7 @@
   </table>
   <p>累计实际输入 Token：{{ workflow.actual_input_tokens }}；累计实际输出 Token：{{ workflow.actual_output_tokens }}</p>
 </section>
+</details>
 
 {% if review_issues %}
 <section aria-labelledby="review-heading"><h2 id="review-heading">审核问题</h2><ul>{% for issue in review_issues %}<li>{{ issue }}</li>{% endfor %}</ul></section>

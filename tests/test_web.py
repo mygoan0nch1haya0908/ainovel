@@ -1,5 +1,8 @@
 import re
 
+from sqlalchemy import func, select
+from ainovel.models.workflow import ModelAttempt
+
 from fastapi.testclient import TestClient
 
 from ainovel.services.batches import BatchService
@@ -13,6 +16,47 @@ def _csrf_token(client: TestClient, path: str = "/") -> str:
     match = re.search(r'name="csrf_token" value="([^"]+)"', response.text)
     assert match is not None
     return match.group(1)
+
+
+def test_empty_batch_has_readable_empty_state_and_disabled_review(client, session, project, official_outline):
+    batch = BatchService(session).create(project.id, official_outline.id, 1)
+    page = client.get(f"/projects/{project.id}")
+    assert f'href="/batches/{batch.id}"' in page.text
+    form = re.search(rf'<form action="/batches/{batch.id}/ready".*?</form>', page.text, re.S)
+    assert form and re.search(r'<button[^>]*disabled', form.group())
+    preview = client.get(f"/batches/{batch.id}")
+    assert preview.status_code == 200
+    assert '尚未生成正文' in preview.text
+    assert session.scalar(select(func.count()).select_from(ModelAttempt)) == 0
+    rejected = client.post(f"/batches/{batch.id}/ready", data={"csrf_token": _csrf_token(client)}, follow_redirects=False)
+    assert rejected.status_code == 422
+    session.expire_all()
+    assert BatchService(session).get(batch.id).status == 'draft'
+
+
+def test_batch_preview_renders_escaped_body_and_enables_complete_review(client, session, project, official_outline):
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 1)
+    body = '<script>alert(1)</script>' + '甲' * 4500
+    service.save_candidate_chapter(batch.id, 1, '<b>章节</b>', body, {})
+    page = client.get(f"/batches/{batch.id}")
+    assert page.status_code == 200
+    assert '&lt;script&gt;alert(1)&lt;/script&gt;' in page.text
+    assert '<script>alert(1)</script>' not in page.text
+    assert '甲' * 4500 in page.text
+    form = re.search(rf'<form action="/batches/{batch.id}/ready".*?</form>', page.text, re.S)
+    assert form and 'disabled' not in form.group()
+    assert client.get('/batches/missing').status_code == 404
+
+
+def test_incomplete_batch_keeps_review_disabled(client, session, project, official_outline):
+    service = BatchService(session)
+    batch = service.create(project.id, official_outline.id, 2)
+    service.save_candidate_chapter(batch.id, 1, '第一章', '甲' * 4500, {})
+    page = client.get(f"/batches/{batch.id}")
+    assert page.status_code == 200
+    form = re.search(rf'<form action="/batches/{batch.id}/ready".*?</form>', page.text, re.S)
+    assert form and re.search(r'<button[^>]*disabled', form.group())
 
 
 def test_every_mutation_rejects_a_missing_csrf_token(client: TestClient) -> None:

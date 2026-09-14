@@ -5,10 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}AI 小说工作台{% endblock %}</title>
   <script src="/static/app.js" defer></script>
+  <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-  <header><p><a href="/">AI 小说工作台</a></p></header>
-  {% if error %}<p role="status">{{ error }}</p>{% else %}<p role="status">本地优先，您的数据保留在此环境中。</p>{% endif %}
-  <main>{% block content %}{% endblock %}</main>
+  <a class="skip-link" href="#main-content">跳至主要内容</a>
+  <header class="site-header"><a class="brand" href="/">AI 小说工作台</a><span>把创意写成长篇</span></header>
+  {% if error %}<p class="notice error" role="alert">{{ error }}</p>{% else %}<p class="notice" role="status">本地工作区 · 生成与审批由您确认</p>{% endif %}
+  <main id="main-content">{% block content %}{% endblock %}</main>
 </body>
 </html>

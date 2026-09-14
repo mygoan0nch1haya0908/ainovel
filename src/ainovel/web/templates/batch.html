@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}正文预览 · {{ project.title }}{% endblock %}
+{% block content %}
+<p><a href="/projects/{{ project.id }}">← 返回项目与生成记录</a></p>
+<h1>正文预览</h1>
+<p>{{ project.title }} · 批次 {{ batch.sequence_number }} <span class="badge">{{ batch_status_labels[batch.status] }}</span></p>
+<p>已保存 {{ info.count }} / {{ batch.planned_chapters }} 章。候选正文不等于已发布正文。</p>
+{% if source_workflow %}<p><a href="/workflows/{{ source_workflow.id }}">查看生成过程、计划与问题</a> · {{ workflow_labels.get(source_workflow.status, source_workflow.status) }}</p>{% endif %}
+{% if chapters %}
+<nav aria-label="章节目录">{% for chapter in chapters %}<a href="#chapter-{{ chapter.id }}">第 {{ chapter.ordinal }} 章 · {{ chapter.title }}</a> {% endfor %}</nav>
+{% for chapter in chapters %}
+<article class="reading-card" id="chapter-{{ chapter.id }}">
+  <h2>第 {{ chapter.ordinal }} 章 · {{ chapter.title }}</h2>
+  <p class="muted">可见字数：{{ chapter.visible_char_count }}</p>
+  <div class="chapter-body">{{ chapter.body }}</div>
+</article>
+{% endfor %}
+{% else %}
+<section class="empty-state"><h2>尚未生成正文</h2>
+  <p>“草稿”只是批次状态。这个批次还没有保存章节内容，不能提交审批。</p>
+  {% if not source_workflow %}<p>这是手动创建的空批次，不会自动调用 AI。请返回项目查看生成记录；如不需要此空批次，可由您驳回后再启动生成。</p>{% endif %}
+  <a class="button secondary" href="/projects/{{ project.id }}#workflow-heading">查看生成状态与下一步</a>
+</section>
+{% endif %}
+<section><h2>审阅操作</h2>{% include "_batch_actions.html" %}</section>
+{% endblock %}

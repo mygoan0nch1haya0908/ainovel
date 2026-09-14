@@ -24,6 +24,7 @@ from ainovel.services.workflows import (
 )
 from ainovel.web.routes import _project_page, templates
 from ainovel.web.security import csrf_token, require_csrf
+from ainovel.web.presentation import WORKFLOW_LABELS, RUN_LABELS
 
 
 router = APIRouter()
@@ -106,6 +107,13 @@ def _workflow_context(
     return {
         "request": request,
         "workflow": workflow,
+        "workflow_labels": WORKFLOW_LABELS,
+        "run_label": RUN_LABELS.get(workflow.status, "继续生成"),
+        "progress_step": (
+            4 if workflow.status in {"AWAITING_CONTENT_APPROVAL", "COMPLETED"}
+            else 3 if any(decision.decision == "approved" for decision in decisions)
+            else 2 if plan_chapters else 1
+        ),
         "project": project,
         "steps": steps,
         "attempt_rows": [

@@ -4,6 +4,9 @@
 <h1>{{ summary.project.title }}</h1>
 {% if chapter_test_mode %}<p><strong>TEST：</strong>此项目位于独立测试数据库，不代表发布。<a href="/chapter-test?project_id={{ summary.project.id }}">查看已确认测试输入</a></p>{% endif %}
 <p>目标字数：{{ summary.project.target_chars_min }} 至 {{ summary.project.target_chars_max }}</p>
+<nav aria-label="项目快捷入口"><a href="#workflow-heading">继续创作</a><a href="#batches-heading">查看正文</a><a href="#history-heading">生成记录</a></nav>
+{% if active_workflow %}<aside><strong>下一步：</strong>进入生成页面查看当前进度。<p><a class="button" href="/workflows/{{ active_workflow.id }}">继续创作 · {{ workflow_labels.get(active_workflow.status, active_workflow.status) }}</a></p></aside>
+{% elif summary.project.active_batch_id %}<aside><strong>当前有候选批次待处理。</strong><p><a class="button" href="/batches/{{ summary.project.active_batch_id }}">查看正文与批次状态</a></p><p>创建批次不等于生成正文；空批次需要您主动驳回后，才能重新启动生成。</p></aside>{% endif %}
 <section aria-labelledby="versions-heading"><h2 id="versions-heading">当前版本</h2>
   <p>创作宪法：{% if summary.current_constitution_version_number %}v{{ summary.current_constitution_version_number }}{% else %}尚未确认{% endif %}</p>
   <p>官方大纲：{% if official_outline %}v{{ official_outline.version_number }}{% else %}尚未确认{% endif %}</p>
@@ -13,7 +16,7 @@
 </section>
 <section aria-labelledby="workflow-heading"><h2 id="workflow-heading">模型生成工作流</h2>
 {% if active_workflow %}
-  <p>活动工作流：<a href="/workflows/{{ active_workflow.id }}">{{ active_workflow.status }}</a></p>
+  <p>活动工作流：<a href="/workflows/{{ active_workflow.id }}">{{ workflow_labels.get(active_workflow.status, active_workflow.status) }}</a></p>
 {% elif summary.project.active_batch_id %}
   <p>当前候选批次完成审批后才能启动新的生成工作流。</p>
 {% elif official_outline and summary.current_constitution_version_number %}
@@ -23,12 +26,17 @@
     <p><label for="model_name">模型名称</label><input id="model_name" name="model_name" value="demo" required></p>
     <p><label for="requested_chapters">计划章节数{% if chapter_test_mode %}（固定为 1）{% else %}（1 至 5）{% endif %}</label><input id="requested_chapters" name="requested_chapters" type="number" min="1" max="{% if chapter_test_mode %}1{% else %}5{% endif %}" value="1" required{% if chapter_test_mode %} readonly{% endif %}></p>
     <p>预算上限：规划 16000/4000，主笔 32000/12000，摘要 16000/4000，审核 32000/{% if chapter_test_mode %}4000{% else %}6000{% endif %}（输入/输出 Token）。</p>
-    <button type="submit">启动工作流</button>
+    <p>此步骤只建立生成任务，不调用模型。进入下一页后再点击生成计划。</p>
+    <button type="submit">创建生成任务</button>
   </form>
 {% else %}
   <p>请先确认创作宪法和官方大纲后再启动生成工作流。</p>
 {% endif %}
 </section>
+<section aria-labelledby="history-heading"><h2 id="history-heading">最近生成记录</h2>
+{% if workflow_history %}<ul>{% for item in workflow_history %}<li><a href="/workflows/{{ item.id }}">查看计划 / 正文 / 失败原因</a><span class="badge">{{ workflow_labels.get(item.status, item.status) }}</span> · {{ item.model_name }}</li>{% endfor %}</ul>{% else %}<p>尚未启动过生成任务。</p>{% endif %}
+</section>
+<details{% if diagnostic %} open{% endif %}><summary>模型配置与诊断</summary>
 <section aria-labelledby="diagnostic-heading"><h2 id="diagnostic-heading">Provider 诊断</h2>
   <form action="/projects/{{ summary.project.id }}/providers/diagnose" method="post">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -38,18 +46,25 @@
   </form>
   {% if diagnostic %}<p>{{ diagnostic.message }}</p>{% if diagnostic.models %}<p>可用模型：{{ diagnostic.models | join(", ") }}</p>{% endif %}{% endif %}
 </section>
+ </details>
+<details><summary>高级操作：手动创建空批次（不会生成正文）</summary>
 <section aria-labelledby="batch-create-heading"><h2 id="batch-create-heading">创建候选批次</h2>
+<p>这是管理已有候选内容的操作，不是 AI 生成入口。请优先使用上方的“继续创作”。</p>
 {% if official_outline and not summary.project.active_batch_id and not summary.project.active_workflow_id %}<form action="/projects/{{ summary.project.id }}/batches" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><p><label for="planned_chapters">计划章节数（1 至 5）</label><input id="planned_chapters" name="planned_chapters" type="number" min="1" max="5" required></p><button type="submit">创建候选批次</button></form>{% elif not official_outline %}<p>请先创建并确认官方大纲后再创建批次。</p>{% else %}<p>项目已有活动工作流或候选批次。</p>{% endif %}
 </section>
+ </details>
 <section aria-labelledby="batches-heading"><h2 id="batches-heading">候选批次</h2>
-{% if batches %}<ul>{% for batch in batches %}<li id="batch-{{ batch.id }}">
+{% if batches %}<ul class="batch-list">{% for batch in batches %}<li id="batch-{{ batch.id }}">
+{% set info = batch_info[batch.id] %}
 <p>批次 {{ batch.id }}：{{ batch.planned_chapters }} 章，状态：{{ batch_status_labels[batch.status] }}</p>
-{% if batch.status == "draft" %}<form action="/batches/{{ batch.id }}/ready" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">提交审批</button></form>{% endif %}
-{% if batch.status == "ready_for_review" %}<form action="/batches/{{ batch.id }}/approve" method="post" data-confirm="确认批准此批次？"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">批准</button></form>{% endif %}
-{% if batch.status in ["draft", "ready_for_review"] %}<form action="/batches/{{ batch.id }}/reject" method="post" data-confirm="确认驳回此批次？"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><p><label for="reason-{{ batch.id }}">驳回原因</label><input id="reason-{{ batch.id }}" name="reason" required></p><button type="submit">驳回</button></form>{% endif %}
+<p>正文：{{ info.count }} / {{ batch.planned_chapters }} 章{% if info.count == 0 %} · 尚未生成正文{% endif %}</p>
+<p><a class="button secondary" href="/batches/{{ batch.id }}">查看正文 / 空稿说明</a></p>
+{% include "_batch_actions.html" %}
 </li>{% endfor %}</ul>{% else %}<p>暂无候选批次</p>{% endif %}
 </section>
+<details><summary>审计记录（操作历史）</summary>
 <section aria-labelledby="audit-heading"><h2 id="audit-heading">审计记录</h2>
 {% if audit_events %}<ol>{% for event in audit_events %}<li>{{ audit_action_labels.get(event.action, event.action) }}（{{ event.actor }}）</li>{% endfor %}</ol>{% else %}<p>暂无审计记录</p>{% endif %}
 </section>
+</details>
 {% endblock %}

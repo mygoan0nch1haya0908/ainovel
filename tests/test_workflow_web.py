@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from html import unescape
+from html.parser import HTMLParser
 import re
 from uuid import uuid4
 
@@ -149,6 +150,65 @@ def post_workflow_action(
         },
         follow_redirects=False,
     )
+
+
+def test_workflow_uses_stage_specific_actions_and_empty_preview(client, workflow):
+    page = client.get(f'/workflows/{workflow.id}')
+    assert 'aria-label="创作进度"' in page.text
+    assert '生成章节计划</button>' in page.text
+    assert '尚未生成正文' in page.text
+    post_workflow_action(client, workflow.id, 'run')
+    page = client.get(f'/workflows/{workflow.id}')
+    assert '确认计划（不会调用模型）</button>' in page.text
+    post_workflow_action(client, workflow.id, 'plan/approve')
+    page = client.get(f'/workflows/{workflow.id}')
+    assert '生成正文</button>' in page.text
+
+
+def test_cancelled_workflow_remains_accessible_from_project(client, session, workflow):
+    workflow.status = 'CANCELLED'
+    workflow.last_error_code = 'provider_protocol'
+    project = session.get(NovelProject, workflow.project_id)
+    project.active_workflow_id = None
+    session.commit()
+    page = client.get(f'/projects/{project.id}')
+    assert f'href="/workflows/{workflow.id}"' in page.text
+    assert '已取消' in page.text
+    detail = client.get(f'/workflows/{workflow.id}')
+    assert '已取消' in detail.text
+    assert 'provider_protocol' in detail.text
+    assert f'action="/workflows/{workflow.id}/run"' not in detail.text
+
+
+class DetailsVisibility(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.closed_details = []
+        self.candidate_hidden = None
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag == 'details':
+            self.closed_details.append('open' not in attributes)
+        if attributes.get('aria-labelledby') == 'candidate-chapters-heading':
+            self.candidate_hidden = any(self.closed_details)
+
+    def handle_endtag(self, tag):
+        if tag == 'details':
+            self.closed_details.pop()
+
+
+def test_workflow_body_is_not_hidden_inside_budget_details(client, workflow):
+    empty = DetailsVisibility()
+    empty.feed(client.get(f'/workflows/{workflow.id}').text)
+    assert empty.closed_details == []
+    post_workflow_action(client, workflow.id, 'run')
+    post_workflow_action(client, workflow.id, 'plan/approve')
+    post_workflow_action(client, workflow.id, 'run')
+    generated = DetailsVisibility()
+    generated.feed(client.get(f'/workflows/{workflow.id}').text)
+    assert generated.candidate_hidden is False
+    assert generated.closed_details == []
 
 
 def create_ready_project(session_factory, title: str) -> str:
