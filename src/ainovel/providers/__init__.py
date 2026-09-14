@@ -10,6 +10,7 @@ from ainovel.providers.contracts import (
     ProviderTimeout,
     ProviderUnavailable,
 )
+from ainovel.providers.qwen import QwenProvider
 
 __all__ = [
     "ModelProvider",
@@ -22,4 +23,5 @@ __all__ = [
     "ProviderProtocolError",
     "ProviderTimeout",
     "ProviderUnavailable",
+    "QwenProvider",
 ]

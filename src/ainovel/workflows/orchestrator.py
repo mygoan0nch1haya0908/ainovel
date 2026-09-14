@@ -5,6 +5,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
+from math import isfinite
 import re
 from typing import Any
 from uuid import uuid4
@@ -127,7 +128,17 @@ class WorkflowOrchestrator:
         *,
         clock: Clock | None = None,
         worker_id: str | None = None,
+        request_timeout_seconds: float = 60.0,
     ) -> None:
+        if (
+            isinstance(request_timeout_seconds, bool)
+            or not isinstance(request_timeout_seconds, (int, float))
+            or not isfinite(request_timeout_seconds)
+            or not 0 < request_timeout_seconds < 300
+        ):
+            raise ValueError(
+                "request timeout must be positive and below the 300-second claim lease"
+            )
         self._session_factory = session_factory
         self._registry = provider_registry
         self._runner = runner
@@ -135,6 +146,7 @@ class WorkflowOrchestrator:
         self._prompt_service_factory = prompt_service
         self._clock = clock or SystemClock()
         self._worker_id = worker_id or f"orchestrator-{uuid4()}"
+        self._request_timeout_seconds = float(request_timeout_seconds)
         self._providers: dict[tuple[str, str, str], ModelProvider] = {}
         self._attempt_responses: dict[str, ModelResponse] = {}
         self._attempt_validations: dict[str, dict[str, object]] = {}
@@ -510,7 +522,7 @@ class WorkflowOrchestrator:
             output_schema=deepcopy(snapshot.output_schema),
             max_input_tokens=input_capacity,
             max_output_tokens=output_tokens,
-            timeout_seconds=60.0,
+            timeout_seconds=self._request_timeout_seconds,
             metadata={
                 "agent_role": _ROLE_BY_STEP[step.kind],
                 "schema_name": _SCHEMA_NAME_BY_STEP[step.kind],

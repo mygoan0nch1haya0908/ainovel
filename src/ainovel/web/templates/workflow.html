@@ -2,6 +2,13 @@
 {% block title %}工作流 {{ workflow.id }} · AI 小说工作台{% endblock %}
 {% block content %}
 <p><a href="/projects/{{ project.id }}">返回项目：{{ project.title }}</a></p>
+{% if chapter_test_mode %}
+<aside aria-label="单章测试提示">
+  <p><strong>TEST · 单章写作测试</strong></p>
+  <p>这是独立测试数据库中的候选内容，不是已发布正文，也不会自动发布。</p>
+  <p><a href="/chapter-test?project_id={{ project.id }}">返回测试设置并查看已确认输入</a></p>
+</aside>
+{% endif %}
 <h1>生成工作流</h1>
 <section aria-labelledby="workflow-status-heading">
   <h2 id="workflow-status-heading">当前状态</h2>
@@ -82,6 +89,19 @@
 
 {% if review_issues %}
 <section aria-labelledby="review-heading"><h2 id="review-heading">审核问题</h2><ul>{% for issue in review_issues %}<li>{{ issue }}</li>{% endfor %}</ul></section>
+{% endif %}
+
+{% if candidate_chapters %}
+<section aria-labelledby="candidate-chapters-heading">
+  <h2 id="candidate-chapters-heading">候选章节正文</h2>
+  {% for chapter in candidate_chapters %}
+  <article>
+    <h3>第 {{ chapter.ordinal }} 章 · {{ chapter.title }}</h3>
+    <p>可见字符：{{ chapter.visible_char_count }}</p>
+    <div class="chapter-body" style="white-space: pre-wrap">{{ chapter.body }}</div>
+  </article>
+  {% endfor %}
+</section>
 {% endif %}
 
 <details>

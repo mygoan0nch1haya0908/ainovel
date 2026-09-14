@@ -90,6 +90,18 @@ def _workflow_context(
         issues = artifact.payload.get("issues", [])
         if isinstance(issues, list):
             review_issues.extend(issue for issue in issues if isinstance(issue, str))
+    candidate_chapters = [
+        {
+            "title": artifact.payload.get("title", ""),
+            "body": artifact.payload.get("body", artifact.text_content or ""),
+            "visible_char_count": artifact.visible_char_count,
+            "ordinal": artifact.ordinal,
+        }
+        for artifact in artifacts
+        if artifact.kind == "chapter_draft"
+        and isinstance(artifact.payload.get("title"), str)
+        and isinstance(artifact.payload.get("body", artifact.text_content), str)
+    ]
 
     return {
         "request": request,
@@ -105,6 +117,7 @@ def _workflow_context(
         "decisions": decisions,
         "plan_chapters": plan_chapters,
         "review_issues": review_issues,
+        "candidate_chapters": candidate_chapters,
         "csrf_token": csrf_token(request),
         "can_run": workflow.status in EXECUTABLE_WORKFLOW_STATUSES,
         "can_resume": can_resume,
@@ -116,6 +129,9 @@ def _workflow_context(
             )
         ),
         "is_paused": workflow.status.startswith("PAUSED_"),
+        "chapter_test_mode": bool(
+            getattr(request.app.state, "chapter_test_mode", False)
+        ),
     }
 
 
@@ -180,6 +196,11 @@ def create_workflow(
         return _project_page(
             request, session, project_id, "计划章节数必须是整数", 422
         )
+    required_count = getattr(request.app.state, "required_workflow_chapters", None)
+    if required_count is not None and count != required_count:
+        return _project_page(
+            request, session, project_id, "单章测试仅允许生成 1 章", 422
+        )
     if not request.app.state.provider_registry.contains(provider_name):
         return _project_page(request, session, project_id, "Provider 未配置", 422)
     try:
@@ -188,7 +209,7 @@ def create_workflow(
             provider_name,
             model_name,
             count,
-            DEFAULT_BUDGETS,
+            getattr(request.app.state, "workflow_budgets", DEFAULT_BUDGETS),
         )
     except (ValueError, PermissionError) as error:
         return _project_page(

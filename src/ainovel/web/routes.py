@@ -47,6 +47,9 @@ def _project_context(request: Request, session: Session, project_id: str) -> dic
         "statistics": batches.official_chapter_statistics(project_id),
         "audit_events": batches.list_audit_events(project_id),
         "active_workflow": active_workflow,
+        "chapter_test_mode": bool(
+            getattr(request.app.state, "chapter_test_mode", False)
+        ),
         "batch_status_labels": BATCH_STATUS_LABELS, "audit_action_labels": AUDIT_ACTION_LABELS,
     }
 

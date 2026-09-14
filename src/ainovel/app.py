@@ -19,6 +19,7 @@ from ainovel.db import create_engine_for_url, create_session_factory, database_r
 from ainovel.providers.demo import DemoFakeProvider
 from ainovel.providers.ollama import OllamaProvider
 from ainovel.providers.openai import OpenAIProvider
+from ainovel.providers.qwen import QwenProvider
 from ainovel.providers.registry import ProviderRegistry
 from ainovel.workflows.orchestrator import WorkflowOrchestrator
 
@@ -41,7 +42,12 @@ def _loopback_provider_url(value: str) -> str:
     return value.rstrip("/")
 
 
-def _default_provider_registry(settings: Settings) -> ProviderRegistry:
+def _default_provider_registry(
+    settings: Settings,
+    *,
+    qwen_context_window_ceiling: int = PROVIDER_CONTEXT_WINDOW_CEILING,
+    qwen_output_token_ceiling: int = PROVIDER_OUTPUT_TOKEN_CEILING,
+) -> ProviderRegistry:
     ollama_base_url = _loopback_provider_url(settings.ollama_base_url)
     api_key = (
         settings.openai_api_key.get_secret_value()
@@ -49,6 +55,11 @@ def _default_provider_registry(settings: Settings) -> ProviderRegistry:
         else None
     )
     allow_openai = bool(settings.allow_real_openai and api_key)
+    qwen_api_key = (
+        settings.qwen_api_key.get_secret_value()
+        if settings.qwen_api_key is not None
+        else None
+    )
 
     def ollama_provider() -> OllamaProvider:
         return OllamaProvider(
@@ -75,11 +86,26 @@ def _default_provider_registry(settings: Settings) -> ProviderRegistry:
             max_output_tokens_limit=PROVIDER_OUTPUT_TOKEN_CEILING,
         )
 
+    def qwen_provider() -> QwenProvider:
+        return QwenProvider(
+            OpenAI(
+                api_key=qwen_api_key or "not-configured",
+                base_url=settings.qwen_base_url,
+                timeout=settings.provider_timeout_seconds,
+                max_retries=0,
+            ),
+            allow_real_calls=settings.allow_real_qwen,
+            context_window_limit=qwen_context_window_ceiling,
+            max_output_tokens_limit=qwen_output_token_ceiling,
+            api_key_configured=bool(qwen_api_key),
+        )
+
     return ProviderRegistry(
         {
             "fake": DemoFakeProvider,
             "ollama": ollama_provider,
             "openai": openai_provider,
+            "qwen": qwen_provider,
         }
     )
 
@@ -87,6 +113,8 @@ def _default_provider_registry(settings: Settings) -> ProviderRegistry:
 def create_app(
     database_url: str | None = None,
     provider_registry: ProviderRegistry | None = None,
+    *,
+    orchestrator_request_timeout_seconds: float = 60.0,
 ) -> FastAPI:
     settings = Settings(database_url=database_url) if database_url else Settings()
 
@@ -106,6 +134,7 @@ def create_app(
         app.state.session_factory,
         app.state.provider_registry,
         AgentRunner(),
+        request_timeout_seconds=orchestrator_request_timeout_seconds,
     )
     app.state.orchestrator_factory = lambda: orchestrator
     app.state.csrf_signer = URLSafeSerializer(session_secret, salt="ainovel-csrf")
