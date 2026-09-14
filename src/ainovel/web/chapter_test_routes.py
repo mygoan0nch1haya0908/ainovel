@@ -225,6 +225,8 @@ def _create_workflow_atomically(
     transaction = None
     session = None
     stage = "connect"
+    primary_failure = None
+    result = None
     try:
         connection = request.app.state.engine.connect()
         stage = "transaction_begin"
@@ -278,16 +280,42 @@ def _create_workflow_atomically(
         session = None
         stage = "transaction_commit"
         transaction.commit()
-        return project_id, workflow_id
+        result = (project_id, workflow_id)
     except Exception as error:
-        raise ChapterTestSetupFailure(stage, type(error).__name__) from None
-    finally:
-        if session is not None:
+        primary_failure = ChapterTestSetupFailure(stage, type(error).__name__)
+
+    cleanup_failure = None
+    if session is not None:
+        try:
             session.close()
-        if transaction is not None and transaction.is_active:
-            transaction.rollback()
-        if connection is not None:
+        except Exception as error:
+            cleanup_failure = ChapterTestSetupFailure(
+                "session_cleanup", type(error).__name__
+            )
+    if transaction is not None:
+        try:
+            if transaction.is_active:
+                transaction.rollback()
+        except Exception as error:
+            if cleanup_failure is None:
+                cleanup_failure = ChapterTestSetupFailure(
+                    "transaction_rollback", type(error).__name__
+                )
+    if connection is not None:
+        try:
             connection.close()
+        except Exception as error:
+            if cleanup_failure is None:
+                cleanup_failure = ChapterTestSetupFailure(
+                    "connection_cleanup", type(error).__name__
+                )
+
+    failure = primary_failure or cleanup_failure
+    if failure is not None:
+        raise failure from None
+    if result is None:
+        raise ChapterTestSetupFailure("result_validation", "RuntimeError") from None
+    return result
 
 
 def _setup_failure_response(

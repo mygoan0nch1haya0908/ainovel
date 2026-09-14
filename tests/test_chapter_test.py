@@ -534,6 +534,163 @@ def test_busy_setup_releases_connection_without_partial_state(
             assert session.scalar(select(func.count()).select_from(NovelProject)) == 0
 
 
+def atomic_setup_values() -> dict[str, str]:
+    return {
+        "project_title": "cleanup test",
+        "setting_style": "style",
+        "provisional_ending": "ending",
+        "chapter_outline": "outline",
+        "chapter_title": "title",
+        "chapter_goal": "goal",
+        "chapter_hook": "hook",
+        "model_name": "qwen-flash",
+        "author_confirm": "yes",
+    }
+
+
+def install_atomic_setup_fakes(
+    route_module,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    workflow_error: Exception | None = None,
+    cleanup_errors: set[str] | None = None,
+) -> tuple[SimpleNamespace, list[str]]:
+    events: list[str] = []
+    failures = cleanup_errors or set()
+
+    class FakeTransaction:
+        is_active = True
+
+        def commit(self) -> None:
+            events.append("transaction_commit")
+            self.is_active = False
+
+        def rollback(self) -> None:
+            events.append("transaction_rollback")
+            self.is_active = False
+            if "transaction_rollback" in failures:
+                raise RuntimeError("rollback Authorization: Bearer cleanup-secret")
+
+    transaction = FakeTransaction()
+
+    class FakeConnection:
+        dialect = SimpleNamespace(name="postgresql")
+
+        def begin(self):
+            events.append("transaction_begin")
+            return transaction
+
+        def close(self) -> None:
+            events.append("connection_close")
+            if "connection_close" in failures:
+                raise RuntimeError("close X-Api-Key: cleanup-secret")
+
+    connection = FakeConnection()
+
+    class FakeEngine:
+        def connect(self):
+            events.append("connect")
+            return connection
+
+    class FakeSession:
+        def close(self) -> None:
+            events.append("session_close")
+            if "session_close" in failures:
+                raise RuntimeError("session author-private-input")
+
+    class FakeProjectService:
+        def __init__(self, _session) -> None:
+            pass
+
+        def create(self, *_args):
+            return SimpleNamespace(id="project-id")
+
+        def add_constitution(self, *_args, **_kwargs) -> None:
+            pass
+
+    class FakeOutlineService:
+        def __init__(self, _session) -> None:
+            pass
+
+        def create_candidate(self, *_args, **_kwargs):
+            return SimpleNamespace(id="outline-id")
+
+        def approve(self, _outline_id: str) -> None:
+            pass
+
+    class FakeWorkflowService:
+        def __init__(self, _session) -> None:
+            pass
+
+        def start(self, *_args):
+            if workflow_error is not None:
+                raise workflow_error
+            return SimpleNamespace(id="workflow-id")
+
+    monkeypatch.setattr(route_module, "Session", lambda **_kwargs: FakeSession())
+    monkeypatch.setattr(route_module, "ProjectService", FakeProjectService)
+    monkeypatch.setattr(route_module, "OutlineService", FakeOutlineService)
+    monkeypatch.setattr(route_module, "WorkflowService", FakeWorkflowService)
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                engine=FakeEngine(),
+                workflow_budgets=route_module.WorkflowBudgets(),
+            )
+        )
+    )
+    return request, events
+
+
+def test_cleanup_failures_do_not_replace_primary_stage_and_all_cleanup_is_attempted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ainovel.web.chapter_test_routes as route_module
+
+    request, events = install_atomic_setup_fakes(
+        route_module,
+        monkeypatch,
+        workflow_error=ValueError("Authorization: Bearer primary-secret"),
+        cleanup_errors={"session_close", "transaction_rollback", "connection_close"},
+    )
+
+    with pytest.raises(route_module.ChapterTestSetupFailure) as raised:
+        route_module._create_workflow_atomically(request, atomic_setup_values())
+
+    assert raised.value.stage == "workflow_start"
+    assert raised.value.exception_type == "ValueError"
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None
+    assert events[-3:] == [
+        "session_close",
+        "transaction_rollback",
+        "connection_close",
+    ]
+    assert "secret" not in str(raised.value)
+
+
+def test_standalone_connection_cleanup_failure_uses_safe_fixed_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ainovel.web.chapter_test_routes as route_module
+
+    request, events = install_atomic_setup_fakes(
+        route_module,
+        monkeypatch,
+        cleanup_errors={"connection_close"},
+    )
+
+    with pytest.raises(route_module.ChapterTestSetupFailure) as raised:
+        route_module._create_workflow_atomically(request, atomic_setup_values())
+
+    assert raised.value.stage == "connection_cleanup"
+    assert raised.value.exception_type == "RuntimeError"
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None
+    assert events[-3:] == ["session_close", "transaction_commit", "connection_close"]
+    assert "cleanup-secret" not in str(raised.value)
+
+
 def test_test_app_existing_workflow_route_rejects_more_than_one_chapter(
     chapter_client: TestClient,
     chapter_test_app,
