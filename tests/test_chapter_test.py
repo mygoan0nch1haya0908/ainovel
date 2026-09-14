@@ -468,7 +468,7 @@ def test_workflow_start_failure_rolls_back_entire_setup(
 
     def fail_after_start(self, *args, **kwargs):
         original_start(self, *args, **kwargs)
-        raise RuntimeError(f"{sensitive_error}; input={sensitive_input}")
+        raise ValueError(f"{sensitive_error}; input={sensitive_input}")
 
     monkeypatch.setattr(route_module.WorkflowService, "start", fail_after_start)
     monkeypatch.setattr(route_module, "token_urlsafe", lambda _size: "setup-event-123")
@@ -484,8 +484,9 @@ def test_workflow_start_failure_rolls_back_entire_setup(
     messages = [record.getMessage() for record in caplog.records]
     assert messages == [
         "chapter_test_setup_failed event_id=setup-event-123 "
-        "exception_type=RuntimeError"
+        "stage=workflow_start exception_type=ValueError"
     ]
+    assert "Traceback" not in caplog.text
     assert sensitive_error not in caplog.text
     assert sensitive_input not in caplog.text
     assert bounded_provider.requests == []

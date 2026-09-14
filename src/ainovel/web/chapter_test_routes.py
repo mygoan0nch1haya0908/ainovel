@@ -43,6 +43,13 @@ FIELD_LABELS = {
 }
 
 
+class ChapterTestSetupFailure(RuntimeError):
+    def __init__(self, stage: str, exception_type: str) -> None:
+        self.stage = stage
+        self.exception_type = exception_type
+        super().__init__("chapter test setup failed")
+
+
 def _empty_form() -> dict[str, str]:
     return {
         "project_title": "",
@@ -217,37 +224,47 @@ def _create_workflow_atomically(
     connection = None
     transaction = None
     session = None
+    stage = "connect"
     try:
         connection = request.app.state.engine.connect()
+        stage = "transaction_begin"
         transaction = connection.begin()
         if connection.dialect.name == "sqlite":
             # Python's legacy sqlite transaction mode does not emit BEGIN for a
             # SELECT.  An explicit outer transaction keeps service SAVEPOINT
             # commits inside this unit so a late failure can roll it all back.
+            stage = "sqlite_begin"
             connection.exec_driver_sql("BEGIN IMMEDIATE")
+        stage = "session_create"
         session = Session(
             bind=connection,
             expire_on_commit=False,
             autoflush=False,
             join_transaction_mode="create_savepoint",
         )
+        stage = "project_create"
         project = ProjectService(session).create(
             values["project_title"], 2_000_000, 5_000_000
         )
+        stage = "constitution_create"
         ProjectService(session).add_constitution(
             project.id,
             {"setting_style": values["setting_style"].strip(), "test_entry": True},
             author_approved=True,
         )
+        stage = "outline_create"
         candidate = OutlineService(session).create_candidate(
             project.id,
             _outline_nodes(values),
             reason="作者确认的单章测试输入",
         )
+        stage = "outline_approve"
         OutlineService(session).approve(candidate.id)
+        stage = "budget_validate"
         budgets = request.app.state.workflow_budgets
         if not isinstance(budgets, WorkflowBudgets):
             raise RuntimeError("chapter test workflow budgets are invalid")
+        stage = "workflow_start"
         workflow = WorkflowService(session).start(
             project.id,
             "qwen",
@@ -256,10 +273,14 @@ def _create_workflow_atomically(
             budgets,
         )
         project_id, workflow_id = project.id, workflow.id
+        stage = "session_close"
         session.close()
         session = None
+        stage = "transaction_commit"
         transaction.commit()
         return project_id, workflow_id
+    except Exception as error:
+        raise ChapterTestSetupFailure(stage, type(error).__name__) from None
     finally:
         if session is not None:
             session.close()
@@ -272,15 +293,14 @@ def _create_workflow_atomically(
 def _setup_failure_response(
     request: Request,
     session: Session,
-    error: Exception,
-    *,
-    status_code: int,
+    error: ChapterTestSetupFailure,
 ) -> object:
     event_id = token_urlsafe(12)
     logger.error(
-        "chapter_test_setup_failed event_id=%s exception_type=%s",
+        "chapter_test_setup_failed event_id=%s stage=%s exception_type=%s",
         event_id,
-        type(error).__name__,
+        error.stage,
+        error.exception_type,
     )
     return _render(
         request,
@@ -288,7 +308,7 @@ def _setup_failure_response(
         _empty_form(),
         _new_submission_token(request),
         error=f"测试项目创建失败；未保留半完成设置，请重试。参考编号：{event_id}",
-        status_code=status_code,
+        status_code=500,
     )
 
 
@@ -358,18 +378,10 @@ def create_chapter_test(
         )
     try:
         _project_id, workflow_id = _create_workflow_atomically(request, values)
-    except (ValueError, PermissionError) as error:
+    except ChapterTestSetupFailure as error:
         return _setup_failure_response(
             request,
             session,
-            status_code=422,
-            error=error,
-        )
-    except Exception as error:
-        return _setup_failure_response(
-            request,
-            session,
-            status_code=500,
             error=error,
         )
     return RedirectResponse(f"/workflows/{workflow_id}", status_code=303)
