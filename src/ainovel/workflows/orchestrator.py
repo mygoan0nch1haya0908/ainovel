@@ -298,6 +298,14 @@ class WorkflowOrchestrator:
             if snapshot is None:
                 raise ValueError("workflow prompt snapshot not found")
             payload = self._task_payload(session, workflow, persisted_step)
+            from ainovel.services.stages import StageService
+
+            stage_context = StageService(session).workflow_context(
+                workflow.id, persisted_step.ordinal,
+                include_roadmap=persisted_step.kind == "PLANNING",
+            )
+            if stage_context is not None:
+                payload["stage"] = stage_context
             configured_input = self._positive_snapshot_parameter(
                 snapshot, "max_input_tokens"
             )
@@ -897,6 +905,14 @@ class WorkflowOrchestrator:
             with self._session_factory() as session:
                 workflow = session.get(GenerationWorkflow, step.workflow_id)
                 if workflow is None or len(result.chapters) != workflow.requested_chapters:
+                    raise ResponseFailure(FailureReason.PLAN)
+                from ainovel.services.stages import StageService
+
+                stage_context = StageService(session).workflow_context(workflow.id)
+                if stage_context is not None and any(
+                    chapter.goal != node["goal"] or chapter.title != node["title"]
+                    for chapter, node in zip(result.chapters, stage_context["nodes"], strict=True)
+                ):
                     raise ResponseFailure(FailureReason.PLAN)
                 session.rollback()
             return {}

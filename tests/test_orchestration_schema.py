@@ -398,7 +398,7 @@ def test_alembic_uses_programmatic_url_when_environment_is_absent(
 
     engine = create_engine(configured_url)
     try:
-        assert _revision_number(engine) == "0003_draft_repair"
+        assert _revision_number(engine) == "0004_stage_roadmaps"
     finally:
         engine.dispose()
     assert not fallback_path.exists()
@@ -421,7 +421,7 @@ def test_alembic_environment_url_intentionally_wins(
 
     engine = create_engine(environment_url)
     try:
-        assert _revision_number(engine) == "0003_draft_repair"
+        assert _revision_number(engine) == "0004_stage_roadmaps"
     finally:
         engine.dispose()
     assert not configured_path.exists()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 from ainovel.providers.diagnostics import ResponseFailure, safe_failure_detail
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Callable
 from copy import deepcopy
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta, timezone
@@ -12,7 +12,7 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from pydantic import BaseModel
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, update, or_
 from sqlalchemy.orm import Session
 
 from ainovel.agents.prompts import (
@@ -25,6 +25,7 @@ from ainovel.models.audit import AuditEvent
 from ainovel.models.batch import WritingBatch
 from ainovel.models.outline import OutlineVersion
 from ainovel.models.project import ConstitutionVersion, NovelProject
+from ainovel.models.stage import StoryStage, StageWorkflow, StageRoadmapVersion
 from ainovel.models.workflow import (
     GenerationWorkflow,
     ModelAttempt,
@@ -250,6 +251,7 @@ class WorkflowService:
         budgets: WorkflowBudgets,
         *,
         generation_version: int = 1,
+        _before_commit: Callable[[GenerationWorkflow], None] | None = None,
     ) -> GenerationWorkflow:
         self._validate_start_arguments(
             provider_name, model_name, requested_chapters, budgets
@@ -382,6 +384,8 @@ class WorkflowService:
                     "budgets": asdict(budgets),
                 },
             )
+            if _before_commit is not None:
+                _before_commit(workflow)
             self.session.commit()
             return workflow
         except Exception:
@@ -424,7 +428,7 @@ class WorkflowService:
                 WorkflowStep.position == workflow.current_position,
             )
         )
-        if project.official_outline_version_id != workflow.base_outline_version_id:
+        if not self._inputs_are_current(workflow, project):
             if step is not None and step.status in {"PENDING", "RUNNING"}:
                 self._pause_stale_workflow(workflow, step)
             else:
@@ -997,7 +1001,7 @@ class WorkflowService:
         ):
             self.session.rollback()
             raise ValueError("workflow step may not persist a non-final artifact")
-        if project.official_outline_version_id != workflow.base_outline_version_id:
+        if not self._inputs_are_current(workflow, project):
             self.session.rollback()
             if self._pause_stale_attempt_completion(attempt_id, response):
                 raise StaleOutlineCompletion(
@@ -1062,6 +1066,7 @@ class WorkflowService:
                     GenerationWorkflow.status == workflow.status,
                     GenerationWorkflow.revision == workflow.revision,
                     GenerationWorkflow.current_position == step.position,
+                    self._stage_current_predicate(workflow.id),
                     select(NovelProject.id)
                     .where(
                         NovelProject.id == workflow.project_id,
@@ -1183,7 +1188,7 @@ class WorkflowService:
             or workflow is None
             or project is None
             or project.active_workflow_id != workflow.id
-            or project.official_outline_version_id == workflow.base_outline_version_id
+            or self._inputs_are_current(workflow, project)
             or attempt.status != "RUNNING"
             or attempt.attempt_number != step.attempt_count
             or step.status != "RUNNING"
@@ -1202,8 +1207,8 @@ class WorkflowService:
                 .where(
                     NovelProject.id == workflow.project_id,
                     NovelProject.active_workflow_id == workflow.id,
-                    NovelProject.official_outline_version_id
-                    != workflow.base_outline_version_id,
+                    or_(NovelProject.official_outline_version_id != workflow.base_outline_version_id,
+                        ~self._stage_current_predicate(workflow.id)),
                 )
                 .exists()
             )
@@ -1453,7 +1458,7 @@ class WorkflowService:
         if (
             project is None
             or project.active_workflow_id != workflow.id
-            or project.official_outline_version_id != workflow.base_outline_version_id
+            or not self._inputs_are_current(workflow, project)
         ):
             self.session.rollback()
             raise ValueError("plan approval conflict")
@@ -1702,7 +1707,7 @@ class WorkflowService:
         if (
             project is None
             or project.active_workflow_id != workflow.id
-            or project.official_outline_version_id != workflow.base_outline_version_id
+            or not self._inputs_are_current(workflow, project)
             or step is None
             or step.status != "PAUSED"
             or step.lease_owner is not None
@@ -1947,6 +1952,25 @@ class WorkflowService:
         except Exception:
             self.session.rollback()
             raise
+
+    @staticmethod
+    def _stage_current_predicate(workflow_id):
+        mapped = select(StageWorkflow.workflow_id).where(StageWorkflow.workflow_id == workflow_id).exists()
+        valid = (select(StageWorkflow.workflow_id)
+                 .join(StoryStage, StoryStage.id == StageWorkflow.stage_id)
+                 .join(StageRoadmapVersion, StageRoadmapVersion.id == StageWorkflow.roadmap_id)
+                 .join(NovelProject, NovelProject.id == StoryStage.project_id)
+                 .where(StageWorkflow.workflow_id == workflow_id,
+                        StoryStage.approved_roadmap_id == StageWorkflow.roadmap_id,
+                        StoryStage.confirmed_chapters == StageWorkflow.confirmed_start,
+                        StageRoadmapVersion.status == "APPROVED",
+                        NovelProject.current_constitution_version_id == StageRoadmapVersion.constitution_version_id)
+                 .exists())
+        return or_(~mapped, valid)
+
+    def _inputs_are_current(self, workflow, project):
+        return (project.official_outline_version_id == workflow.base_outline_version_id
+                and bool(self.session.scalar(select(self._stage_current_predicate(workflow.id)))))
 
     def _read_valid_start_state(self, project_id: str) -> tuple[str, str]:
         self.session.expire_all()
