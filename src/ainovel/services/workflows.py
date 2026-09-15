@@ -521,6 +521,21 @@ class WorkflowService:
 
         recovered_ids: list[str] = []
         for step in candidates:
+            abandoned_attempt = self.session.scalar(
+                select(ModelAttempt.id)
+                .where(
+                    ModelAttempt.step_id == step.id,
+                    ModelAttempt.status == "RUNNING",
+                )
+                .limit(1)
+            )
+            protocol_failure_count = step.protocol_failure_count
+            if (
+                workflow.generation_version == 2
+                and step.kind == "WRITING"
+                and abandoned_attempt is not None
+            ):
+                protocol_failure_count += 1
             recovered = self.session.execute(
                 update(WorkflowStep)
                 .where(
@@ -537,6 +552,7 @@ class WorkflowService:
                     status="PENDING",
                     lease_owner=None,
                     lease_expires_at=None,
+                    protocol_failure_count=protocol_failure_count,
                     revision=step.revision + 1,
                 )
             )

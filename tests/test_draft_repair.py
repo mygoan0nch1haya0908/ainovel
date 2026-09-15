@@ -494,6 +494,183 @@ def test_expired_writer_lease_cannot_persist_work_draft(
     ).all()
 
 
+def test_v2_initial_writer_expired_attempts_reach_protocol_limit(
+    session_factory, session, ready_project, clock: FrozenClock
+) -> None:
+    class LeaseExpiringProvider(FakeProvider):
+        def generate(self, request):
+            result = super().generate(request)
+            if request.metadata["agent_role"] == "chapter_writer":
+                clock.advance(seconds=301)
+            return result
+
+    provider = LeaseExpiringProvider(
+        [
+            response(v2_plan_payload(), 1),
+            response({"title": "城门夜变", "body": body_with_evidence(5200)}, 2),
+            response({"title": "城门夜变", "body": body_with_evidence(5200)}, 3),
+            response({"title": "城门夜变", "body": body_with_evidence(5200)}, 4),
+        ]
+    )
+    workflow, orchestrator = start_approved_v2(
+        session_factory, session, ready_project, clock, provider
+    )
+
+    with pytest.raises(ValueError, match="attempt completion conflict"):
+        orchestrator.advance(workflow.id)
+    with pytest.raises(ValueError, match="attempt completion conflict"):
+        orchestrator.advance(workflow.id)
+    paused = orchestrator.advance(workflow.id)
+
+    session.expire_all()
+    writing = session.scalar(
+        select(WorkflowStep).where(
+            WorkflowStep.workflow_id == workflow.id,
+            WorkflowStep.kind == "WRITING",
+        )
+    )
+    assert paused.status == "PAUSED_ATTEMPTS"
+    assert writing.attempt_count == 2
+    assert writing.protocol_failure_count == 2
+    assert len(
+        [
+            request
+            for request in provider.requests
+            if request.metadata["agent_role"] == "chapter_writer"
+        ]
+    ) == 2
+
+
+def test_v2_pending_repair_expired_attempts_preserve_semantic_reservation(
+    session_factory, session, ready_project, clock: FrozenClock
+) -> None:
+    class RepairLeaseExpiringProvider(FakeProvider):
+        writer_calls = 0
+
+        def generate(self, request):
+            result = super().generate(request)
+            if request.metadata["agent_role"] == "chapter_writer":
+                self.writer_calls += 1
+                if self.writer_calls > 1:
+                    clock.advance(seconds=301)
+            return result
+
+    provider = RepairLeaseExpiringProvider(
+        [
+            response(v2_plan_payload(), 1),
+            response({"title": "城门夜变", "body": body_with_evidence(2799)}, 2),
+            response({"title": "城门夜变", "body": body_with_evidence(3386)}, 3),
+            response({"title": "城门夜变", "body": body_with_evidence(3386)}, 4),
+            response({"title": "城门夜变", "body": body_with_evidence(3386)}, 5),
+        ]
+    )
+    workflow, orchestrator = start_approved_v2(
+        session_factory, session, ready_project, clock, provider
+    )
+    assert orchestrator.advance(workflow.id).completed_step is None
+
+    with pytest.raises(ValueError, match="attempt completion conflict"):
+        orchestrator.advance(workflow.id)
+    with pytest.raises(ValueError, match="attempt completion conflict"):
+        orchestrator.advance(workflow.id)
+    paused = orchestrator.advance(workflow.id)
+
+    from ainovel.models import ChapterDraftRepair
+
+    session.expire_all()
+    writing = session.scalar(
+        select(WorkflowStep).where(
+            WorkflowStep.workflow_id == workflow.id,
+            WorkflowStep.kind == "WRITING",
+        )
+    )
+    repair = session.scalar(
+        select(ChapterDraftRepair).where(
+            ChapterDraftRepair.workflow_id == workflow.id
+        )
+    )
+    assert paused.status == "PAUSED_ATTEMPTS"
+    assert writing.attempt_count == 3
+    assert writing.protocol_failure_count == 2
+    assert repair.repair_count == 1
+    assert repair.repair_pending is True
+    assert provider.writer_calls == 3
+
+
+def test_v2_expired_claim_without_model_attempt_does_not_consume_protocol_retry(
+    session_factory, session, ready_project, clock: FrozenClock
+) -> None:
+    provider = FakeProvider(
+        [
+            response(v2_plan_payload(), 1),
+            response({"title": "城门夜变", "body": body_with_evidence(5200)}, 2),
+        ]
+    )
+    workflow, orchestrator = start_approved_v2(
+        session_factory, session, ready_project, clock, provider
+    )
+    service = WorkflowService(session, clock=clock)
+    claimed = service.claim_step(
+        workflow.id, {"GENERATING_CHAPTERS"}, "stalled-worker", lease_seconds=300
+    )
+    assert claimed is not None
+    clock.advance(seconds=301)
+
+    assert service.recover_expired_claims(workflow.id, clock.now()) == 1
+    session.expire_all()
+    writing = session.get(WorkflowStep, claimed.id)
+    assert writing.protocol_failure_count == 0
+    assert orchestrator.advance(workflow.id).completed_step == "WRITING"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "城" * 6001,
+        ("城门下的守卫反复盘问来客。" * 100)
+        + "\n\n"
+        + ("城门下的守卫反复盘问来客。" * 100),
+    ],
+    ids=["oversized", "repeated"],
+)
+def test_v2_business_rejected_writer_response_records_usage(
+    session_factory, session, ready_project, clock: FrozenClock, body: str
+) -> None:
+    provider = FakeProvider(
+        [
+            response(v2_plan_payload(), 1, input_tokens=100, output_tokens=50),
+            response(
+                {"title": "城门夜变", "body": body},
+                2,
+                input_tokens=211,
+                output_tokens=322,
+            ),
+        ]
+    )
+    workflow, orchestrator = start_approved_v2(
+        session_factory, session, ready_project, clock, provider
+    )
+
+    result = orchestrator.advance(workflow.id)
+
+    session.expire_all()
+    failed_attempt = session.scalar(
+        select(ModelAttempt)
+        .join(WorkflowStep, WorkflowStep.id == ModelAttempt.step_id)
+        .where(
+            WorkflowStep.workflow_id == workflow.id,
+            WorkflowStep.kind == "WRITING",
+            ModelAttempt.status == "FAILED",
+        )
+    )
+    workflow = session.get(GenerationWorkflow, workflow.id)
+    assert result.status == "GENERATING_CHAPTERS"
+    assert failed_attempt.input_tokens == 211
+    assert failed_attempt.output_tokens == 322
+    assert workflow.actual_input_tokens == 311
+    assert workflow.actual_output_tokens == 372
+
+
 def test_v2_protocol_retry_does_not_consume_an_extra_semantic_repair(
     session_factory, session, ready_project, clock: FrozenClock
 ) -> None:

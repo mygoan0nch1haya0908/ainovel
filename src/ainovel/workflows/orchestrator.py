@@ -239,11 +239,14 @@ class WorkflowOrchestrator:
             run = self._runner.run_with_response(
                 self._provider(claim), request, self._result_type(claim)
             )
-            validations = self._validate_business_result(claim, run.result)
         except ProviderError as error:
             return self._record_failure(
                 attempt.id, error, getattr(error, "response", None)
             )
+        try:
+            validations = self._validate_business_result(claim, run.result)
+        except ProviderError as error:
+            return self._record_failure(attempt.id, error, run.response)
 
         self._attempt_responses[attempt.id] = run.response
         self._attempt_validations[attempt.id] = validations
