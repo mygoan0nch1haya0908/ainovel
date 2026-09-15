@@ -124,7 +124,21 @@ class StageService:
             self.session.commit()
             return version
         number = version.attempts_used + 1
-        if number > version.attempt_limit or number * version.input_token_limit > version.total_input_token_limit or number * version.output_token_limit > version.total_output_token_limit:
+        # Keep the full reservation for missing usage, but never allow a known
+        # actual overrun to disappear behind the smaller per-attempt reservation.
+        reserved_input = max(
+            version.attempts_used * version.input_token_limit,
+            version.actual_input_tokens or 0,
+        ) + version.input_token_limit
+        reserved_output = max(
+            version.attempts_used * version.output_token_limit,
+            version.actual_output_tokens or 0,
+        ) + version.output_token_limit
+        if (
+            number > version.attempt_limit
+            or reserved_input > version.total_input_token_limit
+            or reserved_output > version.total_output_token_limit
+        ):
             version.status = "PAUSED_BUDGET"
             self.session.commit()
             return version
@@ -160,12 +174,18 @@ class StageService:
             result = AgentRunner().run_with_response(provider, request, StageRoadmapDraft)
             response = result.response
             payload = result.result.model_dump()
-            if (response.input_tokens is not None and response.input_tokens > request.max_input_tokens) or (response.output_tokens is not None and response.output_tokens > request.max_output_tokens):
-                status = "PAUSED_BUDGET"
-                payload = None
         except Exception as error:
             response = getattr(error, "response", None)
             status = "PAUSED_INVALID" if response is not None else "PAUSED_PROVIDER"
+        # A schema failure can still carry billable usage. Apply the same ceiling
+        # checks to both successful and failed responses before saving either.
+        if response is not None and (
+            response.input_tokens is not None
+            and response.input_tokens > request.max_input_tokens
+            or response.output_tokens is not None
+            and response.output_tokens > request.max_output_tokens
+        ):
+            status, payload = "PAUSED_BUDGET", None
         self.session.expire_all()
         version = self.roadmap(roadmap_id)
         stage = self.get(version.stage_id)
@@ -179,12 +199,19 @@ class StageService:
             if version.status != "RUNNING" or version.attempts_used != number:
                 raise ValueError("roadmap completion conflict")
             attempt = self.session.get(StageModelAttempt, attempt.id)
-            attempt.status = status
-            attempt.error_code = None if status == "PROPOSED" else status.lower()
             attempt.input_tokens = response.input_tokens if response else None
             attempt.output_tokens = response.output_tokens if response else None
             version.actual_input_tokens = self._usage_total(version.actual_input_tokens, attempt.input_tokens)
             version.actual_output_tokens = self._usage_total(version.actual_output_tokens, attempt.output_tokens)
+            if (
+                version.actual_input_tokens is not None
+                and version.actual_input_tokens > version.total_input_token_limit
+                or version.actual_output_tokens is not None
+                and version.actual_output_tokens > version.total_output_token_limit
+            ):
+                status, payload = "PAUSED_BUDGET", None
+            attempt.status = status
+            attempt.error_code = None if status == "PROPOSED" else status.lower()
             version.status, version.payload = status, payload
             self.session.commit()
             return version

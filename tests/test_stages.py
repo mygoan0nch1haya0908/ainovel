@@ -407,3 +407,57 @@ def test_stage_start_propagates_caller_workflow_budgets(session, ready_project):
     service.approve_roadmap(stage.id, version.id, "author")
     started = service.start_next_batch(stage.id, "author", "fake", "demo", 1, budgets=WorkflowBudgets(reviewer_output=4000))
     assert started.workflow.reviewer_output_tokens == 4000
+
+
+@pytest.mark.parametrize("input_tokens,output_tokens", [(16001, 50), (100, 8001), (100, 17000)], ids=["input-call", "output-call", "output-total"])
+def test_invalid_roadmap_with_excess_usage_stops_before_any_retry(session, ready_project, input_tokens, output_tokens):
+    from ainovel.services.stages import StageService
+    from ainovel.models import StageModelAttempt
+    from sqlalchemy import select
+
+    service = StageService(session)
+    stage = service.create(ready_project.id, "查案", "author")
+    version = service.propose_roadmap(stage.id, "author", "fake", "scripted")
+    provider = FakeProvider([
+        response({}, 1, input_tokens=input_tokens, output_tokens=output_tokens),
+        response(roadmap_payload(), 2),
+    ])
+    result = service.generate_roadmap(version.id, provider)
+
+    assert result.status == "PAUSED_BUDGET"
+    assert result.payload is None
+    assert result.actual_input_tokens == input_tokens
+    assert result.actual_output_tokens == output_tokens
+    attempt = session.scalar(select(StageModelAttempt).where(StageModelAttempt.roadmap_id == version.id))
+    assert attempt.status == "PAUSED_BUDGET"
+    with pytest.raises(ValueError, match="not available"):
+        StageService(session).generate_roadmap(version.id, provider)
+    assert len(provider.requests) == 1
+    assert service.roadmap(version.id).attempts_used == 1
+
+
+@pytest.mark.parametrize("dimension,actual", [("input", 16001), ("output", 9000), ("output", 17000)], ids=["input-reservation", "output-reservation", "output-spent"])
+def test_retry_admission_respects_usage_persisted_before_budget_fix(session, ready_project, dimension, actual):
+    from ainovel.services.stages import StageService
+    from ainovel.models import StageModelAttempt
+    from sqlalchemy import select
+
+    service = StageService(session)
+    stage = service.create(ready_project.id, "查案", "author")
+    version = service.propose_roadmap(stage.id, "author", "fake", "scripted")
+    service.generate_roadmap(version.id, FakeProvider([response({}, 1)]))
+    # Reconstruct a pre-fix paused record: schema failed but excessive usage was
+    # persisted. A corrected service must reject its retry before provider dispatch.
+    setattr(version, f"actual_{dimension}_tokens", actual)
+    attempt = session.scalar(select(StageModelAttempt).where(StageModelAttempt.roadmap_id == version.id))
+    setattr(attempt, f"{dimension}_tokens", actual)
+    session.commit()
+    provider = FakeProvider([response(roadmap_payload(), 2)])
+
+    result = StageService(session).generate_roadmap(version.id, provider)
+
+    assert result.status == "PAUSED_BUDGET"
+    assert result.attempts_used == 1
+    assert getattr(result, f"actual_{dimension}_tokens") == actual
+    assert result.payload is None
+    assert provider.requests == []
