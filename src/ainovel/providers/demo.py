@@ -20,6 +20,8 @@ class DemoFakeProvider:
             structured = self._batch_plan(request)
         elif role == "chapter_writer":
             structured = self._chapter_draft(request)
+        elif role == "chapter_coverage_reviewer":
+            structured = self._chapter_coverage(request)
         elif role == "chapter_summarizer":
             structured = {"summary": "演示章节摘要。", "state_delta": {"demo": True}}
         elif role == "batch_reviewer":
@@ -46,17 +48,24 @@ class DemoFakeProvider:
         requested = request.input_payload.get("requested_chapters")
         if not isinstance(requested, int) or not 1 <= requested <= 5:
             raise ProviderProtocolError("batch planner requires requested_chapters from 1 to 5")
-        return {
-            "chapters": [
-                {
+        chapters = []
+        for ordinal in range(1, requested + 1):
+            chapter = {
                     "ordinal": ordinal,
                     "title": f"演示第{ordinal}章",
                     "goal": f"推进演示情节第{ordinal}步",
                     "ending_hook": f"演示悬念{ordinal}",
-                }
-                for ordinal in range(1, requested + 1)
-            ]
-        }
+            }
+            if request.metadata.get("generation_version") == "2":
+                chapter["scenes"] = [
+                    {
+                        "ordinal": 1,
+                        "description": f"完成演示情节第{ordinal}步",
+                        "target_characters": 5200,
+                    }
+                ]
+            chapters.append(chapter)
+        return {"chapters": chapters}
 
     @staticmethod
     def _chapter_draft(request: ModelRequest) -> dict[str, object]:
@@ -79,3 +88,24 @@ class DemoFakeProvider:
         if padding < 0:
             raise ProviderProtocolError("chapter plan coverage exceeds chapter length")
         return {"title": f"演示第{ordinal}章", "body": required + "演" * padding}
+
+    @staticmethod
+    def _chapter_coverage(request: ModelRequest) -> dict[str, object]:
+        plan = request.input_payload.get("chapter_plan")
+        draft = request.input_payload.get("draft")
+        if not isinstance(plan, dict) or not isinstance(draft, dict):
+            raise ProviderProtocolError(
+                "chapter coverage requires plan and draft payloads"
+            )
+        body = draft.get("body")
+        goal = plan.get("goal")
+        ending_hook = plan.get("ending_hook")
+        if not all(isinstance(value, str) for value in (body, goal, ending_hook)):
+            raise ProviderProtocolError("chapter coverage payload is invalid")
+        return {
+            "goal": {"passed": goal in body, "excerpt": goal if goal in body else ""},
+            "ending_hook": {
+                "passed": ending_hook in body,
+                "excerpt": ending_hook if ending_hook in body else "",
+            },
+        }

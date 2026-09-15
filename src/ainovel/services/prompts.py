@@ -178,6 +178,51 @@ class PromptService:
         self.session.flush()
         return sorted(snapshots, key=lambda row: row.role)
 
+    def snapshot_versioned(
+        self,
+        workflow_id: str,
+        prompt_bodies: Mapping[str, str],
+        schemas: Mapping[str, type[BaseModel]],
+        parameters: Mapping[str, dict[str, object]],
+    ) -> list[WorkflowPromptSnapshot]:
+        roles = set(prompt_bodies)
+        if not roles or set(schemas) != roles or set(parameters) != roles:
+            raise ValueError("versioned prompt mappings must cover the same roles")
+        existing = self.list_snapshots(workflow_id)
+        if existing:
+            if {row.role for row in existing} != roles:
+                raise ValueError("workflow prompt snapshot roles are immutable")
+            return existing
+        snapshots: list[WorkflowPromptSnapshot] = []
+        for role in sorted(roles):
+            body = prompt_bodies[role]
+            if not isinstance(body, str) or not body.strip():
+                raise ValueError("versioned prompt body is required")
+            content_hash = self._content_hash(body)
+            version = self.session.scalar(
+                select(PromptVersion).where(
+                    PromptVersion.role == role,
+                    PromptVersion.content_hash == content_hash,
+                )
+            )
+            if version is None:
+                version = self._create_version_uncommitted(
+                    role, body, "builtin_versioned"
+                )
+            snapshot = WorkflowPromptSnapshot(
+                id=str(uuid4()),
+                workflow_id=workflow_id,
+                role=role,
+                prompt_version_id=version.id,
+                prompt_body=body,
+                output_schema=deepcopy(schemas[role].model_json_schema()),
+                parameters=deepcopy(parameters[role]),
+            )
+            self.session.add(snapshot)
+            snapshots.append(snapshot)
+        self.session.flush()
+        return snapshots
+
     def list_snapshots(self, workflow_id: str) -> list[WorkflowPromptSnapshot]:
         return self.session.scalars(
             select(WorkflowPromptSnapshot)

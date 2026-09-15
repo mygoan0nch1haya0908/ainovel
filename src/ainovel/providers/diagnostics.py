@@ -1,7 +1,7 @@
 """Allowlisted response diagnostics; never serialize SDK or validation messages."""
 from enum import Enum
 
-from ainovel.providers.contracts import ProviderProtocolError
+from ainovel.providers.contracts import ModelResponse, ProviderProtocolError
 
 
 class FailureReason(str, Enum):
@@ -48,9 +48,16 @@ _DETAILS = {
 
 
 class ResponseFailure(ProviderProtocolError):
-    def __init__(self, reason: FailureReason, *, visible_count: int | None = None):
+    def __init__(
+        self,
+        reason: FailureReason,
+        *,
+        visible_count: int | None = None,
+        response: ModelResponse | None = None,
+    ):
         self.reason = reason if type(reason) is FailureReason else FailureReason.UNKNOWN
         self.visible_count = visible_count
+        self.response = response
         # Preserve the public exception family and legacy safe SDK messages.
         if self.reason == FailureReason.HTTP:
             message = 'Qwen returned an unsuccessful response'

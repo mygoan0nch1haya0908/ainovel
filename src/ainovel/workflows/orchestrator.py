@@ -17,11 +17,16 @@ from sqlalchemy.orm import Session
 
 from ainovel.agents.contracts import (
     BatchPlanDraft,
+    BatchPlanDraftV2,
     BatchReview,
+    ChapterCoverage,
     ChapterDraft,
     ChapterPlan,
+    ChapterPlanV2,
     ChapterSummaryDelta,
+    WorkChapterDraft,
 )
+from ainovel.agents.prompts import V2_AGENT_SCHEMAS
 from ainovel.agents.runner import AgentRunner
 from ainovel.context import RequiredContextOverflow, effective_input_capacity
 from ainovel.models.batch import Chapter, WritingBatch
@@ -30,6 +35,7 @@ from ainovel.models.outline import OutlineNode
 from ainovel.models.project import ConstitutionVersion, NovelProject
 from ainovel.models.prompt import WorkflowPromptSnapshot
 from ainovel.models.workflow import (
+    ChapterDraftRepair,
     GenerationWorkflow,
     PlanDecision,
     WorkflowArtifact,
@@ -54,6 +60,11 @@ from ainovel.services.context import (
     ContextService,
 )
 from ainovel.services.counting import count_visible_characters
+from ainovel.services.draft_repair import (
+    DraftRepairService,
+    coverage_is_valid,
+    repair_payload,
+)
 from ainovel.services.prompts import PromptService
 from ainovel.services.workflows import (
     EXECUTABLE_WORKFLOW_STATUSES,
@@ -69,18 +80,21 @@ _ROLE_BY_STEP = {
     "WRITING": "chapter_writer",
     "SUMMARIZING": "chapter_summarizer",
     "REVIEWING": "batch_reviewer",
+    "VALIDATING_CHAPTER": "chapter_coverage_reviewer",
 }
 _RESULT_BY_STEP: dict[str, type[BaseModel]] = {
     "PLANNING": BatchPlanDraft,
     "WRITING": ChapterDraft,
     "SUMMARIZING": ChapterSummaryDelta,
     "REVIEWING": BatchReview,
+    "VALIDATING_CHAPTER": ChapterCoverage,
 }
 _SCHEMA_NAME_BY_STEP = {
     "PLANNING": "batch_plan",
     "WRITING": "chapter_draft",
     "SUMMARIZING": "chapter_summary_delta",
     "REVIEWING": "batch_review",
+    "VALIDATING_CHAPTER": "chapter_coverage",
 }
 _WAITING_FOR = {
     "AWAITING_PLAN_APPROVAL": "plan_approval",
@@ -165,6 +179,27 @@ class WorkflowOrchestrator:
             return self._current_result(workflow_id)
         if claim.kind == "CREATING_CANDIDATE_BATCH":
             return self._create_candidate_batch(claim)
+        budget_service = self._workflow_service()
+        try:
+            if not budget_service.preflight_model_budget(
+                claim.id, self._worker_id, claim_revision=claim.revision
+            ):
+                return self._current_result(workflow_id)
+        finally:
+            budget_service.session.close()
+        with self._session_factory() as session:
+            workflow = session.get(GenerationWorkflow, claim.workflow_id)
+            is_v2_repair = (
+                workflow is not None
+                and workflow.generation_version == 2
+                and claim.kind == "WRITING"
+            )
+            if is_v2_repair and not DraftRepairService(
+                session
+            ).reserve_repair_dispatch(
+                claim.id, self._worker_id, claim_revision=claim.revision
+            ):
+                return self._current_result(workflow_id)
 
         try:
             request = self._build_request(claim)
@@ -206,7 +241,9 @@ class WorkflowOrchestrator:
             )
             validations = self._validate_business_result(claim, run.result)
         except ProviderError as error:
-            return self._record_failure(attempt.id, error)
+            return self._record_failure(
+                attempt.id, error, getattr(error, "response", None)
+            )
 
         self._attempt_responses[attempt.id] = run.response
         self._attempt_validations[attempt.id] = validations
@@ -355,17 +392,29 @@ class WorkflowOrchestrator:
             return provider
 
     def _result_type(self, step: WorkflowStep) -> type[BaseModel]:
-        result_type = _RESULT_BY_STEP.get(step.kind)
+        with self._session_factory() as session:
+            workflow = session.get(GenerationWorkflow, step.workflow_id)
+            if workflow is None:
+                raise ValueError("workflow not found")
+            result_type = (
+                V2_AGENT_SCHEMAS.get(_ROLE_BY_STEP.get(step.kind, ""))
+                if workflow.generation_version == 2
+                else _RESULT_BY_STEP.get(step.kind)
+            )
+            session.rollback()
         if result_type is None:
             raise ValueError("workflow step does not have a result schema")
         return result_type
 
     def _record_failure(
-        self, attempt_id: str, error: ProviderError
+        self,
+        attempt_id: str,
+        error: ProviderError,
+        response: ModelResponse | None = None,
     ) -> AdvanceResult:
         service = self._workflow_service()
         try:
-            workflow = service.fail_attempt(attempt_id, error)
+            workflow = service.fail_attempt(attempt_id, error, response=response)
             workflow_id = workflow.id
         finally:
             service.session.close()
@@ -383,6 +432,14 @@ class WorkflowOrchestrator:
             and result.passed is False
             and bool(result.evidence_queries)
         )
+        generation_version = self._generation_version(step.workflow_id)
+        if (
+            generation_version == 2
+            and step.kind == "WRITING"
+            and isinstance(result, WorkChapterDraft)
+            and count_visible_characters(result.body) < 4500
+        ):
+            finalize_step = False
         service = self._workflow_service()
         try:
             try:
@@ -394,7 +451,7 @@ class WorkflowOrchestrator:
         finally:
             service.session.close()
 
-        if step.kind == "WRITING":
+        if step.kind == "WRITING" and generation_version == 1:
             self._persist_validation_artifact(
                 artifact.id, self._attempt_validations.get(attempt_id, {})
             )
@@ -484,12 +541,33 @@ class WorkflowOrchestrator:
             }
         if step.kind == "WRITING":
             chapter_plan = self._chapter_plan(session, workflow, step.ordinal)
-            return {
+            payload = {
                 "ordinal": step.ordinal,
                 "chapter_plan": chapter_plan,
                 "previous_candidate_summaries": self._prior_summaries(
                     session, workflow, step.ordinal
                 ),
+            }
+            if workflow.generation_version == 2:
+                state = DraftRepairService(session).get_for_writing_step(step.id)
+                if state is not None:
+                    payload["repair"] = repair_payload(state)
+            return payload
+        if step.kind == "VALIDATING_CHAPTER":
+            state = session.scalar(
+                select(ChapterDraftRepair)
+                .join(WorkflowStep, WorkflowStep.id == ChapterDraftRepair.writing_step_id)
+                .where(
+                    ChapterDraftRepair.workflow_id == workflow.id,
+                    WorkflowStep.ordinal == step.ordinal,
+                )
+            )
+            if state is None:
+                raise ValueError("coverage validation requires an accepted work draft")
+            return {
+                "ordinal": step.ordinal,
+                "chapter_plan": self._chapter_plan(session, workflow, step.ordinal),
+                "draft": deepcopy(state.latest_payload),
             }
         if step.kind == "SUMMARIZING":
             chapter = self._active_artifact_for_ordinal(
@@ -530,6 +608,7 @@ class WorkflowOrchestrator:
                 "workflow_id": workflow.id,
                 "step_id": step.id,
                 "ordinal": "" if step.ordinal is None else str(step.ordinal),
+                "generation_version": str(workflow.generation_version),
             },
         )
 
@@ -802,8 +881,15 @@ class WorkflowOrchestrator:
     def _validate_business_result(
         self, step: WorkflowStep, result: BaseModel
     ) -> dict[str, object]:
+        with self._session_factory() as session:
+            workflow = session.get(GenerationWorkflow, step.workflow_id)
+            if workflow is None:
+                raise ValueError("workflow not found")
+            generation_version = workflow.generation_version
+            session.rollback()
         if step.kind == "PLANNING":
-            if not isinstance(result, BatchPlanDraft):
+            expected_plan = BatchPlanDraftV2 if generation_version == 2 else BatchPlanDraft
+            if not isinstance(result, expected_plan):
                 raise ResponseFailure(FailureReason.PLAN)
             with self._session_factory() as session:
                 workflow = session.get(GenerationWorkflow, step.workflow_id)
@@ -811,9 +897,14 @@ class WorkflowOrchestrator:
                     raise ResponseFailure(FailureReason.PLAN)
                 session.rollback()
             return {}
+        if step.kind == "VALIDATING_CHAPTER":
+            if not isinstance(result, ChapterCoverage):
+                raise ResponseFailure(FailureReason.PLAN)
+            return {}
         if step.kind != "WRITING":
             return {}
-        if not isinstance(result, ChapterDraft) or step.ordinal is None:
+        expected_draft = WorkChapterDraft if generation_version == 2 else ChapterDraft
+        if not isinstance(result, expected_draft) or step.ordinal is None:
             raise ResponseFailure(FailureReason.PLAN)
         with self._session_factory() as session:
             workflow = session.get(GenerationWorkflow, step.workflow_id)
@@ -829,16 +920,25 @@ class WorkflowOrchestrator:
             session.rollback()
         if not validations['nonblank_title'] or not validations['nonblank_body']:
             raise ResponseFailure(FailureReason.CHAPTER_EMPTY)
-        if not validations['visible_length_valid']:
+        if not validations['visible_length_valid'] and not (
+            generation_version == 2
+            and validations['visible_character_count'] < 4500
+        ):
             count = validations['visible_character_count']
             reason = FailureReason.TOO_SHORT if count < 4500 else FailureReason.TOO_LONG
             raise ResponseFailure(reason, visible_count=count)
-        for key, reason in (
+        required_checks = [
             ('approved_plan_ordinal', FailureReason.PLAN),
-            ('approved_goal_present', FailureReason.GOAL),
-            ('approved_key_event_present', FailureReason.HOOK),
             ('ordinal_continuity', FailureReason.ORDINAL),
-        ):
+        ]
+        if generation_version == 1:
+            required_checks.extend(
+                [
+                    ('approved_goal_present', FailureReason.GOAL),
+                    ('approved_key_event_present', FailureReason.HOOK),
+                ]
+            )
+        for key, reason in required_checks:
             if not validations[key]:
                 raise ResponseFailure(reason)
         if validations['obvious_repeated_blocks']:
@@ -853,7 +953,8 @@ class WorkflowOrchestrator:
         title: str,
         body: str,
     ) -> dict[str, object]:
-        chapter_plan = ChapterPlan.model_validate(
+        plan_type = ChapterPlanV2 if workflow.generation_version == 2 else ChapterPlan
+        chapter_plan = plan_type.model_validate(
             self._chapter_plan(session, workflow, ordinal)
         )
         completed_writers = session.scalar(
@@ -893,6 +994,18 @@ class WorkflowOrchestrator:
     @staticmethod
     def _coverage_text(value: str) -> str:
         return re.sub(r"\s+", "", value).casefold()
+
+    def _generation_version(self, workflow_id: str) -> int:
+        with self._session_factory() as session:
+            version = session.scalar(
+                select(GenerationWorkflow.generation_version).where(
+                    GenerationWorkflow.id == workflow_id
+                )
+            )
+            session.rollback()
+        if version is None:
+            raise ValueError("workflow not found")
+        return version
 
     def _persist_validation_artifact(
         self, chapter_artifact_id: str, validations: dict[str, object]
@@ -951,6 +1064,24 @@ class WorkflowOrchestrator:
                 chapter.payload["title"],
                 chapter.payload["body"],
             )
+            if workflow.generation_version == 2:
+                coverage_step = session.get(WorkflowStep, chapter.step_id)
+                coverage = session.scalar(
+                    select(WorkflowArtifact).where(
+                        WorkflowArtifact.workflow_id == chapter.workflow_id,
+                        WorkflowArtifact.step_id == chapter.step_id,
+                        WorkflowArtifact.kind == "chapter_coverage",
+                        WorkflowArtifact.ordinal == chapter.ordinal,
+                    )
+                )
+                if coverage_step is None or coverage is None:
+                    raise ValueError("chapter coverage evidence is unavailable")
+                payload.pop("approved_goal_present", None)
+                payload.pop("approved_key_event_present", None)
+                payload["coverage"] = deepcopy(coverage.payload)
+                payload["coverage_evidence_valid"] = coverage_is_valid(
+                    session, coverage_step, coverage.payload
+                )
             canonical = _canonical_json(payload)
             row = WorkflowArtifact(
                 id=str(uuid4()),

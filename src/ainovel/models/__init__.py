@@ -6,6 +6,7 @@ from ainovel.models.outline import OutlineNode, OutlineVersion
 from ainovel.models.prompt import PromptVersion, WorkflowPromptSnapshot
 from ainovel.models.project import ConstitutionVersion, NovelProject
 from ainovel.models.workflow import (
+    ChapterDraftRepair,
     GenerationWorkflow,
     ModelAttempt,
     PlanDecision,

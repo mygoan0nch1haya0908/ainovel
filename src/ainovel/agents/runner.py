@@ -60,7 +60,9 @@ class AgentRunner:
                             reason = FailureReason.TOO_SHORT
                         elif count > 6000:
                             reason = FailureReason.TOO_LONG
-            raise ResponseFailure(reason, visible_count=count) from None
+            raise ResponseFailure(
+                reason, visible_count=count, response=response
+            ) from None
         return AgentRunResult(result=result, response=response)
 
     @staticmethod
