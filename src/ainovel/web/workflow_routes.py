@@ -105,8 +105,35 @@ def _workflow_context(
         and isinstance(artifact.payload.get("title"), str)
         and isinstance(artifact.payload.get("body", artifact.text_content), str)
     ]
+    candidate_batch_id = workflow.candidate_batch_id or session.scalar(
+        select(WritingBatch.id).where(
+            WritingBatch.source_workflow_id == workflow.id,
+            WritingBatch.project_id == workflow.project_id,
+        )
+    )
+    candidate_batch = (
+        session.get(WritingBatch, candidate_batch_id)
+        if candidate_batch_id is not None
+        else None
+    )
+    candidate_batch_status = candidate_batch.status if candidate_batch else None
     work_drafts = DraftRepairService(session).list_for_workflow(workflow.id)
     work_draft_by_ordinal = {draft.ordinal: draft for draft in work_drafts}
+    promoted_ordinals = {
+        chapter["ordinal"] for chapter in candidate_chapters
+        if isinstance(chapter["ordinal"], int)
+    }
+    work_draft_rows = []
+    for draft in work_drafts:
+        if draft.ordinal not in promoted_ordinals:
+            state = "unaccepted"
+        elif workflow.status == "COMPLETED" or candidate_batch_status == "approved":
+            state = "author_approved"
+        elif workflow.status == "REJECTED" or candidate_batch_status == "rejected":
+            state = "author_rejected"
+        else:
+            state = "promoted"
+        work_draft_rows.append({"draft": draft, "state": state})
     stage_context = StageService(session).workflow_context(workflow.id)
     usage_complete = all(
         attempt.input_tokens is not None and attempt.output_tokens is not None
@@ -138,6 +165,7 @@ def _workflow_context(
         "review_issues": review_issues,
         "candidate_chapters": candidate_chapters,
         "work_drafts": work_drafts,
+        "work_draft_rows": work_draft_rows,
         "work_draft_by_ordinal": work_draft_by_ordinal,
         "stage_context": stage_context,
         "step_labels": STEP_LABELS,
@@ -148,12 +176,8 @@ def _workflow_context(
         "can_run": workflow.status in EXECUTABLE_WORKFLOW_STATUSES,
         "can_resume": can_resume,
         "can_cancel": can_cancel,
-        "candidate_batch_id": workflow.candidate_batch_id or session.scalar(
-            select(WritingBatch.id).where(
-                WritingBatch.source_workflow_id == workflow.id,
-                WritingBatch.project_id == workflow.project_id,
-            )
-        ),
+        "candidate_batch_id": candidate_batch_id,
+        "candidate_batch_status": candidate_batch_status,
         "is_paused": workflow.status.startswith("PAUSED_"),
         "chapter_test_mode": bool(
             getattr(request.app.state, "chapter_test_mode", False)

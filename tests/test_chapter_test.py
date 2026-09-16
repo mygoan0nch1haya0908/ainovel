@@ -24,6 +24,8 @@ from ainovel.models import (
     OutlineVersion,
     WritingBatch,
 )
+from ainovel.models.stage import StageRoadmapVersion, StageWorkflowNode
+from ainovel.providers.demo import DemoFakeProvider
 from ainovel.providers.contracts import ModelResponse, ProviderCapabilities
 from ainovel.providers.fake import FakeProvider
 from ainovel.providers.registry import ProviderRegistry
@@ -160,6 +162,14 @@ def form_tokens(client: TestClient, path: str = "/chapter-test") -> dict[str, st
     }
 
 
+def page_csrf(client: TestClient, path: str) -> str:
+    page = client.get(path)
+    assert page.status_code == 200
+    match = re.search(r'name="csrf_token" value="([^"]+)"', page.text)
+    assert match is not None
+    return unescape(match.group(1))
+
+
 def valid_setup_data(client: TestClient) -> dict[str, str]:
     return {
         **form_tokens(client),
@@ -242,6 +252,117 @@ def test_default_app_has_no_chapter_test_route(database_url: str) -> None:
     app = create_app(database_url)
     with TestClient(app) as client:
         assert client.get("/chapter-test").status_code == 404
+
+
+class RecordingChapterStageProvider(DemoFakeProvider):
+    def __init__(self) -> None:
+        self.roles: list[str | None] = []
+
+    def generate(self, request):
+        self.roles.append(request.metadata.get("agent_role"))
+        return super().generate(request)
+
+
+def test_actual_chapter_test_app_offers_distinct_stage_mode_and_roadmap_flow(
+    chapter_test_module,
+    database_url: str,
+) -> None:
+    provider = RecordingChapterStageProvider()
+    app = chapter_test_module.create_chapter_test_app(
+        database_url=database_url,
+        provider_registry=ProviderRegistry({"qwen": lambda: provider}),
+    )
+    create_schema(app)
+    with TestClient(app) as client:
+        setup = client.get("/chapter-test")
+        assert "独立单章测试" in setup.text
+        assert "剧情阶段总体架构" in setup.text
+        assert 'name="setup_mode"' in setup.text
+
+        created = client.post(
+            "/chapter-test",
+            data={
+                **form_tokens(client),
+                "setup_mode": "stage",
+                "project_title": "雾城长篇",
+                "setting_style": "近未来山城；克制悬疑。",
+                "provisional_ending": "主角公开真相并离开雾城。",
+                "stage_architecture": "调查七个相互关联的失踪案，逐步揭露幕后组织。",
+                "chapter_outline": "",
+                "chapter_title": "",
+                "chapter_goal": "",
+                "chapter_hook": "",
+                "model_name": "qwen-flash",
+                "author_confirm": "yes",
+            },
+            follow_redirects=False,
+        )
+        assert created.status_code == 303
+        assert created.headers["location"].startswith("/stages/")
+        assert provider.roles == []
+        stage_id = created.headers["location"].rsplit("/", 1)[-1]
+        stage_path = f"/stages/{stage_id}"
+        stage_page = client.get(stage_path)
+        assert "TEST · 剧情阶段规划" in stage_page.text
+        assert "独立单章测试" in stage_page.text
+        assert 'value="qwen"' in stage_page.text
+        assert 'value="qwen-flash"' in stage_page.text
+
+        proposed = client.post(
+            f"{stage_path}/roadmaps",
+            data={
+                "csrf_token": page_csrf(client, stage_path),
+                "provider_name": "qwen",
+                "model_name": "qwen-flash",
+                "author_confirm": "yes",
+            },
+            follow_redirects=False,
+        )
+        assert proposed.status_code == 303
+        assert provider.roles == []
+        with app.state.session_factory() as session:
+            roadmap = session.query(StageRoadmapVersion).filter_by(stage_id=stage_id).one()
+            roadmap_id = roadmap.id
+
+        generated = client.post(
+            f"{stage_path}/roadmaps/{roadmap_id}/generate",
+            data={
+                "csrf_token": page_csrf(client, stage_path),
+                "model_call_confirm": "yes",
+            },
+            follow_redirects=False,
+        )
+        assert generated.status_code == 303
+        assert provider.roles == ["stage_planner"]
+        assert client.post(
+            f"{stage_path}/roadmaps/{roadmap_id}/approve",
+            data={
+                "csrf_token": page_csrf(client, stage_path),
+                "approval_confirm": "yes",
+            },
+            follow_redirects=False,
+        ).status_code == 303
+        started = client.post(
+            f"{stage_path}/batches",
+            data={
+                "csrf_token": page_csrf(client, stage_path),
+                "requested_chapters": "5",
+                "author_confirm": "yes",
+            },
+            follow_redirects=False,
+        )
+        assert started.status_code == 303
+        assert provider.roles == ["stage_planner"]
+        workflow_id = started.headers["location"].rsplit("/", 1)[-1]
+        with app.state.session_factory() as session:
+            workflow = session.get(GenerationWorkflow, workflow_id)
+            mappings = session.query(StageWorkflowNode).filter_by(workflow_id=workflow_id).all()
+            assert workflow is not None
+            assert workflow.generation_version == 2
+            assert workflow.provider_name == "qwen"
+            assert workflow.writer_output_tokens == 12_000
+            assert workflow.reviewer_output_tokens == 4_000
+            assert len(mappings) == 5
 
 
 def test_default_database_is_isolated_from_normal_database_setting(
@@ -542,6 +663,36 @@ def test_workflow_start_failure_rolls_back_entire_setup(
     assert sensitive_error not in caplog.text
     assert sensitive_input not in caplog.text
     assert bounded_provider.requests == []
+    with chapter_test_app.state.session_factory() as session:
+        for model in (
+            NovelProject,
+            ConstitutionVersion,
+            OutlineVersion,
+            OutlineNode,
+            GenerationWorkflow,
+        ):
+            assert session.scalar(select(func.count()).select_from(model)) == 0
+
+
+def test_stage_setup_failure_rolls_back_entire_atomic_setup(
+    chapter_client: TestClient,
+    chapter_test_app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ainovel.web.chapter_test_routes as route_module
+
+    def fail_stage(*_args, **_kwargs):
+        raise ValueError("injected stage setup failure")
+
+    monkeypatch.setattr(route_module.StageService, "create", fail_stage)
+    data = valid_setup_data(chapter_client)
+    data.update({
+        "setup_mode": "stage",
+        "stage_architecture": "调查七个失踪案",
+        "chapter_outline": "",
+    })
+    result = chapter_client.post("/chapter-test", data=data)
+    assert result.status_code == 500
     with chapter_test_app.state.session_factory() as session:
         for model in (
             NovelProject,

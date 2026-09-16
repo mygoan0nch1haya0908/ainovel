@@ -37,7 +37,7 @@ def create_chapter_test_app(
     database_url: str | None = None,
     provider_registry: ProviderRegistry | None = None,
 ) -> FastAPI:
-    """Build the loopback-only, isolated single-chapter author test app."""
+    """Build the loopback-only isolated stage-planning and chapter test app."""
     if database_url is None:
         CHAPTER_TEST_DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
         resolved_database_url = (
@@ -57,7 +57,7 @@ def create_chapter_test_app(
         provider_registry=registry,
         orchestrator_request_timeout_seconds=CHAPTER_TEST_REQUEST_TIMEOUT_SECONDS,
     )
-    app.title = "AI Novel Studio · Single Chapter TEST"
+    app.title = "AI Novel Studio · Author Planning TEST"
     app.state.chapter_test_mode = True
     app.state.chapter_test_database_path = str(
         Path(app.state.engine.url.database).resolve()

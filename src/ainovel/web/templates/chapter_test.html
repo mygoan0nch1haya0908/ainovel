@@ -1,38 +1,48 @@
 {% extends "base.html" %}
-{% block title %}单章写作测试 · AI 小说工作台{% endblock %}
+{% block title %}创作规划测试 · AI 小说工作台{% endblock %}
 {% block content %}
 <aside aria-label="测试环境提示">
-  <h1>TEST · 单章写作测试</h1>
+  <h1>TEST · 单章写作测试与剧情阶段规划</h1>
   <p><strong>这是独立测试数据库，不是正式出版或发布入口。</strong></p>
   <p>数据库位置：<code>{{ database_path }}</code></p>
   <p><strong>付费调用警告：</strong>只有您明确点击“生成章节计划”“生成正文”或继续检查时才会调用 Qwen，可能产生 API 费用；失败步骤最多尝试 2 次，每次都可能计费。</p>
-  <p>本测试固定生成 1 章。主笔输出上限为 12000 Token，请求超时为 180 秒；规划、摘要、审核输出上限均为 4000 Token。</p>
+  <p>可选择“独立单章测试”或“剧情阶段总体架构”。独立单章固定生成 1 章；阶段模式先生成并批准紧凑路线图，再按每批最多 5 章推进。主笔输出上限为 12000 Token，请求超时为 180 秒；规划、摘要、审核输出上限均为 4000 Token。</p>
   <p>现有确定性校验要求正文逐字包含获批计划里的 goal 与 ending_hook（忽略空白差异）。本入口不会放宽该限制，也不会自动批准计划或章节。</p>
 </aside>
-<ol class="progress" aria-label="创作进度"><li aria-current="step">1 · 确认输入</li><li>2 · 生成计划</li><li>3 · 确认计划</li><li>4 · 生成正文</li><li>5 · 审阅正文</li></ol>
+<ol class="progress" aria-label="单章测试进度"><li aria-current="step">单章 1 · 确认输入</li><li>2 · 生成计划</li><li>3 · 确认计划</li><li>4 · 生成正文</li><li>5 · 审阅正文</li></ol>
+<ol class="progress" aria-label="阶段规划进度"><li aria-current="step">阶段 1 · 确认架构</li><li>2 · 生成路线图</li><li>3 · 确认路线图</li><li>4 · 分批创作</li></ol>
 {% if projects %}<p><a class="button secondary" href="#saved-tests-heading">继续已有测试，不重复创建</a></p>{% endif %}
 
 <section aria-labelledby="setup-heading">
-  <h2 id="setup-heading">设置与章节提纲</h2>
+  <h2 id="setup-heading">设置与创作入口</h2>
   {% if reuse_notice %}<p class="notice">{{ reuse_notice }}</p>{% endif %}
-  <form action="/chapter-test" method="post" data-confirm="确认这些设置与提纲，并创建一个尚未运行的单章工作流？">
+  <form action="/chapter-test" method="post" data-confirm="确认所选模式及其输入，并创建一个尚未运行的测试任务？">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <input type="hidden" name="submission_token" value="{{ submission_token }}">
+    <fieldset><legend>选择创作入口</legend>
+      <p><label><input type="radio" name="setup_mode" value="single_chapter"{% if chapter_form.setup_mode != "stage" %} checked{% endif %}> 独立单章测试：使用第一章提纲创建一个 1 章工作流。</label></p>
+      <p><label><input type="radio" name="setup_mode" value="stage"{% if chapter_form.setup_mode == "stage" %} checked{% endif %}> 剧情阶段总体架构：先创建阶段和路线图，不自动生成章节。</label></p>
+    </fieldset>
     <p><label for="project_title">项目名称</label><input id="project_title" name="project_title" maxlength="{{ field_limits.project_title }}" value="{{ chapter_form.project_title }}" required></p>
     <p><label for="setting_style">世界设定与文风约束</label><textarea id="setting_style" name="setting_style" maxlength="{{ field_limits.setting_style }}" rows="6" required>{{ chapter_form.setting_style }}</textarea></p>
     <p><label for="provisional_ending">暂定结局</label><textarea id="provisional_ending" name="provisional_ending" maxlength="{{ field_limits.provisional_ending }}" rows="4" required>{{ chapter_form.provisional_ending }}</textarea></p>
-    <p><label for="chapter_outline">第一章提纲</label><textarea id="chapter_outline" name="chapter_outline" maxlength="{{ field_limits.chapter_outline }}" rows="8" required>{{ chapter_form.chapter_outline }}</textarea></p>
+    <fieldset><legend>独立单章测试输入</legend>
+    <p><label for="chapter_outline">第一章提纲</label><textarea id="chapter_outline" name="chapter_outline" maxlength="{{ field_limits.chapter_outline }}" rows="8">{{ chapter_form.chapter_outline }}</textarea></p>
     <details>
       <summary>可选：作者建议的章节标题、目标与章末钩子</summary>
       <p>这些建议会进入获批官方大纲，但模型生成的批次计划仍须单独审批。</p>
       <p><label for="chapter_title">章节标题</label><input id="chapter_title" name="chapter_title" maxlength="{{ field_limits.chapter_title }}" value="{{ chapter_form.chapter_title }}"></p>
       <p><label for="chapter_goal">章节目标</label><textarea id="chapter_goal" name="chapter_goal" maxlength="{{ field_limits.chapter_goal }}" rows="3">{{ chapter_form.chapter_goal }}</textarea></p>
       <p><label for="chapter_hook">章末钩子</label><textarea id="chapter_hook" name="chapter_hook" maxlength="{{ field_limits.chapter_hook }}" rows="3">{{ chapter_form.chapter_hook }}</textarea></p>
-    </details>
+    </details></fieldset>
+    <fieldset><legend>剧情阶段规划输入</legend>
+      <p><label for="stage_architecture">剧情阶段总体架构</label><textarea id="stage_architecture" name="stage_architecture" maxlength="{{ field_limits.stage_architecture }}" rows="10">{{ chapter_form.stage_architecture }}</textarea></p>
+      <p class="muted">创建阶段不会调用模型。进入阶段页后再明确创建提案、调用模型生成路线图并由作者批准。</p>
+    </fieldset>
     <p><label for="model_name">Qwen 模型</label><input id="model_name" name="model_name" maxlength="{{ field_limits.model_name }}" value="{{ chapter_form.model_name }}" required></p>
-    <p><label><input type="checkbox" name="repair_mode" value="yes"{% if chapter_form.repair_mode == "yes" %} checked{% endif %}> 启用 v2 短稿修补与章节覆盖检查（每章首次生成后最多两轮修补；会增加有界模型调用，仍不保证文学质量）。</label></p>
-    <p><label><input type="checkbox" name="author_confirm" value="yes"{% if chapter_form.author_confirm == "yes" %} checked{% endif %} required> 我确认以上设定、暂定结局与章节提纲作为本次测试的已批准输入。</label></p>
-    <button type="submit">创建单章测试工作流（不会调用模型）</button>
+    <p><label><input type="checkbox" name="repair_mode" value="yes"{% if chapter_form.repair_mode == "yes" %} checked{% endif %}> 仅用于独立单章：启用 v2 短稿修补与章节覆盖检查（每章首次生成后最多两轮修补；会增加有界模型调用，仍不保证文学质量）。</label></p>
+    <p><label><input type="checkbox" name="author_confirm" value="yes"{% if chapter_form.author_confirm == "yes" %} checked{% endif %} required> 我确认以上共同设定，以及所选模式的第一章提纲或剧情阶段总体架构，作为本次测试的已批准输入。</label></p>
+    <button type="submit">创建所选测试任务（不会调用模型）</button>
   </form>
 </section>
 
@@ -50,6 +60,7 @@
   <h3>设定与文风</h3><div style="white-space: pre-wrap">{{ confirmed_input.setting_style }}</div>
   <h3>暂定结局</h3><div style="white-space: pre-wrap">{{ confirmed_input.provisional_ending }}</div>
   <h3>章节提纲</h3><div style="white-space: pre-wrap">{{ confirmed_input.chapter_outline }}</div>
+  {% if confirmed_input.stage_architecture %}<h3>剧情阶段总体架构</h3><div style="white-space: pre-wrap">{{ confirmed_input.stage_architecture }}</div>{% endif %}
   {% if confirmed_input.chapter_title %}<p>建议标题：{{ confirmed_input.chapter_title }}</p>{% endif %}
   {% if confirmed_input.chapter_goal %}<p>建议目标：{{ confirmed_input.chapter_goal }}</p>{% endif %}
   {% if confirmed_input.chapter_hook %}<p>建议钩子：{{ confirmed_input.chapter_hook }}</p>{% endif %}

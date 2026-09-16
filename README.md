@@ -155,14 +155,17 @@ Any live smoke validation must be explicitly opted in and limited to one small,
 synthetic structured request. It must not create, approve, or publish novel
 chapters and must not be part of the default offline test suite.
 
-## Isolated single-chapter Qwen author test
+## Isolated Qwen author planning test
 
 This opt-in author test uses a separate SQLite database at exactly
 `D:/ainovel/.worktrees/qwen-adapter/.superpowers/runtime/chapter-test/chapter-test.db`.
-The dedicated factory ignores the ordinary `AINOVEL_DATABASE_URL` default, fixes
-the workflow at one chapter, and raises only Qwen's test ceilings to 32,000
-context tokens and 12,000 output tokens. It does not download anything. Real
-Qwen calls require both an API key and explicit opt-in and may incur charges.
+The dedicated factory ignores the ordinary `AINOVEL_DATABASE_URL` default and
+offers two distinct entries: an independent one-chapter workflow, or a stage
+architecture followed by a compact roadmap and rolling batches of at most five
+chapters. Generic one-chapter starts remain fixed at one chapter. Both modes use
+the test-only Qwen ceilings of 32,000 context tokens and 12,000 output tokens.
+It does not download anything. Real Qwen calls require both an API key and
+explicit opt-in and may incur charges.
 
 From `D:\ainovel\.worktrees\qwen-adapter`, migrate that exact database, remove
 the migration override, securely load the key, and start only on loopback:
@@ -182,6 +185,16 @@ python -m uvicorn ainovel.chapter_test:create_chapter_test_app --factory --host 
 
 Open [http://127.0.0.1:8001/chapter-test](http://127.0.0.1:8001/chapter-test),
 then follow the explicit gates:
+
+For “剧情阶段总体架构”, enter the shared setting/style and provisional ending,
+select the stage mode, and provide the stage architecture. Setup creates the
+project, approved inputs, and stage atomically without a model call. On the
+stage page, separately create the frozen roadmap proposal, explicitly generate
+it, approve it, and start each 1–5 chapter batch. Plans and bodies retain their
+separate author approvals; a later batch is unavailable until the current body
+batch is approved and reconciled.
+
+For “独立单章测试”:
 
 1. Enter the project setting/style, provisional ending, and first-chapter
    outline; check the author confirmation and create the workflow. This setup

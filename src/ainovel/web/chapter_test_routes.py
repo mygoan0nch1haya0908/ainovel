@@ -13,6 +13,7 @@ from ainovel.models.outline import OutlineNode, OutlineVersion
 from ainovel.models.project import ConstitutionVersion, NovelProject
 from ainovel.services.outlines import OutlineNodeInput, OutlineService
 from ainovel.services.projects import ProjectService
+from ainovel.services.stages import StageService
 from ainovel.services.workflows import WorkflowBudgets, WorkflowService
 from ainovel.web.routes import templates
 from ainovel.web.security import csrf_token, require_csrf
@@ -29,6 +30,7 @@ FIELD_LIMITS = {
     "chapter_title": 200,
     "chapter_goal": 1_000,
     "chapter_hook": 1_000,
+    "stage_architecture": 12_000,
     "model_name": 128,
 }
 FIELD_LABELS = {
@@ -39,6 +41,7 @@ FIELD_LABELS = {
     "chapter_title": "章节标题",
     "chapter_goal": "章节目标",
     "chapter_hook": "章末钩子",
+    "stage_architecture": "剧情阶段总体架构",
     "model_name": "模型名称",
 }
 
@@ -59,6 +62,8 @@ def _empty_form() -> dict[str, str]:
         "chapter_title": "",
         "chapter_goal": "",
         "chapter_hook": "",
+        "stage_architecture": "",
+        "setup_mode": "single_chapter",
         "model_name": "qwen-flash",
         "repair_mode": "",
         "author_confirm": "",
@@ -117,6 +122,9 @@ def _confirmed_input(
         "chapter_title": chapter.title if chapter is not None else "",
         "chapter_goal": chapter.payload.get("goal", "") if chapter else "",
         "chapter_hook": chapter.payload.get("ending_hook", "") if chapter else "",
+        "stage_architecture": (
+            root.payload.get("stage_architecture", "") if root is not None else ""
+        ),
     }
 
 
@@ -151,21 +159,30 @@ def _render(
 
 
 def _validation_error(values: dict[str, str]) -> str | None:
+    if values.get("setup_mode") not in {"single_chapter", "stage"}:
+        return "请选择独立单章测试或剧情阶段总体架构"
     required = (
         ("project_title", "项目名称不能为空"),
         ("setting_style", "设定与文风不能为空"),
         ("provisional_ending", "暂定结局不能为空"),
-        ("chapter_outline", "章节提纲不能为空"),
         ("model_name", "模型名称不能为空"),
     )
     for field, message in required:
         if not values[field].strip():
             return message
+    if values["setup_mode"] == "single_chapter" and not values["chapter_outline"].strip():
+        return "章节提纲不能为空"
+    if values["setup_mode"] == "stage" and not values["stage_architecture"].strip():
+        return "剧情阶段总体架构不能为空"
     for field, maximum in FIELD_LIMITS.items():
         if len(values[field]) > maximum:
             return f"{FIELD_LABELS[field]}不能超过 {maximum} 个字符"
     if values["author_confirm"] != "yes":
-        return "请勾选作者确认，确认设定、暂定结局与章节提纲"
+        return (
+            "请勾选作者确认，确认设定、暂定结局与剧情阶段总体架构"
+            if values["setup_mode"] == "stage"
+            else "请勾选作者确认，确认设定、暂定结局与章节提纲"
+        )
     if values.get("repair_mode", "") not in {"", "yes"}:
         return "短稿修补模式选项无效"
     return None
@@ -186,6 +203,25 @@ def _consume_submission_token(request: Request, submitted: str) -> bool:
 
 
 def _outline_nodes(values: dict[str, str]) -> list[OutlineNodeInput]:
+    if values.get("setup_mode") == "stage":
+        return [
+            OutlineNodeInput(
+                key="book",
+                parent_key=None,
+                kind="book",
+                title="阶段规划总纲",
+                order=0,
+                payload={"stage_architecture": values["stage_architecture"].strip()},
+            ),
+            OutlineNodeInput(
+                key="provisional-ending",
+                parent_key="book",
+                kind="provisional_ending",
+                title="暂定结局",
+                order=1,
+                payload={"text": values["provisional_ending"].strip()},
+            ),
+        ]
     chapter_payload = {
         "chapter_outline": values["chapter_outline"].strip(),
     }
@@ -267,25 +303,32 @@ def _create_workflow_atomically(
         )
         stage = "outline_approve"
         OutlineService(session).approve(candidate.id)
-        stage = "budget_validate"
-        budgets = request.app.state.workflow_budgets
-        if not isinstance(budgets, WorkflowBudgets):
-            raise RuntimeError("chapter test workflow budgets are invalid")
-        stage = "workflow_start"
-        start_args = (project.id, "qwen", values["model_name"], 1, budgets)
-        if values.get("repair_mode") == "yes":
-            workflow = WorkflowService(session).start(
-                *start_args, generation_version=2
+        if values.get("setup_mode") == "stage":
+            stage = "stage_create"
+            story_stage = StageService(session).create(
+                project.id, values["stage_architecture"].strip(), "author"
             )
+            project_id, target_id = project.id, story_stage.id
         else:
-            workflow = WorkflowService(session).start(*start_args)
-        project_id, workflow_id = project.id, workflow.id
+            stage = "budget_validate"
+            budgets = request.app.state.workflow_budgets
+            if not isinstance(budgets, WorkflowBudgets):
+                raise RuntimeError("chapter test workflow budgets are invalid")
+            stage = "workflow_start"
+            start_args = (project.id, "qwen", values["model_name"], 1, budgets)
+            if values.get("repair_mode") == "yes":
+                workflow = WorkflowService(session).start(
+                    *start_args, generation_version=2
+                )
+            else:
+                workflow = WorkflowService(session).start(*start_args)
+            project_id, target_id = project.id, workflow.id
         stage = "session_close"
         session.close()
         session = None
         stage = "transaction_commit"
         transaction.commit()
-        result = (project_id, workflow_id)
+        result = (project_id, target_id)
     except Exception as error:
         primary_failure = ChapterTestSetupFailure(stage, type(error).__name__)
 
@@ -406,6 +449,10 @@ def reuse_chapter_test_input(
         "chapter_title": str(confirmed["chapter_title"]),
         "chapter_goal": str(confirmed["chapter_goal"]),
         "chapter_hook": str(confirmed["chapter_hook"]),
+        "stage_architecture": str(confirmed["stage_architecture"]),
+        "setup_mode": (
+            "stage" if confirmed["stage_architecture"] else "single_chapter"
+        ),
         "model_name": "qwen-flash",
         "repair_mode": "",
         "author_confirm": "",
@@ -431,6 +478,8 @@ def create_chapter_test(
     chapter_goal: str = Form(""),
     chapter_hook: str = Form(""),
     model_name: str = Form("qwen-flash"),
+    setup_mode: str = Form("single_chapter"),
+    stage_architecture: str = Form(""),
     repair_mode: str = Form(""),
     author_confirm: str = Form(""),
     submission_token: str = Form(""),
@@ -446,6 +495,8 @@ def create_chapter_test(
         "chapter_goal": chapter_goal,
         "chapter_hook": chapter_hook,
         "model_name": model_name,
+        "setup_mode": setup_mode,
+        "stage_architecture": stage_architecture,
         "repair_mode": repair_mode,
         "author_confirm": author_confirm,
     }
@@ -472,11 +523,12 @@ def create_chapter_test(
             status_code=409,
         )
     try:
-        _project_id, workflow_id = _create_workflow_atomically(request, values)
+        _project_id, target_id = _create_workflow_atomically(request, values)
     except ChapterTestSetupFailure as error:
         return _setup_failure_response(
             request,
             session,
             error=error,
         )
-    return RedirectResponse(f"/workflows/{workflow_id}", status_code=303)
+    destination = "stages" if setup_mode == "stage" else "workflows"
+    return RedirectResponse(f"/{destination}/{target_id}", status_code=303)

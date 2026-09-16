@@ -2,6 +2,7 @@
 {% block title %}剧情阶段 · {{ project.title }}{% endblock %}
 {% block content %}
 <p><a href="/projects/{{ project.id }}">返回项目：{{ project.title }}</a></p>
+{% if chapter_test_mode %}<aside aria-label="阶段测试提示"><strong>TEST · 剧情阶段规划</strong><p>此阶段位于独立测试数据库，不代表发布；路线图、批次计划和批次正文仍分别由作者确认。</p><p><a href="/chapter-test">返回测试入口或选择独立单章测试</a></p></aside>{% endif %}
 <h1>剧情阶段总体架构</h1>
 <section aria-labelledby="architecture-heading">
   <h2 id="architecture-heading">作者确认的阶段输入</h2>
@@ -15,8 +16,8 @@
   <p>先创建冻结提案，不调用模型；下一步由作者明确点击生成。</p>
   <form action="/stages/{{ stage.id }}/roadmaps" method="post" data-confirm="确认冻结这次架构与模型设置？此操作不会调用模型。">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <p><label for="provider-name">Provider</label><select id="provider-name" name="provider_name"><option value="fake">Fake 演示</option><option value="ollama">Ollama</option><option value="openai">OpenAI</option><option value="qwen">Qwen</option></select></p>
-    <p><label for="model-name">模型名称</label><input id="model-name" name="model_name" value="demo" required></p>
+    <p><label for="provider-name">Provider</label><select id="provider-name" name="provider_name">{% if chapter_test_mode %}<option value="qwen">Qwen</option>{% else %}<option value="fake">Fake 演示</option><option value="ollama">Ollama</option><option value="openai">OpenAI</option><option value="qwen">Qwen</option>{% endif %}</select></p>
+    <p><label for="model-name">模型名称</label><input id="model-name" name="model_name" value="{% if chapter_test_mode %}qwen-flash{% else %}demo{% endif %}" required></p>
     <p><label for="architecture-revision">可选：修订后的总体架构</label><textarea id="architecture-revision" name="architecture" rows="6" placeholder="留空则沿用上方架构"></textarea></p>
     <p><label><input type="checkbox" name="author_confirm" value="yes" required> 我确认架构和模型设置。</label></p>
     <button type="submit">创建路线图提案（不会调用模型）</button>

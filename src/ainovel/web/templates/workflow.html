@@ -101,11 +101,18 @@
 </section>
 {% endif %}
 
-{% if work_drafts %}
+{% if work_draft_rows %}
 <section aria-labelledby="work-drafts-heading">
-  <h2 id="work-drafts-heading">隔离的未批准工作稿</h2>
-  <p class="notice error">以下正文尚未通过长度、覆盖检查和作者批次批准，不是正式候选正文。</p>
-  {% for draft in work_drafts %}<article><h3>第 {{ draft.ordinal }} 章 · {{ draft.title }}</h3><p>可见字符：{{ draft.visible_count }}；修补轮次：{{ draft.repair_count }} / 2{% if draft.repair_pending %}（本轮已预留）{% endif %}；工作稿修订：{{ draft.draft_revision }}；最新尝试：{{ draft.latest_attempt_id }}</p><div class="chapter-body" style="white-space: pre-wrap">{{ draft.body }}</div></article>{% endfor %}
+  <h2 id="work-drafts-heading">v2 工作稿历史</h2>
+  {% for row in work_draft_rows %}{% set draft = row.draft %}<article>
+    <h3>第 {{ draft.ordinal }} 章 · {{ draft.title }}</h3>
+    {% if row.state == "unaccepted" %}<p class="notice error"><strong>隔离的未批准工作稿：</strong>尚未提升为候选正文；可能仍未通过长度或覆盖检查，也未进入作者批次批准。</p>
+    {% elif row.state == "promoted" %}<p class="notice"><strong>已提升为候选正文，等待作者批准。</strong>正式候选正文见下方阅读区；此处只保留修补历史，避免重复正文。</p>
+    {% elif row.state == "author_approved" %}<p class="notice"><strong>已获作者批准。</strong>正文已从隔离工作稿提升；此处只保留修补历史，避免重复正文。</p>
+    {% else %}<p class="notice"><strong>曾提升为候选正文，但该批次已被作者驳回。</strong>此处只保留修补历史。</p>{% endif %}
+    <p>可见字符：{{ draft.visible_count }}；修补轮次：{{ draft.repair_count }} / 2{% if draft.repair_pending %}（本轮已预留）{% endif %}；工作稿修订：{{ draft.draft_revision }}；最新尝试：{{ draft.latest_attempt_id }}</p>
+    {% if row.state == "unaccepted" %}<div class="chapter-body" style="white-space: pre-wrap">{{ draft.body }}</div>{% endif %}
+  </article>{% endfor %}
 </section>
 {% endif %}
 
@@ -136,7 +143,7 @@
 
 {% if candidate_chapters %}
 <section aria-labelledby="candidate-chapters-heading">
-  <h2 id="candidate-chapters-heading">候选章节正文</h2>
+  <h2 id="candidate-chapters-heading">{% if workflow.status == "COMPLETED" or candidate_batch_status == "approved" %}已获作者批准的章节正文{% elif workflow.status == "REJECTED" or candidate_batch_status == "rejected" %}已驳回的候选章节正文{% else %}候选章节正文{% endif %}</h2>
   {% for chapter in candidate_chapters %}
   <article>
     <h3>第 {{ chapter.ordinal }} 章 · {{ chapter.title }}</h3>

@@ -76,6 +76,7 @@ def _stage_context(request: Request, session: Session, stage_id: str) -> dict[st
         "workflow_rows": workflow_rows, "active_workflow": active_workflow,
         "can_start_batch": approved is not None and bool(remaining) and project.active_workflow_id is None and project.active_batch_id is None,
         "stage_status_labels": STAGE_ROADMAP_LABELS, "workflow_labels": WORKFLOW_LABELS,
+        "chapter_test_mode": bool(getattr(request.app.state, "chapter_test_mode", False)),
     }
 
 

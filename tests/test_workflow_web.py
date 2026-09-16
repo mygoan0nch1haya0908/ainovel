@@ -257,6 +257,60 @@ def test_v2_failed_work_draft_is_escaped_separate_and_marks_partial_usage(
     assert "<script>alert" not in page.text
 
 
+@pytest.mark.parametrize(
+    ("workflow_status", "expected_state"),
+    [
+        ("AWAITING_CONTENT_APPROVAL", "已提升为候选正文，等待作者批准"),
+        ("COMPLETED", "已获作者批准"),
+    ],
+)
+def test_promoted_work_draft_history_has_exact_nonfailure_state_without_duplicate_body(
+    client: TestClient,
+    session,
+    workflow: GenerationWorkflow,
+    workflow_status: str,
+    expected_state: str,
+) -> None:
+    workflow.generation_version = 2
+    workflow.status = workflow_status
+    writing = WorkflowStep(
+        id=str(uuid4()), workflow_id=workflow.id, kind="WRITING", ordinal=1,
+        position=1, status="SUCCEEDED", attempt_count=1,
+    )
+    attempt = ModelAttempt(
+        id=str(uuid4()), step_id=writing.id, attempt_number=1, status="SUCCEEDED",
+        request_digest="e" * 64, provider_response_id="accepted-draft",
+        input_tokens=100, output_tokens=200, latency_ms=3,
+    )
+    session.add(writing)
+    session.flush()
+    session.add(attempt)
+    session.flush()
+    body = "<script>accepted-history</script>"
+    session.add_all([
+        ChapterDraftRepair(
+            id=str(uuid4()), workflow_id=workflow.id, writing_step_id=writing.id,
+            latest_attempt_id=attempt.id,
+            latest_payload={"title": "已提升章", "body": body},
+            visible_count=4500, repair_count=1, repair_pending=False, draft_revision=2,
+        ),
+        WorkflowArtifact(
+            id=str(uuid4()), workflow_id=workflow.id, step_id=writing.id,
+            kind="chapter_draft", ordinal=1, text_content=body,
+            payload={"title": "已提升章", "body": body},
+            visible_char_count=4500, content_hash="f" * 64,
+        ),
+    ])
+    session.commit()
+
+    page = client.get(f"/workflows/{workflow.id}")
+    assert page.status_code == 200
+    assert expected_state in page.text
+    assert "尚未提升为候选正文" not in page.text
+    assert "不是正式候选正文" not in page.text
+    assert page.text.count("&lt;script&gt;accepted-history&lt;/script&gt;") == 1
+
+
 def create_ready_project(session_factory, title: str) -> str:
     with session_factory() as session:
         project = ProjectService(session).create(title, 2_000_000, 5_000_000)
