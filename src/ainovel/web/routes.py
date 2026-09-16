@@ -15,6 +15,7 @@ from ainovel.web.presentation import WORKFLOW_LABELS
 from ainovel.services.batches import BatchService
 from ainovel.services.outlines import OutlineService
 from ainovel.services.projects import ProjectService
+from ainovel.services.stages import StageService
 from ainovel.web.security import csrf_token, require_csrf
 
 router = APIRouter()
@@ -79,6 +80,7 @@ def _project_context(request: Request, session: Session, project_id: str) -> dic
         "statistics": batches.official_chapter_statistics(project_id),
         "audit_events": batches.list_audit_events(project_id),
         "active_workflow": active_workflow,
+        "stages": StageService(session).list_for_project(project_id),
         "chapter_test_mode": bool(
             getattr(request.app.state, "chapter_test_mode", False)
         ),

@@ -18,6 +18,7 @@ from ainovel.models.batch import Chapter
 from ainovel.models.prompt import WorkflowPromptSnapshot
 from ainovel.models.project import NovelProject
 from ainovel.models.workflow import (
+    ChapterDraftRepair,
     GenerationWorkflow,
     ModelAttempt,
     WorkflowArtifact,
@@ -210,6 +211,50 @@ def test_workflow_body_is_not_hidden_inside_budget_details(client, workflow):
     generated.feed(client.get(f'/workflows/{workflow.id}').text)
     assert generated.candidate_hidden is False
     assert generated.closed_details == []
+
+
+def test_v2_failed_work_draft_is_escaped_separate_and_marks_partial_usage(
+    client: TestClient, session, workflow: GenerationWorkflow
+) -> None:
+    workflow.generation_version = 2
+    workflow.status = "PAUSED_REVIEW"
+    workflow.last_error_code = "provider_protocol"
+    workflow.last_error_detail = "provider returned an invalid response"
+    writing = WorkflowStep(
+        id=str(uuid4()), workflow_id=workflow.id, kind="WRITING", ordinal=1,
+        position=1, status="PAUSED", attempt_count=2, protocol_failure_count=1,
+    )
+    coverage = WorkflowStep(
+        id=str(uuid4()), workflow_id=workflow.id, kind="VALIDATING_CHAPTER",
+        ordinal=1, position=2, status="PENDING",
+    )
+    attempt = ModelAttempt(
+        id=str(uuid4()), step_id=writing.id, attempt_number=2, status="FAILED",
+        request_digest="d" * 64, provider_response_id=None,
+        input_tokens=None, output_tokens=None, latency_ms=None,
+        error_code="provider_protocol", error_detail="provider returned an invalid response",
+    )
+    session.add_all([writing, coverage])
+    session.flush()
+    session.add(attempt)
+    session.flush()
+    session.add(ChapterDraftRepair(
+        id=str(uuid4()), workflow_id=workflow.id, writing_step_id=writing.id,
+        latest_attempt_id=attempt.id,
+        latest_payload={"title": "<b>未批准</b>", "body": "<script>alert('x')</script>"},
+        visible_count=18, repair_count=2, repair_pending=False, draft_revision=3,
+    ))
+    session.commit()
+
+    page = client.get(f"/workflows/{workflow.id}")
+    assert page.status_code == 200
+    assert "隔离的未批准工作稿" in page.text
+    assert "修补轮次：2 / 2" in page.text
+    assert "章节覆盖检查" in page.text
+    assert "含未知项，合计不完整" in page.text
+    assert "未记录细分原因" in page.text
+    assert "&lt;script&gt;alert" in page.text
+    assert "<script>alert" not in page.text
 
 
 def create_ready_project(session_factory, title: str) -> str:

@@ -60,6 +60,7 @@ def _empty_form() -> dict[str, str]:
         "chapter_goal": "",
         "chapter_hook": "",
         "model_name": "qwen-flash",
+        "repair_mode": "",
         "author_confirm": "",
     }
 
@@ -128,6 +129,7 @@ def _render(
     error: str | None = None,
     status_code: int = 200,
     project_id: str | None = None,
+    reuse_notice: str | None = None,
 ) -> object:
     return templates.TemplateResponse(
         request,
@@ -140,6 +142,7 @@ def _render(
             "error": error,
             "projects": ProjectService(session).list_projects(),
             "confirmed_input": _confirmed_input(session, project_id),
+            "reuse_notice": reuse_notice,
             "database_path": request.app.state.chapter_test_database_path,
             "field_limits": FIELD_LIMITS,
         },
@@ -163,6 +166,8 @@ def _validation_error(values: dict[str, str]) -> str | None:
             return f"{FIELD_LABELS[field]}不能超过 {maximum} 个字符"
     if values["author_confirm"] != "yes":
         return "请勾选作者确认，确认设定、暂定结局与章节提纲"
+    if values.get("repair_mode", "") not in {"", "yes"}:
+        return "短稿修补模式选项无效"
     return None
 
 
@@ -267,13 +272,13 @@ def _create_workflow_atomically(
         if not isinstance(budgets, WorkflowBudgets):
             raise RuntimeError("chapter test workflow budgets are invalid")
         stage = "workflow_start"
-        workflow = WorkflowService(session).start(
-            project.id,
-            "qwen",
-            values["model_name"],
-            1,
-            budgets,
-        )
+        start_args = (project.id, "qwen", values["model_name"], 1, budgets)
+        if values.get("repair_mode") == "yes":
+            workflow = WorkflowService(session).start(
+                *start_args, generation_version=2
+            )
+        else:
+            workflow = WorkflowService(session).start(*start_args)
         project_id, workflow_id = project.id, workflow.id
         stage = "session_close"
         session.close()
@@ -364,6 +369,57 @@ def chapter_test_page(
     )
 
 
+@router.post("/chapter-test/reuse/{project_id}")
+def reuse_chapter_test_input(
+    project_id: str,
+    request: Request,
+    reuse_confirm: str = Form(""),
+    session: Session = Depends(get_session),
+    _csrf: None = Depends(require_csrf),
+) -> object:
+    confirmed = _confirmed_input(session, project_id)
+    if confirmed is None:
+        return _render(
+            request,
+            session,
+            _empty_form(),
+            _new_submission_token(request),
+            error="找不到可复用的已确认输入",
+            status_code=404,
+        )
+    if reuse_confirm != "yes":
+        return _render(
+            request,
+            session,
+            _empty_form(),
+            _new_submission_token(request),
+            error="请确认只把旧输入预填到新任务表单",
+            status_code=422,
+            project_id=project_id,
+        )
+    project = confirmed["project"]
+    values = {
+        "project_title": project.title,
+        "setting_style": str(confirmed["setting_style"]),
+        "provisional_ending": str(confirmed["provisional_ending"]),
+        "chapter_outline": str(confirmed["chapter_outline"]),
+        "chapter_title": str(confirmed["chapter_title"]),
+        "chapter_goal": str(confirmed["chapter_goal"]),
+        "chapter_hook": str(confirmed["chapter_hook"]),
+        "model_name": "qwen-flash",
+        "repair_mode": "",
+        "author_confirm": "",
+    }
+    return _render(
+        request,
+        session,
+        values,
+        _new_submission_token(request),
+        project_id=project_id,
+        reuse_notice="这是新任务的预填表单；原任务、提示词快照、修补次数和状态均未修改。",
+    )
+
+
 @router.post("/chapter-test")
 def create_chapter_test(
     request: Request,
@@ -375,6 +431,7 @@ def create_chapter_test(
     chapter_goal: str = Form(""),
     chapter_hook: str = Form(""),
     model_name: str = Form("qwen-flash"),
+    repair_mode: str = Form(""),
     author_confirm: str = Form(""),
     submission_token: str = Form(""),
     session: Session = Depends(get_session),
@@ -389,6 +446,7 @@ def create_chapter_test(
         "chapter_goal": chapter_goal,
         "chapter_hook": chapter_hook,
         "model_name": model_name,
+        "repair_mode": repair_mode,
         "author_confirm": author_confirm,
     }
     error = _validation_error(values)

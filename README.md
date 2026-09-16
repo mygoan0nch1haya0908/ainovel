@@ -72,6 +72,23 @@ before synchronizing the workflow decision.
 Fake output verifies orchestration, persistence, crash-safe gates, and approval
 boundaries. It does **not** evaluate or demonstrate literary quality.
 
+## 剧情阶段路线图与滚动批次
+
+项目已经有作者确认的创作宪法和官方大纲后，可在项目页填写“剧情阶段总体架构”。
+保存架构、创建路线图提案、批准路线图和建立批次都不会调用模型。路线图生成按钮会
+明确标注可能收费；它只生成一个待作者审阅的紧凑路线图版本，不会自动批准。
+
+批准路线图后，每次只能建立 1–5 章的下一批任务。工作流先生成包含场景目标和可见
+字符预算的批次计划，作者批准计划后才可生成正文；候选正文还须在批次页由作者批准，
+阶段确认进度才会推进，之后才能建立下一批。页面同时显示批内序号、阶段序号和全书
+序号。刷新任何 GET 页面都不会生成、重试、批准或推进状态。若路线图尝试停在
+`RUNNING`，页面不会自动恢复、重置预算或另建提案，需先人工核查持久状态。
+
+v2 正文仍须达到 4,500–6,000 个可见字符，目标约 5,200。首次生成过短时，每章最多
+增加两轮有界修补调用；协议重试、工作流总调用数和 Token 预算仍分别受限，重启不会
+重置计数。工作稿与正式候选正文分开展示，覆盖检查和批次批准也仍是独立作者门槛。
+短稿修补只提供受限的补救机会，会增加模型调用和费用，并不保证文学质量。
+
 See [Phase 2 operational boundaries](docs/phase-two-operational-boundaries.md)
 for claim ownership, strict summary encoding, cross-batch approved memory,
 model budgets, and cancellation of paused workflows.
@@ -176,6 +193,14 @@ then follow the explicit gates:
 4. Read the full candidate body and visible count before using the existing
    candidate-batch approval or rejection controls. Nothing is approved or
    published automatically.
+
+New single-chapter tasks may explicitly enable the v2 short-draft repair and
+coverage-check option. Leaving it unchecked preserves the legacy v1 workflow.
+The confirmed-input view has a CSRF-protected “reuse old input” action that only
+prefills a new setup form; it never mutates, upgrades, or retries the source
+workflow. v2 can add at most two repair calls after the first draft, remains
+subject to the workflow call/Token budgets and every author gate, and offers no
+guarantee of literary quality.
 
 The project page links to a full chapter preview and recent generation history,
 including cancelled workflows. An empty manual batch is labeled as having no

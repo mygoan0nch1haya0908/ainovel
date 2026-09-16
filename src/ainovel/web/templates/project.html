@@ -10,7 +10,20 @@
 <section aria-labelledby="versions-heading"><h2 id="versions-heading">当前版本</h2>
   <p>创作宪法：{% if summary.current_constitution_version_number %}v{{ summary.current_constitution_version_number }}{% else %}尚未确认{% endif %}</p>
   <p>官方大纲：{% if official_outline %}v{{ official_outline.version_number }}{% else %}尚未确认{% endif %}</p>
-</section>
+  </section>
+  {% if not chapter_test_mode %}<section aria-labelledby="stage-architecture-heading">
+    <h2 id="stage-architecture-heading">剧情阶段总体架构</h2>
+    <p>阶段路线图、每批计划与每批正文分别由作者确认；每批最多五章。创建架构和批准操作都不会调用模型。</p>
+    {% if official_outline and summary.current_constitution_version_number %}
+    <form action="/projects/{{ summary.project.id }}/stages" method="post" data-confirm="确认保存此剧情阶段总体架构？此操作不会调用模型。">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <p><label for="stage-architecture">剧情阶段总体架构</label><textarea id="stage-architecture" name="architecture" rows="7" required></textarea></p>
+      <p><label><input type="checkbox" name="author_confirm" value="yes" required> 我确认该架构作为新阶段的作者输入。</label></p>
+      <button type="submit">创建剧情阶段（不会调用模型）</button>
+    </form>
+    {% else %}<p>请先确认创作宪法和官方大纲。</p>{% endif %}
+    {% if stages %}<h3>已有剧情阶段</h3><ul>{% for stage in stages %}<li><a href="/stages/{{ stage.id }}">阶段 {{ loop.index }} · 已确认 {{ stage.confirmed_chapters }} 章</a></li>{% endfor %}</ul>{% endif %}
+  </section>{% endif %}
 <section aria-labelledby="official-heading"><h2 id="official-heading">官方正文</h2>
   <p>官方章节：{{ statistics.chapter_count }} 章</p><p>可见字数：{{ statistics.visible_character_count }}</p>
 </section>

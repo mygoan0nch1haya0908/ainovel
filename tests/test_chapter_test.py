@@ -175,6 +175,58 @@ def valid_setup_data(client: TestClient) -> dict[str, str]:
     }
 
 
+def test_new_single_chapter_run_explicitly_opts_into_v2_repair(
+    chapter_client: TestClient,
+    chapter_test_app,
+) -> None:
+    data = valid_setup_data(chapter_client)
+    data["repair_mode"] = "yes"
+    created = chapter_client.post(
+        "/chapter-test", data=data, follow_redirects=False
+    )
+    assert created.status_code == 303
+    workflow_id = created.headers["location"].rsplit("/", 1)[-1]
+    with chapter_test_app.state.session_factory() as session:
+        workflow = session.get(GenerationWorkflow, workflow_id)
+        assert workflow is not None and workflow.generation_version == 2
+
+
+def test_reuse_old_input_is_explicit_prefill_and_does_not_mutate_source(
+    chapter_client: TestClient,
+    chapter_test_app,
+) -> None:
+    created = chapter_client.post(
+        "/chapter-test",
+        data=valid_setup_data(chapter_client),
+        follow_redirects=False,
+    )
+    workflow_id = created.headers["location"].rsplit("/", 1)[-1]
+    with chapter_test_app.state.session_factory() as session:
+        source = session.get(GenerationWorkflow, workflow_id)
+        assert source is not None
+        project_id = source.project_id
+
+    confirmed = chapter_client.get(f"/chapter-test?project_id={project_id}")
+    assert 'action="/chapter-test/reuse/' in confirmed.text
+    assert 'value="雾城来信"' not in confirmed.text
+    before = chapter_test_app.state.provider_registry.get("qwen").requests[:]
+    reused = chapter_client.post(
+        f"/chapter-test/reuse/{project_id}",
+        data={
+            "csrf_token": form_tokens(chapter_client, f"/chapter-test?project_id={project_id}")["csrf_token"],
+            "reuse_confirm": "yes",
+        },
+    )
+    assert reused.status_code == 200
+    assert 'value="雾城来信"' in reused.text
+    assert "主角潜入旧邮局取得密信" in reused.text
+    assert "这是新任务的预填表单" in reused.text
+    assert chapter_test_app.state.provider_registry.get("qwen").requests == before
+    with chapter_test_app.state.session_factory() as session:
+        source = session.get(GenerationWorkflow, workflow_id)
+        assert source is not None and source.generation_version == 1
+
+
 def post_action(client: TestClient, workflow_id: str, suffix: str):
     page = client.get(f"/workflows/{workflow_id}")
     token = re.search(r'name="csrf_token" value="([^"]+)"', page.text)

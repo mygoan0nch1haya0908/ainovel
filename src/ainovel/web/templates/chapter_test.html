@@ -14,6 +14,7 @@
 
 <section aria-labelledby="setup-heading">
   <h2 id="setup-heading">设置与章节提纲</h2>
+  {% if reuse_notice %}<p class="notice">{{ reuse_notice }}</p>{% endif %}
   <form action="/chapter-test" method="post" data-confirm="确认这些设置与提纲，并创建一个尚未运行的单章工作流？">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <input type="hidden" name="submission_token" value="{{ submission_token }}">
@@ -29,6 +30,7 @@
       <p><label for="chapter_hook">章末钩子</label><textarea id="chapter_hook" name="chapter_hook" maxlength="{{ field_limits.chapter_hook }}" rows="3">{{ chapter_form.chapter_hook }}</textarea></p>
     </details>
     <p><label for="model_name">Qwen 模型</label><input id="model_name" name="model_name" maxlength="{{ field_limits.model_name }}" value="{{ chapter_form.model_name }}" required></p>
+    <p><label><input type="checkbox" name="repair_mode" value="yes"{% if chapter_form.repair_mode == "yes" %} checked{% endif %}> 启用 v2 短稿修补与章节覆盖检查（每章首次生成后最多两轮修补；会增加有界模型调用，仍不保证文学质量）。</label></p>
     <p><label><input type="checkbox" name="author_confirm" value="yes"{% if chapter_form.author_confirm == "yes" %} checked{% endif %} required> 我确认以上设定、暂定结局与章节提纲作为本次测试的已批准输入。</label></p>
     <button type="submit">创建单章测试工作流（不会调用模型）</button>
   </form>
@@ -51,6 +53,11 @@
   {% if confirmed_input.chapter_title %}<p>建议标题：{{ confirmed_input.chapter_title }}</p>{% endif %}
   {% if confirmed_input.chapter_goal %}<p>建议目标：{{ confirmed_input.chapter_goal }}</p>{% endif %}
   {% if confirmed_input.chapter_hook %}<p>建议钩子：{{ confirmed_input.chapter_hook }}</p>{% endif %}
+  <form action="/chapter-test/reuse/{{ confirmed_input.project.id }}" method="post" data-confirm="确认只把这些旧输入预填到一个新任务表单？原任务不会被重试或修改。">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="reuse_confirm" value="yes">
+    <button type="submit" class="secondary">复用旧输入到新任务（不会调用模型）</button>
+  </form>
 </section>
 {% endif %}
 {% endblock %}

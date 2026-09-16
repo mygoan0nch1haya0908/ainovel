@@ -22,6 +22,7 @@ from ainovel.providers.openai import OpenAIProvider
 from ainovel.providers.qwen import QwenProvider
 from ainovel.providers.registry import ProviderRegistry
 from ainovel.workflows.orchestrator import WorkflowOrchestrator
+from ainovel.services.workflows import DEFAULT_BUDGETS
 
 
 PROVIDER_CONTEXT_WINDOW_CEILING = 16_000
@@ -130,6 +131,7 @@ def create_app(
     app.state.engine = engine
     app.state.session_factory = create_session_factory(engine)
     app.state.provider_registry = provider_registry or _default_provider_registry(settings)
+    app.state.workflow_budgets = DEFAULT_BUDGETS
     orchestrator = WorkflowOrchestrator(
         app.state.session_factory,
         app.state.provider_registry,
@@ -155,9 +157,11 @@ def create_app(
 
     from ainovel.web.routes import router as web_router
     from ainovel.web.workflow_routes import router as workflow_router
+    from ainovel.web.stage_routes import router as stage_router
 
     app.include_router(web_router)
     app.include_router(workflow_router)
+    app.include_router(stage_router)
 
     @app.get("/health")
     def health() -> dict[str, str]:

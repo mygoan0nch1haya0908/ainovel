@@ -17,6 +17,8 @@ from ainovel.models.workflow import (
     WorkflowStep,
 )
 from ainovel.services.projects import ProjectService
+from ainovel.services.draft_repair import DraftRepairService
+from ainovel.services.stages import StageService
 from ainovel.services.workflows import (
     DEFAULT_BUDGETS,
     EXECUTABLE_WORKFLOW_STATUSES,
@@ -24,7 +26,7 @@ from ainovel.services.workflows import (
 )
 from ainovel.web.routes import _project_page, templates
 from ainovel.web.security import csrf_token, require_csrf
-from ainovel.web.presentation import WORKFLOW_LABELS, RUN_LABELS
+from ainovel.web.presentation import WORKFLOW_LABELS, RUN_LABELS, STEP_LABELS
 
 
 router = APIRouter()
@@ -103,6 +105,15 @@ def _workflow_context(
         and isinstance(artifact.payload.get("title"), str)
         and isinstance(artifact.payload.get("body", artifact.text_content), str)
     ]
+    work_drafts = DraftRepairService(session).list_for_workflow(workflow.id)
+    work_draft_by_ordinal = {draft.ordinal: draft for draft in work_drafts}
+    stage_context = StageService(session).workflow_context(workflow.id)
+    usage_complete = all(
+        attempt.input_tokens is not None and attempt.output_tokens is not None
+        for attempt in attempts
+    )
+    known_input_tokens = sum(attempt.input_tokens or 0 for attempt in attempts)
+    known_output_tokens = sum(attempt.output_tokens or 0 for attempt in attempts)
 
     return {
         "request": request,
@@ -126,6 +137,13 @@ def _workflow_context(
         "plan_chapters": plan_chapters,
         "review_issues": review_issues,
         "candidate_chapters": candidate_chapters,
+        "work_drafts": work_drafts,
+        "work_draft_by_ordinal": work_draft_by_ordinal,
+        "stage_context": stage_context,
+        "step_labels": STEP_LABELS,
+        "usage_complete": usage_complete,
+        "known_input_tokens": known_input_tokens,
+        "known_output_tokens": known_output_tokens,
         "csrf_token": csrf_token(request),
         "can_run": workflow.status in EXECUTABLE_WORKFLOW_STATUSES,
         "can_resume": can_resume,

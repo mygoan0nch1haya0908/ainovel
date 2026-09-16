@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}剧情阶段 · {{ project.title }}{% endblock %}
+{% block content %}
+<p><a href="/projects/{{ project.id }}">返回项目：{{ project.title }}</a></p>
+<h1>剧情阶段总体架构</h1>
+<section aria-labelledby="architecture-heading">
+  <h2 id="architecture-heading">作者确认的阶段输入</h2>
+  <div class="chapter-body" style="white-space: pre-wrap">{{ stage.architecture }}</div>
+  <p>阶段修订号：{{ stage.revision }}</p>
+  {% if estimated_chapters is not none %}<p><strong>已确认 {{ stage.confirmed_chapters }} / {{ estimated_chapters }} 章</strong>；剩余 {{ remaining_chapters }} 章。只有正式批准候选批次后才推进。</p>{% elif proposed_estimate is not none %}<p><strong>已确认 {{ stage.confirmed_chapters }} / {{ proposed_estimate }} 章</strong>（提案尚未批准，不作为正式总数）。</p>{% else %}<p>尚无已批准路线图，确认进度为 {{ stage.confirmed_chapters }} 章。</p>{% endif %}
+</section>
+
+<section aria-labelledby="roadmap-create-heading">
+  <h2 id="roadmap-create-heading">新路线图提案</h2>
+  <p>先创建冻结提案，不调用模型；下一步由作者明确点击生成。</p>
+  <form action="/stages/{{ stage.id }}/roadmaps" method="post" data-confirm="确认冻结这次架构与模型设置？此操作不会调用模型。">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p><label for="provider-name">Provider</label><select id="provider-name" name="provider_name"><option value="fake">Fake 演示</option><option value="ollama">Ollama</option><option value="openai">OpenAI</option><option value="qwen">Qwen</option></select></p>
+    <p><label for="model-name">模型名称</label><input id="model-name" name="model_name" value="demo" required></p>
+    <p><label for="architecture-revision">可选：修订后的总体架构</label><textarea id="architecture-revision" name="architecture" rows="6" placeholder="留空则沿用上方架构"></textarea></p>
+    <p><label><input type="checkbox" name="author_confirm" value="yes" required> 我确认架构和模型设置。</label></p>
+    <button type="submit">创建路线图提案（不会调用模型）</button>
+  </form>
+</section>
+
+<section aria-labelledby="roadmaps-heading">
+  <h2 id="roadmaps-heading">路线图版本</h2>
+  {% if roadmap_rows %}
+  {% for row in roadmap_rows %}{% set roadmap = row.roadmap %}
+  <article>
+    <h3>版本 {{ roadmap.version_number }} · {{ stage_status_labels.get(roadmap.status, roadmap.status) }}</h3>
+    <p>Provider / 模型：{{ roadmap.provider_name }} / {{ roadmap.model_name }}；尝试 {{ roadmap.attempts_used }} / {{ roadmap.attempt_limit }}</p>
+    <p>累计用量：输入 {{ roadmap.actual_input_tokens if roadmap.actual_input_tokens is not none else "未知" }} / 输出 {{ roadmap.actual_output_tokens if roadmap.actual_output_tokens is not none else "未知" }} Token{% if roadmap.actual_input_tokens is none or roadmap.actual_output_tokens is none %}（含未知项，合计不完整）{% endif %}</p>
+    {% if roadmap.status in ["PENDING", "PAUSED_PROVIDER", "PAUSED_INVALID"] %}
+    <form action="/stages/{{ stage.id }}/roadmaps/{{ roadmap.id }}/generate" method="post" data-confirm="确认调用 {{ roadmap.provider_name }} / {{ roadmap.model_name }} 生成路线图？可能产生费用。">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="model_call_confirm" value="yes">
+      <button type="submit">调用模型生成路线图（可能收费）</button>
+    </form>
+    {% elif roadmap.status == "RUNNING" %}<p class="notice error">该尝试记录为生成中。进程中断后不会自动恢复、重置预算或另建提案；请先人工核查持久状态。</p>{% endif %}
+    {% if roadmap.payload %}
+      <p><strong>预计 {{ roadmap.estimated_chapters }} 章</strong></p>
+      <p>目标：{{ roadmap.payload.goal }}；起点：{{ roadmap.payload.start_state }}；终点：{{ roadmap.payload.end_state }}</p>
+      <ol>{% for node in roadmap.payload.nodes %}<li><strong>阶段第 {{ node.ordinal }} 章 · {{ node.title }}</strong><br>目标：{{ node.goal }}{% if node.dependencies %}<br>依赖：{{ node.dependencies | join(", ") }}{% endif %}</li>{% endfor %}</ol>
+      {% if row.difference %}<details open><summary>与当前批准版的修订差异</summary><ul>{% for key, change in row.difference.items() %}<li>{{ key }}：{{ change.before if change.before is not none else "无" }} → {{ change.after }}</li>{% endfor %}</ul></details>{% endif %}
+      {% if roadmap.status == "PROPOSED" %}<form action="/stages/{{ stage.id }}/roadmaps/{{ roadmap.id }}/approve" method="post" data-confirm="确认批准此路线图？批准不会调用模型。"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="approval_confirm" value="yes"><button type="submit">批准路线图（不会调用模型）</button></form>{% endif %}
+    {% endif %}
+    {% if row.attempts %}<details><summary>路线图模型尝试</summary><ol>{% for attempt in row.attempts %}<li>第 {{ attempt.number }} 次 · {{ attempt.status }} · 输入 {{ attempt.input_tokens if attempt.input_tokens is not none else "未知" }} / 输出 {{ attempt.output_tokens if attempt.output_tokens is not none else "未知" }}{% if attempt.error_code %} · {{ attempt.error_code }}{% endif %}</li>{% endfor %}</ol></details>{% endif %}
+  </article>
+  {% endfor %}
+  {% else %}<p>尚未创建路线图提案。</p>{% endif %}
+</section>
+
+<section aria-labelledby="stage-batch-heading">
+  <h2 id="stage-batch-heading">滚动批次</h2>
+  {% if can_start_batch %}
+  <p>将从未确认节点中自动选择下一段；单批最多五章。启动任务不会调用模型，之后仍须分别生成并确认批次计划、生成并确认正文。</p>
+  <form action="/stages/{{ stage.id }}/batches" method="post" data-confirm="确认建立下一批工作流？此操作不会调用模型。">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p><label for="requested-chapters">本批最多章节数（1 至 5）</label><input id="requested-chapters" name="requested_chapters" type="number" min="1" max="5" value="5" required></p>
+    <p><label><input type="checkbox" name="author_confirm" value="yes" required> 我确认建立下一批任务。</label></p>
+    <button type="submit">建立下一批任务（不会调用模型）</button>
+  </form>
+  {% elif active_workflow %}<p>当前批次尚未完成作者审批与对账：<a href="/workflows/{{ active_workflow.id }}">{{ workflow_labels.get(active_workflow.status, active_workflow.status) }}</a>。不能提前启动下一批。</p>
+  {% elif project.active_batch_id %}<p>候选正文尚待作者批准或驳回，不能启动下一批。</p>
+  {% elif approved_roadmap and remaining_chapters == 0 %}<p>阶段路线图已全部确认。</p>
+  {% else %}<p>批准路线图后才能启动批次。</p>{% endif %}
+  {% if workflow_rows %}<h3>阶段批次记录</h3><ol>{% for row in workflow_rows %}<li><a href="/workflows/{{ row.workflow.id }}">{{ workflow_labels.get(row.workflow.status, row.workflow.status) }}</a>{% if row.mapping.committed_batch_id %} · 已正式确认{% else %} · 尚未推进阶段进度{% endif %}<ul>{% for node in row.nodes %}<li>批内第 {{ node.ordinal }} 章 · 阶段第 {{ node.stage_ordinal }} 章 · 全书第 {{ node.book_ordinal }} 章</li>{% endfor %}</ul></li>{% endfor %}</ol>{% endif %}
+</section>
+{% endblock %}
