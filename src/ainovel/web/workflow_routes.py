@@ -17,7 +17,7 @@ from ainovel.models.workflow import (
     WorkflowStep,
 )
 from ainovel.services.projects import ProjectService
-from ainovel.services.draft_repair import DraftRepairService
+from ainovel.services.draft_repair import DraftRepairService, coverage_excerpt_is_valid
 from ainovel.services.stages import StageService
 from ainovel.services.workflows import (
     DEFAULT_BUDGETS,
@@ -119,6 +119,25 @@ def _workflow_context(
     candidate_batch_status = candidate_batch.status if candidate_batch else None
     work_drafts = DraftRepairService(session).list_for_workflow(workflow.id)
     work_draft_by_ordinal = {draft.ordinal: draft for draft in work_drafts}
+    coverage_rows = []
+    for artifact in artifacts:
+        if artifact.kind != "chapter_coverage":
+            continue
+        draft = work_draft_by_ordinal.get(artifact.ordinal)
+        for key, label in (("goal", "目标覆盖"), ("ending_hook", "章末钩子覆盖")):
+            verdict = artifact.payload.get(key, {})
+            if not isinstance(verdict, dict):
+                verdict = {}
+            excerpt = verdict.get("excerpt")
+            issues = verdict.get("issues", [])
+            coverage_rows.append({
+                "ordinal": artifact.ordinal, "label": label,
+                "passed": verdict.get("passed") is True,
+                "excerpt": excerpt if isinstance(excerpt, str) else "",
+                "excerpt_valid": coverage_excerpt_is_valid(draft.body if draft else None, excerpt),
+                "issues": [issue for issue in issues if isinstance(issue, str) and issue.strip()]
+                if isinstance(issues, list) else [],
+            })
     promoted_ordinals = {
         chapter["ordinal"] for chapter in candidate_chapters
         if isinstance(chapter["ordinal"], int)
@@ -163,6 +182,7 @@ def _workflow_context(
         "decisions": decisions,
         "plan_chapters": plan_chapters,
         "review_issues": review_issues,
+        "coverage_rows": coverage_rows,
         "candidate_chapters": candidate_chapters,
         "work_drafts": work_drafts,
         "work_draft_rows": work_draft_rows,

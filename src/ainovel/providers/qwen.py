@@ -112,6 +112,22 @@ class QwenProvider:
         except APIStatusError:
             raise ResponseFailure(FailureReason.HTTP) from None
 
+        # Validate metadata independently before parsing potentially invalid content.
+        provider_response_id = getattr(response, "id", None)
+        if not isinstance(provider_response_id, str) or not provider_response_id.strip():
+            provider_response_id = None
+        usage = getattr(response, "usage", None)
+        input_tokens = getattr(usage, "prompt_tokens", None)
+        output_tokens = getattr(usage, "completion_tokens", None)
+        if type(input_tokens) is not int or input_tokens < 0:
+            input_tokens = None
+        if type(output_tokens) is not int or output_tokens < 0:
+            output_tokens = None
+        metadata = ModelResponse(
+            structured=None, text=None, provider_response_id=provider_response_id,
+            input_tokens=input_tokens, output_tokens=output_tokens,
+            latency_ms=round((perf_counter() - started) * 1000),
+        )
         try:
             choices = response.choices
             if not isinstance(choices, list) or not choices:
@@ -135,22 +151,14 @@ class QwenProvider:
                 raise ResponseFailure(FailureReason.JSON) from None
             if not isinstance(structured, dict):
                 raise ResponseFailure(FailureReason.JSON)
+        except ResponseFailure as error:
+            error.response = metadata
+            raise
         except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
-            raise ResponseFailure(FailureReason.ENVELOPE) from None
+            raise ResponseFailure(FailureReason.ENVELOPE, response=metadata) from None
 
-        try:
-            provider_response_id = response.id
-            usage = response.usage
-            input_tokens = usage.prompt_tokens
-            output_tokens = usage.completion_tokens
-            if not isinstance(provider_response_id, str) or not provider_response_id.strip():
-                raise ValueError("response ID is invalid")
-            if type(input_tokens) is not int or input_tokens < 0:
-                raise ValueError("prompt token count is invalid")
-            if type(output_tokens) is not int or output_tokens < 0:
-                raise ValueError("completion token count is invalid")
-        except (AttributeError, TypeError, ValueError):
-            raise ResponseFailure(FailureReason.METADATA) from None
+        if provider_response_id is None or input_tokens is None or output_tokens is None:
+            raise ResponseFailure(FailureReason.METADATA, response=metadata) from None
 
         return ModelResponse(
             structured=structured,

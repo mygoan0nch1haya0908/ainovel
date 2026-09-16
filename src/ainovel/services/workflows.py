@@ -960,7 +960,7 @@ class WorkflowService:
         response: ModelResponse,
         artifact: BaseModel | Mapping[str, object],
         finalize_step: bool = True,
-    ) -> WorkflowArtifact:
+    ) -> WorkflowArtifact | None:
         self._validate_response(response)
         self.session.expire_all()
         attempt = self.session.get(ModelAttempt, attempt_id)
@@ -1009,6 +1009,14 @@ class WorkflowService:
                 )
             raise ValueError("attempt completion conflict")
 
+        over_budget = workflow.generation_version == 2 and (
+            workflow.total_input_token_limit is None
+            or workflow.total_output_token_limit is None
+            or workflow.actual_input_tokens + (response.input_tokens or 0)
+            > workflow.total_input_token_limit
+            or workflow.actual_output_tokens + (response.output_tokens or 0)
+            > workflow.total_output_token_limit
+        )
         try:
             artifact_values = self._artifact_values(workflow, step, artifact)
             effective_finalize = finalize_step
@@ -1026,11 +1034,15 @@ class WorkflowService:
                     workflow, step, artifact_values, effective_finalize
                 )
             )
+            if over_budget:
+                target_status, target_position, target_step_status, make_active = (
+                    "PAUSED_ATTEMPTS", step.position, "PAUSED", False
+                )
             self._require_transition(workflow.status, target_status)
         except Exception:
             self.session.rollback()
             raise
-        artifact_row = WorkflowArtifact(
+        artifact_row = None if over_budget else WorkflowArtifact(
             id=str(uuid4()),
             workflow_id=workflow.id,
             step_id=step.id,
@@ -1041,16 +1053,18 @@ class WorkflowService:
             visible_char_count=artifact_values.visible_char_count,
             content_hash=artifact_values.content_hash,
         )
-        self.session.add(artifact_row)
+        if artifact_row is not None:
+            self.session.add(artifact_row)
         try:
             self.session.flush()
             promoted_artifact = None
-            if workflow.generation_version == 2 and step.kind == "WRITING":
+            if artifact_row is not None and workflow.generation_version == 2 and step.kind == "WRITING":
                 persist_work_draft(
                     self.session, workflow, step, attempt, artifact_row
                 )
             if (
-                workflow.generation_version == 2
+                artifact_row is not None
+                and workflow.generation_version == 2
                 and step.kind == "VALIDATING_CHAPTER"
                 and target_status != "PAUSED_REVIEW"
             ):
@@ -1085,12 +1099,15 @@ class WorkflowService:
                     + (response.output_tokens or 0),
                     revision=workflow.revision + 1,
                     last_error_code=(
-                        "review_blocked" if target_status == "PAUSED_REVIEW" else None
+                        "workflow_budget_exhausted" if over_budget
+                        else "review_blocked" if target_status == "PAUSED_REVIEW" else None
                     ),
                     last_error_detail=(
-                        "batch review requires author attention"
-                        if target_status == "PAUSED_REVIEW"
-                        else None
+                        "workflow model call or token budget exhausted" if over_budget
+                        else ("chapter coverage requires author attention"
+                              if step.kind == "VALIDATING_CHAPTER"
+                              else "batch review requires author attention")
+                        if target_status == "PAUSED_REVIEW" else None
                     ),
                 )
             )
@@ -1133,13 +1150,13 @@ class WorkflowService:
                     ModelAttempt.status == "RUNNING",
                 )
                 .values(
-                    status="COMPLETED",
+                    status="FAILED" if over_budget else "COMPLETED",
                     provider_response_id=response.provider_response_id,
                     input_tokens=response.input_tokens,
                     output_tokens=response.output_tokens,
                     latency_ms=response.latency_ms,
-                    error_code=None,
-                    error_detail=None,
+                    error_code="workflow_budget_exhausted" if over_budget else None,
+                    error_detail="workflow token budget exceeded by response" if over_budget else None,
                 )
             )
             if (
@@ -2272,7 +2289,9 @@ class WorkflowService:
         if expected_kind is None:
             raise ValueError("workflow step does not accept model artifacts")
         if isinstance(artifact, BaseModel):
-            raw_payload: object = artifact.model_dump(mode="json")
+            raw_payload: object = artifact.model_dump(
+                mode="json", exclude_unset=step.kind == "VALIDATING_CHAPTER"
+            )
             kind: object = expected_kind
             ordinal: object = step.ordinal
             text_content: object = None
@@ -2307,7 +2326,7 @@ class WorkflowService:
             )
             payload = schemas[_STEP_PROMPT_ROLES[step.kind]].model_validate(
                 payload
-            ).model_dump(mode="json")
+            ).model_dump(mode="json", exclude_unset=step.kind == "VALIDATING_CHAPTER")
         except (KeyError, ValueError, TypeError):
             raise ValueError("artifact payload failed validation") from None
         if step.kind == "WRITING":

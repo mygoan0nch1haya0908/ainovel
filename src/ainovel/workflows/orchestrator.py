@@ -462,6 +462,9 @@ class WorkflowOrchestrator:
         finally:
             service.session.close()
 
+        if artifact is None:
+            return self._current_result(step.workflow_id)
+
         if step.kind == "WRITING" and generation_version == 1:
             self._persist_validation_artifact(
                 artifact.id, self._attempt_validations.get(attempt_id, {})

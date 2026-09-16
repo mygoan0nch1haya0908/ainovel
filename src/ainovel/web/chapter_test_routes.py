@@ -299,7 +299,8 @@ def _create_workflow_atomically(
         candidate = OutlineService(session).create_candidate(
             project.id,
             _outline_nodes(values),
-            reason="作者确认的单章测试输入",
+            reason=("作者确认的剧情阶段总体架构输入" if values.get("setup_mode") == "stage"
+                    else "作者确认的单章测试输入"),
         )
         stage = "outline_approve"
         OutlineService(session).approve(candidate.id)

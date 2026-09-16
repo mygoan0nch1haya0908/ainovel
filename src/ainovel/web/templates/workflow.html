@@ -101,6 +101,21 @@
 </section>
 {% endif %}
 
+{% if coverage_rows %}
+<section aria-labelledby="coverage-heading">
+  <h2 id="coverage-heading">章节覆盖检查结果</h2>
+  {% for row in coverage_rows %}<article>
+    <h3>第 {{ row.ordinal }} 章 · {{ row.label }}</h3>
+    <p>语义判定：{{ "通过" if row.passed else "未通过" }}</p>
+    <p>{{ "摘录有效：已核对正文原文" if row.excerpt_valid else "摘录无效：不是正文中的非空连续原文" }}</p>
+    <blockquote>{{ row.excerpt or "未提供摘录" }}</blockquote>
+    {% if row.issues %}<ul>{% for issue in row.issues %}<li>{{ issue }}</li>{% endfor %}</ul>
+    {% elif not row.passed %}<p>此记录未提供具体问题说明，请结合目标与正文审阅。</p>{% endif %}
+  </article>{% endfor %}
+  <p class="muted">语义判定与摘录核验均通过才可提升为候选正文；作者批次批准仍须单独完成。</p>
+</section>
+{% endif %}
+
 {% if work_draft_rows %}
 <section aria-labelledby="work-drafts-heading">
   <h2 id="work-drafts-heading">v2 工作稿历史</h2>

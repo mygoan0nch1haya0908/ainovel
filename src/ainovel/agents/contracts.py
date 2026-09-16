@@ -88,8 +88,13 @@ class WorkChapterDraft(AgentSchema):
 
 
 class CoverageVerdict(AgentSchema):
+    # New strict wire schemas require every property; parsing remains compatible
+    # with historical snapshots that never requested issues.
+    model_config = ConfigDict(json_schema_extra={"required": ["passed", "excerpt", "issues"]})
     passed: bool
     excerpt: str
+    # Older frozen v2 snapshots only requested passed/excerpt.
+    issues: list[str] = Field(default_factory=list)
 
 
 class ChapterCoverage(AgentSchema):

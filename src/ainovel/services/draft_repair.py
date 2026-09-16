@@ -208,6 +208,13 @@ def persist_work_draft(
     return state
 
 
+def coverage_excerpt_is_valid(body: object, excerpt: object) -> bool:
+    return (
+        isinstance(body, str) and isinstance(excerpt, str)
+        and bool(excerpt.strip()) and excerpt in body
+    )
+
+
 def coverage_is_valid(
     session: Session, step: WorkflowStep, payload: dict[str, object]
 ) -> bool:
@@ -222,7 +229,7 @@ def coverage_is_valid(
         if not isinstance(verdict, dict) or verdict.get("passed") is not True:
             return False
         excerpt = verdict.get("excerpt")
-        if not isinstance(excerpt, str) or not excerpt.strip() or excerpt not in body:
+        if not coverage_excerpt_is_valid(body, excerpt):
             return False
     return True
 
