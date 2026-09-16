@@ -6,9 +6,12 @@ from pydantic import BaseModel
 
 from ainovel.agents.contracts import (
     BatchPlanDraft,
+    BatchPlanDraftV2,
     BatchReview,
+    ChapterCoverage,
     ChapterDraft,
     ChapterSummaryDelta,
+    WorkChapterDraft,
 )
 
 
@@ -49,4 +52,22 @@ AGENT_PARAMETERS: Mapping[str, dict[str, object]] = {
     "chapter_writer": {"max_input_tokens": 32_000, "max_output_tokens": 12_000},
     "chapter_summarizer": {"max_input_tokens": 16_000, "max_output_tokens": 4_000},
     "batch_reviewer": {"max_input_tokens": 32_000, "max_output_tokens": 6_000},
+}
+
+
+V2_BUILTIN_PROMPTS: Mapping[str, str] = {
+    "batch_planner": """你是新版批次规划代理。依据官方大纲和作者锁定约束，为每章输出有顺序的场景及字数预算。场景预算总和必须在 4500–6000，目标约 5200。不得输出正文、解释或 Schema 之外的字段。""",
+    "chapter_writer": """你是新版章节主笔代理。依据已批准场景计划写出完整候选章。若任务包含 repair，必须以其中的最新完整草稿为基础，在已批准场景内补足有效行动、冲突和因果，返回完整修订章；不得提前消耗后续事件或重复填充。只输出 WorkChapterDraft Schema 的 title 和 body。""",
+    "chapter_coverage_reviewer": """你是章节覆盖审阅代理。分别判断正文是否落实本章 goal 和 ending_hook，并为每个肯定判断提供正文中的原样、连续、精确摘录。每个目标均须输出 issues：未通过时列出具体未落实的问题，通过时为空列表。不得要求正文逐字复述计划标签；不得编造或改写证据。只输出 ChapterCoverage Schema。""",
+    "chapter_summarizer": BUILTIN_PROMPTS["chapter_summarizer"],
+    "batch_reviewer": BUILTIN_PROMPTS["batch_reviewer"],
+}
+
+
+V2_AGENT_SCHEMAS: Mapping[str, type[BaseModel]] = {
+    "batch_planner": BatchPlanDraftV2,
+    "chapter_writer": WorkChapterDraft,
+    "chapter_coverage_reviewer": ChapterCoverage,
+    "chapter_summarizer": ChapterSummaryDelta,
+    "batch_reviewer": BatchReview,
 }

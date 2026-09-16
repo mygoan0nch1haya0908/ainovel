@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -57,6 +58,15 @@ class GenerationWorkflow(TimestampMixin, Base):
     provider_name: Mapped[str] = mapped_column(String(64), nullable=False)
     model_name: Mapped[str] = mapped_column(String(255), nullable=False)
     requested_chapters: Mapped[int] = mapped_column(Integer, nullable=False)
+    generation_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
+    model_call_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_input_token_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_output_token_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    model_calls_used: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
     status: Mapped[str] = mapped_column(String(64), nullable=False)
     current_position: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
@@ -116,6 +126,9 @@ class WorkflowStep(Base):
     attempt_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )
+    protocol_failure_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
     active_artifact_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(
@@ -161,6 +174,36 @@ class WorkflowArtifact(TimestampMixin, Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     visible_char_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class ChapterDraftRepair(TimestampMixin, Base):
+    __tablename__ = "chapter_draft_repairs"
+    __table_args__ = (
+        UniqueConstraint("writing_step_id"),
+        Index("ix_chapter_draft_repairs_workflow", "workflow_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    workflow_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("generation_workflows.id"), nullable=False
+    )
+    writing_step_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("workflow_steps.id"), nullable=False
+    )
+    latest_attempt_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("model_attempts.id"), nullable=False
+    )
+    latest_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    visible_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    repair_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    repair_pending: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+    draft_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
 
 
 class PlanDecision(TimestampMixin, Base):

@@ -17,6 +17,8 @@ from ainovel.models.workflow import (
     WorkflowStep,
 )
 from ainovel.services.projects import ProjectService
+from ainovel.services.draft_repair import DraftRepairService, coverage_excerpt_is_valid
+from ainovel.services.stages import StageService
 from ainovel.services.workflows import (
     DEFAULT_BUDGETS,
     EXECUTABLE_WORKFLOW_STATUSES,
@@ -24,6 +26,7 @@ from ainovel.services.workflows import (
 )
 from ainovel.web.routes import _project_page, templates
 from ainovel.web.security import csrf_token, require_csrf
+from ainovel.web.presentation import WORKFLOW_LABELS, RUN_LABELS, STEP_LABELS
 
 
 router = APIRouter()
@@ -90,10 +93,84 @@ def _workflow_context(
         issues = artifact.payload.get("issues", [])
         if isinstance(issues, list):
             review_issues.extend(issue for issue in issues if isinstance(issue, str))
+    candidate_chapters = [
+        {
+            "title": artifact.payload.get("title", ""),
+            "body": artifact.payload.get("body", artifact.text_content or ""),
+            "visible_char_count": artifact.visible_char_count,
+            "ordinal": artifact.ordinal,
+        }
+        for artifact in artifacts
+        if artifact.kind == "chapter_draft"
+        and isinstance(artifact.payload.get("title"), str)
+        and isinstance(artifact.payload.get("body", artifact.text_content), str)
+    ]
+    candidate_batch_id = workflow.candidate_batch_id or session.scalar(
+        select(WritingBatch.id).where(
+            WritingBatch.source_workflow_id == workflow.id,
+            WritingBatch.project_id == workflow.project_id,
+        )
+    )
+    candidate_batch = (
+        session.get(WritingBatch, candidate_batch_id)
+        if candidate_batch_id is not None
+        else None
+    )
+    candidate_batch_status = candidate_batch.status if candidate_batch else None
+    work_drafts = DraftRepairService(session).list_for_workflow(workflow.id)
+    work_draft_by_ordinal = {draft.ordinal: draft for draft in work_drafts}
+    coverage_rows = []
+    for artifact in artifacts:
+        if artifact.kind != "chapter_coverage":
+            continue
+        draft = work_draft_by_ordinal.get(artifact.ordinal)
+        for key, label in (("goal", "目标覆盖"), ("ending_hook", "章末钩子覆盖")):
+            verdict = artifact.payload.get(key, {})
+            if not isinstance(verdict, dict):
+                verdict = {}
+            excerpt = verdict.get("excerpt")
+            issues = verdict.get("issues", [])
+            coverage_rows.append({
+                "ordinal": artifact.ordinal, "label": label,
+                "passed": verdict.get("passed") is True,
+                "excerpt": excerpt if isinstance(excerpt, str) else "",
+                "excerpt_valid": coverage_excerpt_is_valid(draft.body if draft else None, excerpt),
+                "issues": [issue for issue in issues if isinstance(issue, str) and issue.strip()]
+                if isinstance(issues, list) else [],
+            })
+    promoted_ordinals = {
+        chapter["ordinal"] for chapter in candidate_chapters
+        if isinstance(chapter["ordinal"], int)
+    }
+    work_draft_rows = []
+    for draft in work_drafts:
+        if draft.ordinal not in promoted_ordinals:
+            state = "unaccepted"
+        elif workflow.status == "COMPLETED" or candidate_batch_status == "approved":
+            state = "author_approved"
+        elif workflow.status == "REJECTED" or candidate_batch_status == "rejected":
+            state = "author_rejected"
+        else:
+            state = "promoted"
+        work_draft_rows.append({"draft": draft, "state": state})
+    stage_context = StageService(session).workflow_context(workflow.id)
+    usage_complete = all(
+        attempt.input_tokens is not None and attempt.output_tokens is not None
+        for attempt in attempts
+    )
+    known_input_tokens = sum(attempt.input_tokens or 0 for attempt in attempts)
+    known_output_tokens = sum(attempt.output_tokens or 0 for attempt in attempts)
 
     return {
         "request": request,
         "workflow": workflow,
+        "workflow_labels": WORKFLOW_LABELS,
+        "run_label": RUN_LABELS.get(workflow.status, "继续生成"),
+        "progress_step": (
+            4 if workflow.status in {"AWAITING_CONTENT_APPROVAL", "COMPLETED"}
+            else 3 if any(decision.decision == "approved" for decision in decisions)
+            else 2 if plan_chapters else 1
+        ),
         "project": project,
         "steps": steps,
         "attempt_rows": [
@@ -105,17 +182,26 @@ def _workflow_context(
         "decisions": decisions,
         "plan_chapters": plan_chapters,
         "review_issues": review_issues,
+        "coverage_rows": coverage_rows,
+        "candidate_chapters": candidate_chapters,
+        "work_drafts": work_drafts,
+        "work_draft_rows": work_draft_rows,
+        "work_draft_by_ordinal": work_draft_by_ordinal,
+        "stage_context": stage_context,
+        "step_labels": STEP_LABELS,
+        "usage_complete": usage_complete,
+        "known_input_tokens": known_input_tokens,
+        "known_output_tokens": known_output_tokens,
         "csrf_token": csrf_token(request),
         "can_run": workflow.status in EXECUTABLE_WORKFLOW_STATUSES,
         "can_resume": can_resume,
         "can_cancel": can_cancel,
-        "candidate_batch_id": workflow.candidate_batch_id or session.scalar(
-            select(WritingBatch.id).where(
-                WritingBatch.source_workflow_id == workflow.id,
-                WritingBatch.project_id == workflow.project_id,
-            )
-        ),
+        "candidate_batch_id": candidate_batch_id,
+        "candidate_batch_status": candidate_batch_status,
         "is_paused": workflow.status.startswith("PAUSED_"),
+        "chapter_test_mode": bool(
+            getattr(request.app.state, "chapter_test_mode", False)
+        ),
     }
 
 
@@ -180,6 +266,11 @@ def create_workflow(
         return _project_page(
             request, session, project_id, "计划章节数必须是整数", 422
         )
+    required_count = getattr(request.app.state, "required_workflow_chapters", None)
+    if required_count is not None and count != required_count:
+        return _project_page(
+            request, session, project_id, "单章测试仅允许生成 1 章", 422
+        )
     if not request.app.state.provider_registry.contains(provider_name):
         return _project_page(request, session, project_id, "Provider 未配置", 422)
     try:
@@ -188,7 +279,7 @@ def create_workflow(
             provider_name,
             model_name,
             count,
-            DEFAULT_BUDGETS,
+            getattr(request.app.state, "workflow_budgets", DEFAULT_BUDGETS),
         )
     except (ValueError, PermissionError) as error:
         return _project_page(

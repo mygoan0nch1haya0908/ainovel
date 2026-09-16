@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from html import unescape
+from html.parser import HTMLParser
 import re
 from uuid import uuid4
 
@@ -17,6 +18,7 @@ from ainovel.models.batch import Chapter
 from ainovel.models.prompt import WorkflowPromptSnapshot
 from ainovel.models.project import NovelProject
 from ainovel.models.workflow import (
+    ChapterDraftRepair,
     GenerationWorkflow,
     ModelAttempt,
     WorkflowArtifact,
@@ -149,6 +151,164 @@ def post_workflow_action(
         },
         follow_redirects=False,
     )
+
+
+def test_workflow_uses_stage_specific_actions_and_empty_preview(client, workflow):
+    page = client.get(f'/workflows/{workflow.id}')
+    assert 'aria-label="创作进度"' in page.text
+    assert '生成章节计划</button>' in page.text
+    assert '尚未生成正文' in page.text
+    post_workflow_action(client, workflow.id, 'run')
+    page = client.get(f'/workflows/{workflow.id}')
+    assert '确认计划（不会调用模型）</button>' in page.text
+    post_workflow_action(client, workflow.id, 'plan/approve')
+    page = client.get(f'/workflows/{workflow.id}')
+    assert '生成正文</button>' in page.text
+
+
+def test_cancelled_workflow_remains_accessible_from_project(client, session, workflow):
+    workflow.status = 'CANCELLED'
+    workflow.last_error_code = 'provider_protocol'
+    project = session.get(NovelProject, workflow.project_id)
+    project.active_workflow_id = None
+    session.commit()
+    page = client.get(f'/projects/{project.id}')
+    assert f'href="/workflows/{workflow.id}"' in page.text
+    assert '已取消' in page.text
+    detail = client.get(f'/workflows/{workflow.id}')
+    assert '已取消' in detail.text
+    assert 'provider_protocol' in detail.text
+    assert '未记录细分原因' in detail.text
+    assert f'action="/workflows/{workflow.id}/run"' not in detail.text
+
+
+class DetailsVisibility(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.closed_details = []
+        self.candidate_hidden = None
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag == 'details':
+            self.closed_details.append('open' not in attributes)
+        if attributes.get('aria-labelledby') == 'candidate-chapters-heading':
+            self.candidate_hidden = any(self.closed_details)
+
+    def handle_endtag(self, tag):
+        if tag == 'details':
+            self.closed_details.pop()
+
+
+def test_workflow_body_is_not_hidden_inside_budget_details(client, workflow):
+    empty = DetailsVisibility()
+    empty.feed(client.get(f'/workflows/{workflow.id}').text)
+    assert empty.closed_details == []
+    post_workflow_action(client, workflow.id, 'run')
+    post_workflow_action(client, workflow.id, 'plan/approve')
+    post_workflow_action(client, workflow.id, 'run')
+    generated = DetailsVisibility()
+    generated.feed(client.get(f'/workflows/{workflow.id}').text)
+    assert generated.candidate_hidden is False
+    assert generated.closed_details == []
+
+
+def test_v2_failed_work_draft_is_escaped_separate_and_marks_partial_usage(
+    client: TestClient, session, workflow: GenerationWorkflow
+) -> None:
+    workflow.generation_version = 2
+    workflow.status = "PAUSED_REVIEW"
+    workflow.last_error_code = "provider_protocol"
+    workflow.last_error_detail = "provider returned an invalid response"
+    writing = WorkflowStep(
+        id=str(uuid4()), workflow_id=workflow.id, kind="WRITING", ordinal=1,
+        position=1, status="PAUSED", attempt_count=2, protocol_failure_count=1,
+    )
+    coverage = WorkflowStep(
+        id=str(uuid4()), workflow_id=workflow.id, kind="VALIDATING_CHAPTER",
+        ordinal=1, position=2, status="PENDING",
+    )
+    attempt = ModelAttempt(
+        id=str(uuid4()), step_id=writing.id, attempt_number=2, status="FAILED",
+        request_digest="d" * 64, provider_response_id=None,
+        input_tokens=None, output_tokens=None, latency_ms=None,
+        error_code="provider_protocol", error_detail="provider returned an invalid response",
+    )
+    session.add_all([writing, coverage])
+    session.flush()
+    session.add(attempt)
+    session.flush()
+    session.add(ChapterDraftRepair(
+        id=str(uuid4()), workflow_id=workflow.id, writing_step_id=writing.id,
+        latest_attempt_id=attempt.id,
+        latest_payload={"title": "<b>未批准</b>", "body": "<script>alert('x')</script>"},
+        visible_count=18, repair_count=2, repair_pending=False, draft_revision=3,
+    ))
+    session.commit()
+
+    page = client.get(f"/workflows/{workflow.id}")
+    assert page.status_code == 200
+    assert "隔离的未批准工作稿" in page.text
+    assert "修补轮次：2 / 2" in page.text
+    assert "章节覆盖检查" in page.text
+    assert "含未知项，合计不完整" in page.text
+    assert "未记录细分原因" in page.text
+    assert "&lt;script&gt;alert" in page.text
+    assert "<script>alert" not in page.text
+
+
+@pytest.mark.parametrize(
+    ("workflow_status", "expected_state"),
+    [
+        ("AWAITING_CONTENT_APPROVAL", "已提升为候选正文，等待作者批准"),
+        ("COMPLETED", "已获作者批准"),
+    ],
+)
+def test_promoted_work_draft_history_has_exact_nonfailure_state_without_duplicate_body(
+    client: TestClient,
+    session,
+    workflow: GenerationWorkflow,
+    workflow_status: str,
+    expected_state: str,
+) -> None:
+    workflow.generation_version = 2
+    workflow.status = workflow_status
+    writing = WorkflowStep(
+        id=str(uuid4()), workflow_id=workflow.id, kind="WRITING", ordinal=1,
+        position=1, status="SUCCEEDED", attempt_count=1,
+    )
+    attempt = ModelAttempt(
+        id=str(uuid4()), step_id=writing.id, attempt_number=1, status="SUCCEEDED",
+        request_digest="e" * 64, provider_response_id="accepted-draft",
+        input_tokens=100, output_tokens=200, latency_ms=3,
+    )
+    session.add(writing)
+    session.flush()
+    session.add(attempt)
+    session.flush()
+    body = "<script>accepted-history</script>"
+    session.add_all([
+        ChapterDraftRepair(
+            id=str(uuid4()), workflow_id=workflow.id, writing_step_id=writing.id,
+            latest_attempt_id=attempt.id,
+            latest_payload={"title": "已提升章", "body": body},
+            visible_count=4500, repair_count=1, repair_pending=False, draft_revision=2,
+        ),
+        WorkflowArtifact(
+            id=str(uuid4()), workflow_id=workflow.id, step_id=writing.id,
+            kind="chapter_draft", ordinal=1, text_content=body,
+            payload={"title": "已提升章", "body": body},
+            visible_char_count=4500, content_hash="f" * 64,
+        ),
+    ])
+    session.commit()
+
+    page = client.get(f"/workflows/{workflow.id}")
+    assert page.status_code == 200
+    assert expected_state in page.text
+    assert "尚未提升为候选正文" not in page.text
+    assert "不是正式候选正文" not in page.text
+    assert page.text.count("&lt;script&gt;accepted-history&lt;/script&gt;") == 1
 
 
 def create_ready_project(session_factory, title: str) -> str:

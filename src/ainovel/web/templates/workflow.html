@@ -2,17 +2,34 @@
 {% block title %}工作流 {{ workflow.id }} · AI 小说工作台{% endblock %}
 {% block content %}
 <p><a href="/projects/{{ project.id }}">返回项目：{{ project.title }}</a></p>
+{% if chapter_test_mode %}
+<aside aria-label="单章测试提示">
+  <p><strong>TEST · 单章写作测试</strong></p>
+  <p>这是独立测试数据库中的候选内容，不是已发布正文，也不会自动发布。</p>
+  <p><a href="/chapter-test?project_id={{ project.id }}">返回测试设置并查看已确认输入</a></p>
+</aside>
+{% endif %}
 <h1>生成工作流</h1>
+<ol class="progress" aria-label="创作进度">
+{% for label in ["确认输入", "生成计划", "确认计划", "生成正文", "审阅正文"] %}
+<li{% if loop.index0 == progress_step %} aria-current="step"{% elif loop.index0 < progress_step %} class="done"{% endif %}>{{ loop.index }} · {{ label }}</li>
+{% endfor %}
+</ol>
 <section aria-labelledby="workflow-status-heading">
   <h2 id="workflow-status-heading">当前状态</h2>
-  <p><strong>{{ workflow.status }}</strong></p>
+  <p><strong>{{ workflow_labels.get(workflow.status, workflow.status) }}</strong> <span class="muted">{{ workflow.status }}</span></p>
+  {% if workflow.status in ["CANCELLED", "FAILED", "REJECTED"] %}<p class="notice error">本次生成已结束，不会继续自动生成。已有计划和正文（如有）仍保留在此页。请返回项目处理候选批次后，按需创建新任务。</p>{% endif %}
   <p>Provider / 模型：{{ workflow.provider_name }} / {{ workflow.model_name }}</p>
   <p>计划章节：{{ workflow.requested_chapters }}；当前位置：{{ workflow.current_position }}</p>
-  {% if is_paused %}
+  {% if stage_context %}<p><a href="/stages/{{ stage_context.stage_id }}">返回剧情阶段</a> · 本批从已确认 {{ stage_context.confirmed_chapters }} 章后开始</p><ul>{% for node in stage_context.nodes %}<li>批内第 {{ node.ordinal }} 章 · 阶段第 {{ node.stage_ordinal }} 章 · 全书第 {{ node.book_ordinal }} 章 · {{ node.title }}</li>{% endfor %}</ul>{% endif %}
+  {% if is_paused or workflow.last_error_code %}
   <details open>
-    <summary>暂停原因（需要处理）</summary>
+    <summary>最近的暂停 / 失败原因</summary>
     <p>错误类别：{{ workflow.last_error_code or "未分类" }}</p>
     <p>{{ workflow.last_error_detail or "没有可公开的详细信息" }}</p>
+    {% if workflow.last_error_code == "provider_protocol" and workflow.last_error_detail in [none, "provider returned an invalid response"] %}
+    <p>此记录未记录细分原因，无法追溯具体是格式、截断还是字数 / 内容校验失败。新增诊断只对更新后的调用生效，不会自动重试。</p>
+    {% endif %}
   </details>
   {% endif %}
 </section>
@@ -22,12 +39,14 @@
   {% if can_run %}
   <form action="/workflows/{{ workflow.id }}/run" method="post">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <button type="submit">运行至下一道门</button>
+    <button type="submit">{{ run_label }}</button>
   </form>
+  <p class="muted">点击后运行至下一次作者确认；模型调用可能收费，请等待响应，不要重复提交。</p>
   {% elif workflow.status == "AWAITING_PLAN_APPROVAL" %}
-  <form action="/workflows/{{ workflow.id }}/plan/approve" method="post" data-confirm="确认批准此计划并开始按顺序生成章节？">
+  <p>请先阅读下方计划。确认计划不会调用模型，之后还需点击“生成正文”。</p>
+  <form action="/workflows/{{ workflow.id }}/plan/approve" method="post" data-confirm="确认采用下方计划？此操作不会调用模型。">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <button type="submit">批准计划</button>
+    <button type="submit">确认计划（不会调用模型）</button>
   </form>
   <form action="/workflows/{{ workflow.id }}/plan/reject" method="post" data-confirm="确认驳回此计划？">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -37,7 +56,7 @@
   {% elif can_resume %}
   <form action="/workflows/{{ workflow.id }}/resume" method="post">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <button type="submit">恢复工作流</button>
+    <button type="submit">恢复工作流（恢复后再手动运行）</button>
   </form>
   {% elif workflow.status == "AWAITING_CONTENT_APPROVAL" or (is_paused and candidate_batch_id) %}
   <p>候选批次已准备好，等待作者审批。</p>
@@ -49,7 +68,8 @@
   <p>当前状态没有可用的作者操作。</p>
   {% endif %}
   {% if candidate_batch_id %}
-  <p><a href="/projects/{{ project.id }}#batch-{{ candidate_batch_id }}">前往候选批次审批</a></p>
+  <p><a class="button secondary" href="/batches/{{ candidate_batch_id }}">查看正文并审阅批次</a></p>
+  <p><a href="/projects/{{ project.id }}#batch-{{ candidate_batch_id }}">返回项目批次列表</a></p>
   {% endif %}
   {% if can_cancel %}
   <form action="/workflows/{{ workflow.id }}/cancel" method="post" data-confirm="确认取消此暂停工作流？工件与审计将保留，项目可重新启动生成。">
@@ -59,13 +79,64 @@
   {% endif %}
 </section>
 
-{% if plan_chapters %}
-<section aria-labelledby="plan-heading">
-  <h2 id="plan-heading">批次计划</h2>
-  <ol>{% for chapter in plan_chapters %}<li><strong>{{ chapter.title }}</strong>（第 {{ chapter.ordinal }} 章）<br>目标：{{ chapter.goal }}<br>结尾悬念：{{ chapter.ending_hook }}</li>{% endfor %}</ol>
+{% set failed_attempts = attempt_rows | selectattr('attempt.status', 'equalto', 'FAILED') | list %}
+{% if failed_attempts %}
+<section aria-labelledby="failure-attempts-heading">
+  <h2 id="failure-attempts-heading">每次失败的诊断</h2>
+  <p class="muted">仅展示脱敏原因；普通失败响应正文不保存。v2 写作可另行保留隔离的未批准工作稿。没有 Token 用量记录不代表没有计费。若存在多项不合格条件，先报告首项。</p>
+  <ol>{% for row in failed_attempts %}<li>
+    <strong>{{ step_labels.get(row.step.kind, row.step.kind) }}{% if row.step.ordinal %} · 第 {{ row.step.ordinal }} 章{% endif %} · 第 {{ row.attempt.attempt_number }} 次</strong>
+    <p>{{ row.attempt.error_code or "未分类" }} · {{ row.attempt.error_detail or "没有详细记录" }}</p>
+    <p>用量：输入 {{ row.attempt.input_tokens if row.attempt.input_tokens is not none else "未知" }} / 输出 {{ row.attempt.output_tokens if row.attempt.output_tokens is not none else "未知" }} Token{% if row.step.ordinal in work_draft_by_ordinal %}{% set draft = work_draft_by_ordinal[row.step.ordinal] %}；工作稿修补 {{ draft.repair_count }} / 2 轮{% endif %}</p>
+    {% if row.attempt.error_code == 'provider_protocol' and row.attempt.error_detail in [none, 'provider returned an invalid response'] %}<p class="muted">未记录细分原因，不能从这条旧记录还原根因。</p>{% endif %}
+  </li>{% endfor %}</ol>
 </section>
 {% endif %}
 
+{% if plan_chapters %}
+<section aria-labelledby="plan-heading">
+  <h2 id="plan-heading">批次计划</h2>
+  {% if workflow.generation_version == 2 %}<p class="muted">v2 正文会按场景目标生成，并在进入摘要前执行章节覆盖检查；检查结果仍须作者审阅。</p>{% endif %}
+  <ol>{% for chapter in plan_chapters %}<li><strong>{{ chapter.title }}</strong>（第 {{ chapter.ordinal }} 章）<br>目标：{{ chapter.goal }}<br>结尾悬念：{{ chapter.ending_hook }}{% if chapter.scenes %}<br>场景目标：<ol>{% for scene in chapter.scenes %}<li>场景 {{ scene.ordinal }} · 目标可见字符：{{ scene.target_characters }} · {{ scene.description }}</li>{% endfor %}</ol>{% endif %}</li>{% endfor %}</ol>
+</section>
+{% endif %}
+
+{% if coverage_rows %}
+<section aria-labelledby="coverage-heading">
+  <h2 id="coverage-heading">章节覆盖检查结果</h2>
+  {% for row in coverage_rows %}<article>
+    <h3>第 {{ row.ordinal }} 章 · {{ row.label }}</h3>
+    <p>语义判定：{{ "通过" if row.passed else "未通过" }}</p>
+    <p>{{ "摘录有效：已核对正文原文" if row.excerpt_valid else "摘录无效：不是正文中的非空连续原文" }}</p>
+    <blockquote>{{ row.excerpt or "未提供摘录" }}</blockquote>
+    {% if row.issues %}<ul>{% for issue in row.issues %}<li>{{ issue }}</li>{% endfor %}</ul>
+    {% elif not row.passed %}<p>此记录未提供具体问题说明，请结合目标与正文审阅。</p>{% endif %}
+  </article>{% endfor %}
+  <p class="muted">语义判定与摘录核验均通过才可提升为候选正文；作者批次批准仍须单独完成。</p>
+</section>
+{% endif %}
+
+{% if work_draft_rows %}
+<section aria-labelledby="work-drafts-heading">
+  <h2 id="work-drafts-heading">v2 工作稿历史</h2>
+  {% for row in work_draft_rows %}{% set draft = row.draft %}<article>
+    <h3>第 {{ draft.ordinal }} 章 · {{ draft.title }}</h3>
+    {% if row.state == "unaccepted" %}<p class="notice error"><strong>隔离的未批准工作稿：</strong>尚未提升为候选正文；可能仍未通过长度或覆盖检查，也未进入作者批次批准。</p>
+    {% elif row.state == "promoted" %}<p class="notice"><strong>已提升为候选正文，等待作者批准。</strong>正式候选正文见下方阅读区；此处只保留修补历史，避免重复正文。</p>
+    {% elif row.state == "author_approved" %}<p class="notice"><strong>已获作者批准。</strong>正文已从隔离工作稿提升；此处只保留修补历史，避免重复正文。</p>
+    {% else %}<p class="notice"><strong>曾提升为候选正文，但该批次已被作者驳回。</strong>此处只保留修补历史。</p>{% endif %}
+    <p>可见字符：{{ draft.visible_count }}；修补轮次：{{ draft.repair_count }} / 2{% if draft.repair_pending %}（本轮已预留）{% endif %}；工作稿修订：{{ draft.draft_revision }}；最新尝试：{{ draft.latest_attempt_id }}</p>
+    {% if row.state == "unaccepted" %}<div class="chapter-body" style="white-space: pre-wrap">{{ draft.body }}</div>{% endif %}
+  </article>{% endfor %}
+</section>
+{% endif %}
+
+{% if not candidate_chapters %}
+<section class="empty-state"><h2>尚未生成正文</h2><p>计划不等于正文。请根据上方“下一步”操作；若已暂停或取消，请先查看状态和原因。</p></section>
+{% else %}
+<p><a class="button secondary" href="#candidate-chapters-heading">阅读已生成正文 · {{ candidate_chapters | length }} 章</a></p>
+{% endif %}
+<details><summary>Token 预算与实际用量</summary>
 <section aria-labelledby="budget-heading">
   <h2 id="budget-heading">预算与实际用量</h2>
   <table>
@@ -77,11 +148,25 @@
       <tr><td>审核</td><td>{{ workflow.reviewer_input_tokens }}</td><td>{{ workflow.reviewer_output_tokens }}</td></tr>
     </tbody>
   </table>
-  <p>累计实际输入 Token：{{ workflow.actual_input_tokens }}；累计实际输出 Token：{{ workflow.actual_output_tokens }}</p>
+  <p>累计已知输入 Token：{{ known_input_tokens }}；累计已知输出 Token：{{ known_output_tokens }}{% if usage_complete %}（记录完整）{% else %}（含未知项，合计不完整）{% endif %}</p>
 </section>
+</details>
 
 {% if review_issues %}
 <section aria-labelledby="review-heading"><h2 id="review-heading">审核问题</h2><ul>{% for issue in review_issues %}<li>{{ issue }}</li>{% endfor %}</ul></section>
+{% endif %}
+
+{% if candidate_chapters %}
+<section aria-labelledby="candidate-chapters-heading">
+  <h2 id="candidate-chapters-heading">{% if workflow.status == "COMPLETED" or candidate_batch_status == "approved" %}已获作者批准的章节正文{% elif workflow.status == "REJECTED" or candidate_batch_status == "rejected" %}已驳回的候选章节正文{% else %}候选章节正文{% endif %}</h2>
+  {% for chapter in candidate_chapters %}
+  <article>
+    <h3>第 {{ chapter.ordinal }} 章 · {{ chapter.title }}</h3>
+    <p>可见字符：{{ chapter.visible_char_count }}</p>
+    <div class="chapter-body" style="white-space: pre-wrap">{{ chapter.body }}</div>
+  </article>
+  {% endfor %}
+</section>
 {% endif %}
 
 <details>
@@ -97,9 +182,9 @@
     <pre>{{ snapshot.parameters }}</pre>
   </li>{% endfor %}</ol>
   <h2>步骤</h2>
-  <ol>{% for step in steps %}<li>{{ step.position }} · {{ step.kind }}{% if step.ordinal %} {{ step.ordinal }}{% endif %} · {{ step.status }} · 尝试 {{ step.attempt_count }}</li>{% endfor %}</ol>
+  <ol>{% for step in steps %}<li>{{ step.position }} · {{ step_labels.get(step.kind, step.kind) }}（{{ step.kind }}）{% if step.ordinal %} {{ step.ordinal }}{% endif %} · {{ step.status }} · 尝试 {{ step.attempt_count }}</li>{% endfor %}</ol>
   <h2>模型尝试</h2>
-  {% if attempt_rows %}<ol>{% for row in attempt_rows %}<li>{{ row.step.kind }}{% if row.step.ordinal %} {{ row.step.ordinal }}{% endif %} · #{{ row.attempt.attempt_number }} · {{ row.attempt.status }} · {{ row.attempt.provider_response_id or "无响应编号" }} · 输入 {{ row.attempt.input_tokens if row.attempt.input_tokens is not none else "未知" }} / 输出 {{ row.attempt.output_tokens if row.attempt.output_tokens is not none else "未知" }} · {{ row.attempt.latency_ms if row.attempt.latency_ms is not none else "未知" }} ms{% if row.attempt.error_code %} · {{ row.attempt.error_code }}{% endif %}</li>{% endfor %}</ol>{% else %}<p>尚无模型尝试。</p>{% endif %}
+  {% if attempt_rows %}<ol>{% for row in attempt_rows %}<li>{{ step_labels.get(row.step.kind, row.step.kind) }}{% if row.step.ordinal %} {{ row.step.ordinal }}{% endif %} · #{{ row.attempt.attempt_number }} · {{ row.attempt.status }} · {{ row.attempt.provider_response_id or "无响应编号" }} · 输入 {{ row.attempt.input_tokens if row.attempt.input_tokens is not none else "未知" }} / 输出 {{ row.attempt.output_tokens if row.attempt.output_tokens is not none else "未知" }} · {{ row.attempt.latency_ms if row.attempt.latency_ms is not none else "未知" }} ms{% if row.attempt.error_code %} · {{ row.attempt.error_code }}{% endif %}</li>{% endfor %}</ol>{% else %}<p>尚无模型尝试。</p>{% endif %}
   <h2>工件</h2>
   {% if artifacts %}<ol>{% for artifact in artifacts %}<li>{{ artifact.kind }}{% if artifact.ordinal %} {{ artifact.ordinal }}{% endif %} · 可见字符 {{ artifact.visible_char_count if artifact.visible_char_count is not none else "不适用" }} · SHA-256 {{ artifact.content_hash }}</li>{% endfor %}</ol>{% else %}<p>尚无工件。</p>{% endif %}
   <h2>作者计划决策</h2>

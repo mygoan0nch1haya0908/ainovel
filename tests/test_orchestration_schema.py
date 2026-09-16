@@ -23,6 +23,7 @@ from ainovel.models import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 STAGE_TWO_TABLES = {
+    "chapter_draft_repairs",
     "context_packet_items",
     "context_packets",
     "context_sources",
@@ -153,6 +154,37 @@ def _insert_project_outline_workflow(connection) -> None:
     )
 
 
+def _insert_legacy_project_outline_workflow(connection) -> None:
+    connection.execute(
+        text(
+            "INSERT INTO novel_projects (id, title, target_chars_min, target_chars_max, "
+            "created_at, updated_at) VALUES ("
+            "'project', 'Project', 100, 200, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        )
+    )
+    connection.execute(
+        text(
+            "INSERT INTO outline_versions (id, project_id, version_number, status, "
+            "reason, created_at, updated_at) VALUES ("
+            "'outline', 'project', 1, 'official', 'test', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        )
+    )
+    connection.execute(
+        text(
+            "INSERT INTO generation_workflows ("
+            "id, project_id, base_outline_version_id, provider_name, model_name, "
+            "requested_chapters, status, current_position, planner_input_tokens, "
+            "planner_output_tokens, writer_input_tokens, writer_output_tokens, "
+            "summarizer_input_tokens, summarizer_output_tokens, reviewer_input_tokens, "
+            "reviewer_output_tokens, actual_input_tokens, actual_output_tokens, revision, "
+            "created_at, updated_at) VALUES ("
+            "'workflow', 'project', 'outline', 'fake', 'fake', 1, 'PLANNING', 0, "
+            "16000, 4000, 32000, 12000, 16000, 4000, 32000, 6000, 0, 0, 1, "
+            "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        )
+    )
+
+
 def test_stage_two_tables_and_fts_exist(migrated_engine: Engine) -> None:
     names = set(inspect(migrated_engine).get_table_names())
     assert STAGE_TWO_TABLES <= names
@@ -182,6 +214,11 @@ def test_stage_two_columns_nullability_and_server_defaults(
     assert workflow["actual_input_tokens"]["default"] == "0"
     assert workflow["actual_output_tokens"]["default"] == "0"
     assert workflow["revision"]["default"] == "1"
+    assert workflow["generation_version"]["default"] == "1"
+    assert workflow["model_calls_used"]["default"] == "0"
+    assert workflow["model_call_limit"]["nullable"] is True
+    assert workflow["total_input_token_limit"]["nullable"] is True
+    assert workflow["total_output_token_limit"]["nullable"] is True
 
     prompt = _column_map(migrated_engine, "prompt_versions")
     assert prompt["active"]["default"] == "0"
@@ -192,6 +229,7 @@ def test_stage_two_columns_nullability_and_server_defaults(
     assert step["lease_owner"]["nullable"] is True
     assert step["lease_expires_at"]["nullable"] is True
     assert step["attempt_count"]["default"] == "0"
+    assert step["protocol_failure_count"]["default"] == "0"
     assert step["revision"]["default"] == "1"
     lease_checks = {
         constraint["name"]: constraint["sqltext"]
@@ -360,7 +398,7 @@ def test_alembic_uses_programmatic_url_when_environment_is_absent(
 
     engine = create_engine(configured_url)
     try:
-        assert _revision_number(engine) == "0002_orchestration_context"
+        assert _revision_number(engine) == "0004_stage_roadmaps"
     finally:
         engine.dispose()
     assert not fallback_path.exists()
@@ -383,7 +421,7 @@ def test_alembic_environment_url_intentionally_wins(
 
     engine = create_engine(environment_url)
     try:
-        assert _revision_number(engine) == "0002_orchestration_context"
+        assert _revision_number(engine) == "0004_stage_roadmaps"
     finally:
         engine.dispose()
     assert not configured_path.exists()
@@ -731,3 +769,67 @@ def test_stage_two_migration_downgrades_and_re_upgrades(
     finally:
         _remove_database_artifacts(database_path, temporary_root)
         _remove_database_artifacts(ambient_database_path, temporary_root)
+
+
+def test_draft_repair_migration_defaults_existing_workflows_to_v1_and_round_trips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    temporary_root = tmp_path.resolve(strict=True)
+    assert temporary_root.is_relative_to(PROJECT_ROOT.resolve())
+    database_path = temporary_root / "draft-repair-round-trip.db"
+    database_url = f"sqlite+pysqlite:///{database_path.as_posix()}"
+    monkeypatch.delenv("AINOVEL_DATABASE_URL", raising=False)
+    monkeypatch.chdir(temporary_root)
+    config = Config(str(PROJECT_ROOT / "alembic.ini"))
+    config.set_main_option("sqlalchemy.url", database_url)
+
+    try:
+        command.upgrade(config, "0002_orchestration_context")
+        engine = create_engine(database_url)
+        try:
+            with engine.begin() as connection:
+                _insert_legacy_project_outline_workflow(connection)
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        engine = create_engine(database_url)
+        try:
+            with engine.connect() as connection:
+                assert connection.execute(
+                    text(
+                        "SELECT generation_version FROM generation_workflows "
+                        "WHERE id = 'workflow'"
+                    )
+                ).scalar_one() == 1
+            assert "chapter_draft_repairs" in inspect(engine).get_table_names()
+        finally:
+            engine.dispose()
+
+        command.downgrade(config, "0002_orchestration_context")
+        engine = create_engine(database_url)
+        try:
+            assert "generation_version" not in _column_map(
+                engine, "generation_workflows"
+            )
+            assert "protocol_failure_count" not in _column_map(
+                engine, "workflow_steps"
+            )
+            assert "chapter_draft_repairs" not in inspect(engine).get_table_names()
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        engine = create_engine(database_url)
+        try:
+            with engine.connect() as connection:
+                assert connection.execute(
+                    text(
+                        "SELECT generation_version FROM generation_workflows "
+                        "WHERE id = 'workflow'"
+                    )
+                ).scalar_one() == 1
+        finally:
+            engine.dispose()
+    finally:
+        _remove_database_artifacts(database_path, temporary_root)

@@ -154,7 +154,7 @@ def _prepare_reviewer_step(
 
 
 def test_workflow_contract_constants_are_exact_and_budgets_are_frozen() -> None:
-    assert PROVIDER_NAMES == frozenset({"fake", "ollama", "openai"})
+    assert PROVIDER_NAMES == frozenset({"fake", "ollama", "openai", "qwen"})
     assert WORKFLOW_STATUSES == frozenset(
         {
             "PREPARING",
