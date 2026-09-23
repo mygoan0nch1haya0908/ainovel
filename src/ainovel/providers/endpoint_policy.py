@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 import ipaddress
 import re
+import socket
 from urllib.parse import urlsplit, urlunsplit
 
 
@@ -58,5 +59,45 @@ def normalize_endpoint(value: str, connection_kind: str) -> Endpoint:
             authority += f":{port}"
         normalized = urlunsplit((parsed.scheme, authority, path, "", ""))
         return Endpoint(normalized, host, port, path, connection_kind)
+    except Exception:
+        raise EndpointError() from None
+
+
+def resolve_endpoint(endpoint: Endpoint, *, resolver=None) -> tuple[str, ...]:
+    """Validate every answer. Callers must pin a returned IP, never resolve again."""
+    try:
+        if normalize_endpoint(endpoint.base_url, endpoint.kind) != endpoint:
+            raise EndpointError()
+        try:
+            literal = ipaddress.ip_address(endpoint.host)
+        except ValueError:
+            literal = None
+        if literal is not None:
+            answers = [str(literal)]
+        elif resolver is not None:
+            answers = resolver(endpoint.host, endpoint.port)
+        else:
+            answers = (entry[4][0] for entry in socket.getaddrinfo(
+                endpoint.host, endpoint.port, type=socket.SOCK_STREAM))
+        approved = []
+        for index, value in enumerate(answers):
+            if index >= 256 or not isinstance(value, str) or '%' in value:
+                raise EndpointError()
+            address = ipaddress.ip_address(value)
+            if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+                raise EndpointError()
+            if endpoint.kind == 'loopback':
+                allowed = address.is_loopback
+            else:
+                allowed = (address.is_global and not address.is_multicast
+                           and not address.is_reserved and not address.is_loopback
+                           and not address.is_link_local)
+            if not allowed:
+                raise EndpointError()
+            if str(address) not in approved:
+                approved.append(str(address))
+        if not approved:
+            raise EndpointError()
+        return tuple(approved)
     except Exception:
         raise EndpointError() from None
