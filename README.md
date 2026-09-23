@@ -186,13 +186,31 @@ python -m uvicorn ainovel.chapter_test:create_chapter_test_app --factory --host 
 Open [http://127.0.0.1:8001/chapter-test](http://127.0.0.1:8001/chapter-test),
 then follow the explicit gates:
 
-For “剧情阶段总体架构”, enter the shared setting/style and provisional ending,
-select the stage mode, and provide the stage architecture. Setup creates the
+The default “三层大纲规划” form requires a “总剧情大纲” for the whole book and a
+“阶段大纲” for the current plot stage, in addition to setting/style and the
+provisional ending. “单章大纲（可选，当前阶段第一章）” is optional: leave it empty
+for automatic chapter subdivision, or supply instructions for that stage's
+first chapter only. Chapter title/goal/hook suggestions are saved only when the
+chapter outline is supplied. Each outline field is limited to 12,000 characters.
+The whole-book, stage, and optional chapter inputs are stored as separate
+parent-child outline nodes; the provisional ending remains under the book.
+Setup creates the
 project, approved inputs, and stage atomically without a model call. On the
 stage page, separately create the frozen roadmap proposal, explicitly generate
 it, approve it, and start each 1–5 chapter batch. Plans and bodies retain their
 separate author approvals; a later batch is unavailable until the current body
 batch is approved and reconciled.
+
+Roadmap proposals freeze the hierarchy; batch planning and writing receive the
+whole-book and stage constraints, with the optional first-chapter hint attached
+only to its selected node. Later chapters and batches do not inherit that hint
+as a global instruction. Required context is never silently truncated: requests
+that exceed the existing token budget pause before a model call. Model prompts
+respect upper-level constraints, but do not guarantee semantic consistency;
+authors must check the three levels before approving a roadmap or batch plan.
+The confirmed-input and stage pages display the submitted hierarchy. Reusing a
+legacy stage input keeps its stage text without inventing a whole-book outline;
+legacy stage/single-chapter submissions and existing snapshots remain supported.
 
 For “独立单章测试”:
 
@@ -207,8 +225,9 @@ For “独立单章测试”:
    candidate-batch approval or rejection controls. Nothing is approved or
    published automatically.
 
-New single-chapter tasks may explicitly enable the v2 short-draft repair and
-coverage-check option. Leaving it unchecked preserves the legacy v1 workflow.
+New single-chapter forms and reused-input forms enable the v2 short-draft repair
+and coverage-check option by default. Explicitly unchecking it selects legacy v1;
+existing workflows and legacy submissions without the option remain unchanged.
 The confirmed-input view has a CSRF-protected “reuse old input” action that only
 prefills a new setup form; it never mutates, upgrades, or retries the source
 workflow. v2 can add at most two repair calls after the first draft, remains

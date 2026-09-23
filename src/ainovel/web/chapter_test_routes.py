@@ -26,6 +26,7 @@ FIELD_LIMITS = {
     "project_title": 120,
     "setting_style": 8_000,
     "provisional_ending": 4_000,
+    "book_outline": 12_000,
     "chapter_outline": 12_000,
     "chapter_title": 200,
     "chapter_goal": 1_000,
@@ -37,6 +38,7 @@ FIELD_LABELS = {
     "project_title": "项目名称",
     "setting_style": "设定与文风",
     "provisional_ending": "暂定结局",
+    "book_outline": "总剧情大纲",
     "chapter_outline": "章节提纲",
     "chapter_title": "章节标题",
     "chapter_goal": "章节目标",
@@ -58,14 +60,15 @@ def _empty_form() -> dict[str, str]:
         "project_title": "",
         "setting_style": "",
         "provisional_ending": "",
+        "book_outline": "",
         "chapter_outline": "",
         "chapter_title": "",
         "chapter_goal": "",
         "chapter_hook": "",
         "stage_architecture": "",
-        "setup_mode": "single_chapter",
+        "setup_mode": "hierarchical",
         "model_name": "qwen-flash",
-        "repair_mode": "",
+        "repair_mode": "yes",
         "author_confirm": "",
     }
 
@@ -106,6 +109,7 @@ def _confirmed_input(
         (node for node in nodes if node.kind == "provisional_ending"), None
     )
     chapter = next((node for node in nodes if node.stable_key == "chapter-1"), None)
+    stage = next((node for node in nodes if node.stable_key == "stage-1"), None)
     return {
         "project": project,
         "setting_style": (
@@ -114,6 +118,7 @@ def _confirmed_input(
             else ""
         ),
         "provisional_ending": ending.payload.get("text", "") if ending else "",
+        "book_outline": root.payload.get("book_outline", "") if root else "",
         "chapter_outline": (
             chapter.payload.get("chapter_outline", "")
             if chapter is not None
@@ -123,7 +128,8 @@ def _confirmed_input(
         "chapter_goal": chapter.payload.get("goal", "") if chapter else "",
         "chapter_hook": chapter.payload.get("ending_hook", "") if chapter else "",
         "stage_architecture": (
-            root.payload.get("stage_architecture", "") if root is not None else ""
+            stage.payload.get("stage_architecture", "") if stage is not None
+            else root.payload.get("stage_architecture", "") if root is not None else ""
         ),
     }
 
@@ -159,8 +165,8 @@ def _render(
 
 
 def _validation_error(values: dict[str, str]) -> str | None:
-    if values.get("setup_mode") not in {"single_chapter", "stage"}:
-        return "请选择独立单章测试或剧情阶段总体架构"
+    if values.get("setup_mode") not in {"single_chapter", "stage", "hierarchical"}:
+        return "请选择三层大纲规划或独立单章测试"
     required = (
         ("project_title", "项目名称不能为空"),
         ("setting_style", "设定与文风不能为空"),
@@ -172,7 +178,9 @@ def _validation_error(values: dict[str, str]) -> str | None:
             return message
     if values["setup_mode"] == "single_chapter" and not values["chapter_outline"].strip():
         return "章节提纲不能为空"
-    if values["setup_mode"] == "stage" and not values["stage_architecture"].strip():
+    if values["setup_mode"] == "hierarchical" and not values["book_outline"].strip():
+        return "总剧情大纲不能为空"
+    if values["setup_mode"] in {"stage", "hierarchical"} and not values["stage_architecture"].strip():
         return "剧情阶段总体架构不能为空"
     for field, maximum in FIELD_LIMITS.items():
         if len(values[field]) > maximum:
@@ -180,7 +188,7 @@ def _validation_error(values: dict[str, str]) -> str | None:
     if values["author_confirm"] != "yes":
         return (
             "请勾选作者确认，确认设定、暂定结局与剧情阶段总体架构"
-            if values["setup_mode"] == "stage"
+            if values["setup_mode"] in {"stage", "hierarchical"}
             else "请勾选作者确认，确认设定、暂定结局与章节提纲"
         )
     if values.get("repair_mode", "") not in {"", "yes"}:
@@ -203,6 +211,25 @@ def _consume_submission_token(request: Request, submitted: str) -> bool:
 
 
 def _outline_nodes(values: dict[str, str]) -> list[OutlineNodeInput]:
+    if values.get("setup_mode") == "hierarchical":
+        nodes = [
+            OutlineNodeInput(key="book", parent_key=None, kind="book", title="总剧情大纲", order=0,
+                             payload={"book_outline": values["book_outline"].strip()}),
+            OutlineNodeInput(key="provisional-ending", parent_key="book", kind="provisional_ending", title="暂定结局", order=1,
+                             payload={"text": values["provisional_ending"].strip()}),
+            OutlineNodeInput(key="stage-1", parent_key="book", kind="current_stage_goal", title="阶段大纲", order=2,
+                             payload={"stage_architecture": values["stage_architecture"].strip()}),
+        ]
+        if values["chapter_outline"].strip():
+            payload = {"chapter_outline": values["chapter_outline"].strip(), "stage_ordinal": 1}
+            for field, key in (("chapter_goal", "goal"), ("chapter_hook", "ending_hook")):
+                if values[field].strip():
+                    payload[key] = values[field].strip()
+            nodes.append(OutlineNodeInput(
+                key="chapter-1", parent_key="stage-1", kind="chapter", order=3,
+                title=values["chapter_title"].strip() or "第一章", payload=payload,
+            ))
+        return nodes
     if values.get("setup_mode") == "stage":
         return [
             OutlineNodeInput(
@@ -299,12 +326,13 @@ def _create_workflow_atomically(
         candidate = OutlineService(session).create_candidate(
             project.id,
             _outline_nodes(values),
-            reason=("作者确认的剧情阶段总体架构输入" if values.get("setup_mode") == "stage"
+            reason=("作者确认的三层大纲输入" if values.get("setup_mode") == "hierarchical"
+                    else "作者确认的剧情阶段总体架构输入" if values.get("setup_mode") == "stage"
                     else "作者确认的单章测试输入"),
         )
         stage = "outline_approve"
         OutlineService(session).approve(candidate.id)
-        if values.get("setup_mode") == "stage":
+        if values.get("setup_mode") in {"stage", "hierarchical"}:
             stage = "stage_create"
             story_stage = StageService(session).create(
                 project.id, values["stage_architecture"].strip(), "author"
@@ -446,16 +474,18 @@ def reuse_chapter_test_input(
         "project_title": project.title,
         "setting_style": str(confirmed["setting_style"]),
         "provisional_ending": str(confirmed["provisional_ending"]),
+        "book_outline": str(confirmed["book_outline"]),
         "chapter_outline": str(confirmed["chapter_outline"]),
         "chapter_title": str(confirmed["chapter_title"]),
         "chapter_goal": str(confirmed["chapter_goal"]),
         "chapter_hook": str(confirmed["chapter_hook"]),
         "stage_architecture": str(confirmed["stage_architecture"]),
         "setup_mode": (
-            "stage" if confirmed["stage_architecture"] else "single_chapter"
+            "hierarchical" if confirmed["book_outline"]
+            else "stage" if confirmed["stage_architecture"] else "single_chapter"
         ),
         "model_name": "qwen-flash",
-        "repair_mode": "",
+        "repair_mode": "yes",
         "author_confirm": "",
     }
     return _render(
@@ -474,6 +504,7 @@ def create_chapter_test(
     project_title: str = Form(""),
     setting_style: str = Form(""),
     provisional_ending: str = Form(""),
+    book_outline: str = Form(""),
     chapter_outline: str = Form(""),
     chapter_title: str = Form(""),
     chapter_goal: str = Form(""),
@@ -491,6 +522,7 @@ def create_chapter_test(
         "project_title": project_title,
         "setting_style": setting_style,
         "provisional_ending": provisional_ending,
+        "book_outline": book_outline,
         "chapter_outline": chapter_outline,
         "chapter_title": chapter_title,
         "chapter_goal": chapter_goal,
@@ -531,5 +563,5 @@ def create_chapter_test(
             session,
             error=error,
         )
-    destination = "stages" if setup_mode == "stage" else "workflows"
+    destination = "stages" if setup_mode in {"stage", "hierarchical"} else "workflows"
     return RedirectResponse(f"/{destination}/{target_id}", status_code=303)

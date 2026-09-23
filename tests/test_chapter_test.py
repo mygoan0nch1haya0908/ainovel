@@ -185,6 +185,23 @@ def valid_setup_data(client: TestClient) -> dict[str, str]:
     }
 
 
+def test_default_form_creates_v2_without_author_toggling_repair(
+    chapter_client: TestClient,
+    chapter_test_app,
+) -> None:
+    page = chapter_client.get("/chapter-test")
+    checkbox = re.search(r'<input[^>]*name="repair_mode"[^>]*>', page.text)
+    assert checkbox is not None and "checked" in checkbox.group(0)
+    data = valid_setup_data(chapter_client)
+    data["repair_mode"] = "yes"
+    created = chapter_client.post("/chapter-test", data=data, follow_redirects=False)
+    assert created.status_code == 303
+    with chapter_test_app.state.session_factory() as session:
+        workflow = session.get(GenerationWorkflow, created.headers["location"].rsplit("/", 1)[-1])
+        assert workflow is not None and workflow.generation_version == 2
+        assert session.scalar(select(func.count()).select_from(ModelAttempt)) == 0
+
+
 def test_new_single_chapter_run_explicitly_opts_into_v2_repair(
     chapter_client: TestClient,
     chapter_test_app,
@@ -231,6 +248,8 @@ def test_reuse_old_input_is_explicit_prefill_and_does_not_mutate_source(
     assert 'value="雾城来信"' in reused.text
     assert "主角潜入旧邮局取得密信" in reused.text
     assert "这是新任务的预填表单" in reused.text
+    checkbox = re.search(r'<input[^>]*name="repair_mode"[^>]*>', reused.text)
+    assert checkbox is not None and "checked" in checkbox.group(0)
     assert chapter_test_app.state.provider_registry.get("qwen").requests == before
     with chapter_test_app.state.session_factory() as session:
         source = session.get(GenerationWorkflow, workflow_id)

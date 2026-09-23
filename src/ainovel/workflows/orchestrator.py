@@ -304,8 +304,13 @@ class WorkflowOrchestrator:
                 workflow.id, persisted_step.ordinal,
                 include_roadmap=persisted_step.kind == "PLANNING",
             )
+            scoped_outline_keys = set()
             if stage_context is not None:
+                scoped_outline_keys = set(stage_context.pop("_scoped_outline_keys", []))
                 payload["stage"] = stage_context
+                if scoped_outline_keys and "official_outline_tree" in payload:
+                    payload["official_outline_tree"] = [node for node in payload["official_outline_tree"]
+                                                        if node["stable_key"] not in scoped_outline_keys]
             configured_input = self._positive_snapshot_parameter(
                 snapshot, "max_input_tokens"
             )
@@ -363,6 +368,13 @@ class WorkflowOrchestrator:
             candidates = ContextBuilder(session).candidates_for_step(
                 workflow.id, persisted_step.id
             )
+            if scoped_outline_keys:
+                # The frozen stage node already carries the applicable hint.
+                # Do not reintroduce it as global context for later chapters.
+                scoped_sources = {f"{workflow.base_outline_version_id}:{key}" for key in scoped_outline_keys}
+                candidates = [candidate for candidate in candidates
+                              if not (candidate.state_scope == "official"
+                                      and candidate.stable_key.partition(":")[2] in scoped_sources)]
             packet = context_service.build_packet(
                 workflow.id,
                 persisted_step.id,

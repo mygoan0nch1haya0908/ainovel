@@ -18,6 +18,23 @@ from ainovel.services.workflows import DEFAULT_BUDGETS, PROVIDER_NAMES, Workflow
 
 
 STAGE_PROMPT = "根据作者阶段架构和锁定设定提出精简路线图。仅列有稳定标识的小章节节点；按因果顺序推进，依赖只能引用此前节点。不得生成正文或场景详情。保留已确认节点，必须覆盖关键事件和阶段终态，不得用章数代替节点列表。"
+HIERARCHY_INSTRUCTION = "遵守设定与锁定结局；总剧情大纲约束阶段大纲，阶段大纲约束单章展开。不得静默改写上层约束。first_chapter 或 author_chapter_outline 仅适用于当前阶段第1章，不得作为所有章节的任务；未提供时自行按阶段大纲拆章。路线图和章节计划均须作者核对三层一致性后批准。"
+
+
+def _outline_hierarchy(nodes):
+    """Extract the new setup hierarchy; old outlines retain their existing path."""
+    book = next((n for n in nodes if n["key"] == "book" and n["payload"].get("book_outline")), None)
+    stage = next((n for n in nodes if n["key"] == "stage-1" and n.get("parent_key") == "book"), None)
+    if book is None or stage is None:
+        return None
+    result = {"book_outline": book["payload"]["book_outline"],
+              "stage_architecture": stage["payload"].get("stage_architecture", "")}
+    chapter = next((n for n in nodes if n.get("parent_key") == stage["key"]
+                    and n["payload"].get("stage_ordinal") == 1
+                    and n["payload"].get("chapter_outline")), None)
+    if chapter:
+        result["first_chapter"] = {"outline_key": chapter["key"], "title": chapter["title"], **deepcopy(chapter["payload"])}
+    return result
 
 
 @dataclass(frozen=True)
@@ -63,6 +80,12 @@ class StageService:
     def list_for_project(self, project_id):
         return list(self.session.scalars(select(StoryStage).where(StoryStage.project_id == project_id).order_by(StoryStage.created_at)))
 
+    def outline_context(self, stage_id):
+        stage = self.get(stage_id)
+        nodes = self.session.scalars(select(OutlineNode).where(OutlineNode.outline_version_id == stage.base_outline_version_id)).all()
+        return _outline_hierarchy([{"key": n.stable_key, "parent_key": n.parent_key,
+                                    "title": n.title, "payload": n.payload} for n in nodes])
+
     def roadmap(self, roadmap_id):
         version = self.session.get(StageRoadmapVersion, roadmap_id)
         if version is None:
@@ -90,14 +113,18 @@ class StageService:
                 raise ValueError("approved constitution required")
             previous = self.roadmap(stage.approved_roadmap_id) if stage.approved_roadmap_id else None
             outline_nodes = self.session.scalars(select(OutlineNode).where(OutlineNode.outline_version_id == stage.base_outline_version_id).order_by(OutlineNode.order)).all()
+            frozen_outline = [{"key": n.stable_key, "parent_key": n.parent_key, "kind": n.kind,
+                               "title": n.title, "payload": deepcopy(n.payload), "locked": n.author_locked} for n in outline_nodes]
+            hierarchy = _outline_hierarchy(frozen_outline)
             version = StageRoadmapVersion(
                 id=str(uuid4()), stage_id=stage.id,
                 version_number=self.session.scalar(select(func.coalesce(func.max(StageRoadmapVersion.version_number), 0) + 1).where(StageRoadmapVersion.stage_id == stage.id)),
                 input_revision=stage.revision, constitution_version_id=constitution.id,
                 provider_name=provider_name, model_name=model_name.strip(), architecture=architecture.strip(),
-                prompt_snapshot={"body": STAGE_PROMPT, "schema": StageRoadmapDraft.model_json_schema()},
+                prompt_snapshot={"body": STAGE_PROMPT + (HIERARCHY_INSTRUCTION if hierarchy else ""), "schema": StageRoadmapDraft.model_json_schema()},
                 input_snapshot={"architecture": architecture.strip(), "constitution": deepcopy(constitution.content),
-                                "outline": [{"key": n.stable_key, "kind": n.kind, "title": n.title, "payload": n.payload, "locked": n.author_locked} for n in outline_nodes],
+                                "outline": frozen_outline,
+                                **({"outline_hierarchy": hierarchy} if hierarchy else {}),
                                 "confirmed_chapters": stage.confirmed_chapters,
                                 "previous_roadmap": deepcopy(previous.payload) if previous else None},
                 input_token_limit=budgets.input_tokens, output_token_limit=budgets.output_tokens,
@@ -314,6 +341,18 @@ class StageService:
                             for n in nodes if ordinal is None or n.ordinal == ordinal]}
         if include_roadmap:
             result["roadmap"] = deepcopy(version.payload)
+        hierarchy = version.input_snapshot.get("outline_hierarchy")
+        if hierarchy:
+            result["outline_constraints"] = {key: deepcopy(value) for key, value in hierarchy.items() if key != "first_chapter"}
+            result["instruction"] += HIERARCHY_INSTRUCTION
+            first_chapter = hierarchy.get("first_chapter")
+            if first_chapter:
+                # This internal key lets the caller exclude the duplicate raw
+                # outline source from both its tree and retrieval packet.
+                result["_scoped_outline_keys"] = [first_chapter["outline_key"]]
+                for node in result["nodes"]:
+                    if node["stage_ordinal"] == 1:
+                        node["author_chapter_outline"] = deepcopy(first_chapter)
         return result
 
     def commit_batch_progress(self, batch, chapters, first_number, actor):

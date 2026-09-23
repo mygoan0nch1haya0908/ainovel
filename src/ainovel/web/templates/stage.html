@@ -5,6 +5,18 @@
 {% if chapter_test_mode %}<aside aria-label="阶段测试提示"><strong>TEST · 剧情阶段规划</strong><p>此阶段位于独立测试数据库，不代表发布；路线图、批次计划和批次正文仍分别由作者确认。</p><p><a href="/chapter-test">返回测试入口或选择独立单章测试</a></p></aside>{% endif %}
 <h1>剧情阶段总体架构</h1>
 <section aria-labelledby="architecture-heading">
+  {% if outline_hierarchy %}
+  <h2>总剧情大纲（全书约束）</h2>
+  <div class="chapter-body" style="white-space: pre-wrap">{{ outline_hierarchy.book_outline }}</div>
+  <h2>已批准的阶段大纲</h2>
+  <div class="chapter-body" style="white-space: pre-wrap">{{ outline_hierarchy.stage_architecture }}</div>
+  <h2>单章大纲（当前阶段第一章）</h2>
+  {% if outline_hierarchy.first_chapter %}
+  <div class="chapter-body" style="white-space: pre-wrap">{{ outline_hierarchy.first_chapter.chapter_outline }}</div>
+  <p>建议标题：{{ outline_hierarchy.first_chapter.title }}{% if outline_hierarchy.first_chapter.goal %}；目标：{{ outline_hierarchy.first_chapter.goal }}{% endif %}{% if outline_hierarchy.first_chapter.ending_hook %}；章末钩子：{{ outline_hierarchy.first_chapter.ending_hook }}{% endif %}</p>
+  {% else %}<p>未提供；由 AI 按阶段大纲自动拆分章节。</p>{% endif %}
+  <p>上层大纲约束下层展开。请在批准路线图前核对总剧情、阶段和单章是否一致；发现冲突时先修订提案再批准。系统不保证自动发现所有语义冲突。</p>
+  {% endif %}
   <h2 id="architecture-heading">作者确认的阶段输入</h2>
   <div class="chapter-body" style="white-space: pre-wrap">{{ stage.architecture }}</div>
   <p>阶段修订号：{{ stage.revision }}</p>
@@ -43,7 +55,7 @@
       <p>目标：{{ roadmap.payload.goal }}；起点：{{ roadmap.payload.start_state }}；终点：{{ roadmap.payload.end_state }}</p>
       <ol>{% for node in roadmap.payload.nodes %}<li><strong>阶段第 {{ node.ordinal }} 章 · {{ node.title }}</strong><br>目标：{{ node.goal }}{% if node.dependencies %}<br>依赖：{{ node.dependencies | join(", ") }}{% endif %}</li>{% endfor %}</ol>
       {% if row.difference %}<details open><summary>与当前批准版的修订差异</summary><ul>{% for key, change in row.difference.items() %}<li>{{ key }}：{{ change.before if change.before is not none else "无" }} → {{ change.after }}</li>{% endfor %}</ul></details>{% endif %}
-      {% if roadmap.status == "PROPOSED" %}<form action="/stages/{{ stage.id }}/roadmaps/{{ roadmap.id }}/approve" method="post" data-confirm="确认批准此路线图？批准不会调用模型。"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="approval_confirm" value="yes"><button type="submit">批准路线图（不会调用模型）</button></form>{% endif %}
+      {% if roadmap.status == "PROPOSED" %}<form action="/stages/{{ stage.id }}/roadmaps/{{ roadmap.id }}/approve" method="post" data-confirm="已核对路线图与全书、阶段及单章输入的一致性，确认批准？批准不会调用模型。"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="approval_confirm" value="yes"><button type="submit">批准路线图（不会调用模型）</button></form>{% endif %}
     {% endif %}
     {% if row.attempts %}<details><summary>路线图模型尝试</summary><ol>{% for attempt in row.attempts %}<li>第 {{ attempt.number }} 次 · {{ attempt.status }} · 输入 {{ attempt.input_tokens if attempt.input_tokens is not none else "未知" }} / 输出 {{ attempt.output_tokens if attempt.output_tokens is not none else "未知" }}{% if attempt.error_code %} · {{ attempt.error_code }}{% endif %}</li>{% endfor %}</ol></details>{% endif %}
   </article>
