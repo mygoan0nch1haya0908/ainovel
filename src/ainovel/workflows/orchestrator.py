@@ -50,6 +50,7 @@ from ainovel.providers.contracts import (
     ProviderUnavailable,
 )
 from ainovel.providers.registry import ProviderRegistry
+from ainovel.services.provider_resolution import ProviderResolver
 from ainovel.services.batches import BatchService
 from ainovel.services.context import (
     EXCERPT_SOURCE_TYPES,
@@ -144,6 +145,7 @@ class WorkflowOrchestrator:
         clock: Clock | None = None,
         worker_id: str | None = None,
         request_timeout_seconds: float = 60.0,
+        provider_resolver: ProviderResolver | None = None,
     ) -> None:
         if (
             isinstance(request_timeout_seconds, bool)
@@ -156,6 +158,7 @@ class WorkflowOrchestrator:
             )
         self._session_factory = session_factory
         self._registry = provider_registry
+        self._provider_resolver = provider_resolver or ProviderResolver(session_factory, provider_registry)
         self._runner = runner
         self._context_service_factory = context_service
         self._prompt_service_factory = prompt_service
@@ -409,7 +412,10 @@ class WorkflowOrchestrator:
             key = (workflow.id, workflow.provider_name, workflow.model_name)
             provider = self._providers.get(key)
             if provider is None:
-                provider = self._registry.get(workflow.provider_name)
+                provider = self._provider_resolver.resolve(
+                    workflow.provider_name, workflow.model_name,
+                    model_profile_version_id=workflow.model_profile_version_id,
+                )
                 self._providers[key] = provider
             session.rollback()
             return provider

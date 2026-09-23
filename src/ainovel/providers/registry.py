@@ -11,7 +11,7 @@ from ainovel.providers.contracts import (
 )
 
 
-ProviderName = Literal["fake", "ollama", "openai", "qwen"]
+ProviderName = Literal["fake", "ollama", "openai", "qwen", "compatible"]
 
 
 class ProviderRegistry:
@@ -30,4 +30,4 @@ class ProviderRegistry:
             raise ProviderUnavailable("provider is unavailable") from None
 
     def contains(self, name: str) -> bool:
-        return name in self._factories
+        return name == "compatible" or name in self._factories

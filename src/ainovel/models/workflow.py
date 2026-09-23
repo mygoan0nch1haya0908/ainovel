@@ -57,6 +57,9 @@ class GenerationWorkflow(TimestampMixin, Base):
     )
     provider_name: Mapped[str] = mapped_column(String(64), nullable=False)
     model_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    model_profile_version_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("model_profile_versions.id"), nullable=True
+    )
     requested_chapters: Mapped[int] = mapped_column(Integer, nullable=False)
     generation_version: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default=text("1")

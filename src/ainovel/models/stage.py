@@ -27,6 +27,9 @@ class StageRoadmapVersion(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(40), default="PENDING")
     provider_name: Mapped[str] = mapped_column(String(40))
     model_name: Mapped[str] = mapped_column(String(255))
+    model_profile_version_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("model_profile_versions.id"), nullable=True
+    )
     architecture: Mapped[str] = mapped_column(Text)
     prompt_snapshot: Mapped[dict] = mapped_column(JSON)
     input_snapshot: Mapped[dict] = mapped_column(JSON)

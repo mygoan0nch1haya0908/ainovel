@@ -9,7 +9,7 @@ cleanup; it cannot recall an already-sent request or erase previous backups.
 from dataclasses import dataclass
 from uuid import uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from ainovel.models.model_profile import ModelProfile, ModelProfileVersion
@@ -144,6 +144,22 @@ class ModelProfileService:
             return [self._view(*pair) for pair in pairs]
         except Exception:
             raise ModelProfileError("model profile unavailable") from None
+
+    def impacted_task_counts(self, profile_id: str) -> dict[str, int]:
+        """Count all bound history and workflows that may still dispatch."""
+        from ainovel.models.workflow import GenerationWorkflow
+        from ainovel.models.stage import StageRoadmapVersion
+        from ainovel.services.workflows import TERMINAL_WORKFLOW_STATUSES
+
+        versions = select(ModelProfileVersion.id).where(ModelProfileVersion.profile_id == profile_id)
+        workflows = self.session.scalar(select(func.count()).select_from(GenerationWorkflow)
+            .where(GenerationWorkflow.model_profile_version_id.in_(versions))) or 0
+        active = self.session.scalar(select(func.count()).select_from(GenerationWorkflow)
+            .where(GenerationWorkflow.model_profile_version_id.in_(versions),
+                   GenerationWorkflow.status.not_in(TERMINAL_WORKFLOW_STATUSES))) or 0
+        roadmaps = self.session.scalar(select(func.count()).select_from(StageRoadmapVersion)
+            .where(StageRoadmapVersion.model_profile_version_id.in_(versions))) or 0
+        return {"workflows": workflows, "active_workflows": active, "roadmaps": roadmaps}
 
     def _credential(self, version: ModelProfileVersion) -> str | None:
         if version.credential_ref:

@@ -21,6 +21,9 @@ from ainovel.providers.ollama import OllamaProvider
 from ainovel.providers.openai import OpenAIProvider
 from ainovel.providers.qwen import QwenProvider
 from ainovel.providers.registry import ProviderRegistry
+from ainovel.services.model_profiles import ModelProfileService
+from ainovel.services.provider_resolution import ProviderResolver
+from ainovel.security.secret_vault import SecretVault
 from ainovel.workflows.orchestrator import WorkflowOrchestrator
 from ainovel.services.workflows import DEFAULT_BUDGETS
 
@@ -116,6 +119,9 @@ def create_app(
     provider_registry: ProviderRegistry | None = None,
     *,
     orchestrator_request_timeout_seconds: float = 60.0,
+    profile_vault: SecretVault | None = None,
+    profile_transport=None,
+    provider_resolver: ProviderResolver | None = None,
 ) -> FastAPI:
     settings = Settings(database_url=database_url) if database_url else Settings()
 
@@ -131,12 +137,21 @@ def create_app(
     app.state.engine = engine
     app.state.session_factory = create_session_factory(engine)
     app.state.provider_registry = provider_registry or _default_provider_registry(settings)
+    app.state.profile_vault = profile_vault
+    app.state.model_profile_service_factory = lambda session: ModelProfileService(
+        session, vault=profile_vault
+    )
+    app.state.provider_resolver = provider_resolver or ProviderResolver(
+        app.state.session_factory, app.state.provider_registry,
+        vault=profile_vault, transport=profile_transport,
+    )
     app.state.workflow_budgets = DEFAULT_BUDGETS
     orchestrator = WorkflowOrchestrator(
         app.state.session_factory,
         app.state.provider_registry,
         AgentRunner(),
         request_timeout_seconds=orchestrator_request_timeout_seconds,
+        provider_resolver=app.state.provider_resolver,
     )
     app.state.orchestrator_factory = lambda: orchestrator
     app.state.csrf_signer = URLSafeSerializer(session_secret, salt="ainovel-csrf")

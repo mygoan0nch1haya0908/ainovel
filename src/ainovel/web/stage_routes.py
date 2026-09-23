@@ -110,7 +110,7 @@ def create_stage(project_id: str, request: Request, architecture: str = Form("")
 
 
 @router.post("/stages/{stage_id}/roadmaps")
-def propose_roadmap(stage_id: str, request: Request, provider_name: str = Form(""), model_name: str = Form(""), architecture: str = Form(""), author_confirm: str = Form(""), session: Session = Depends(get_session), _csrf: None = Depends(require_csrf)) -> object:
+def propose_roadmap(stage_id: str, request: Request, provider_name: str = Form(""), model_name: str = Form(""), model_profile_version_id: str = Form(""), architecture: str = Form(""), author_confirm: str = Form(""), session: Session = Depends(get_session), _csrf: None = Depends(require_csrf)) -> object:
     _stage_context(request, session, stage_id)
     if author_confirm != "yes":
         return _stage_page(request, session, stage_id, "请确认架构与模型设置", 422)
@@ -119,7 +119,9 @@ def propose_roadmap(stage_id: str, request: Request, provider_name: str = Form("
     if not model_name.strip():
         return _stage_page(request, session, stage_id, "模型名称不能为空", 422)
     try:
-        StageService(session).propose_roadmap(stage_id, "author", provider_name, model_name.strip(), architecture=architecture.strip() or None)
+        StageService(session).propose_roadmap(stage_id, "author", provider_name, model_name.strip(),
+            architecture=architecture.strip() or None,
+            model_profile_version_id=model_profile_version_id or None)
     except (ValueError, PermissionError):
         return _stage_page(request, session, stage_id, "路线图提案创建失败，请检查项目状态", 422)
     return RedirectResponse(f"/stages/{stage_id}", status_code=303)
@@ -143,8 +145,16 @@ def generate_roadmap(stage_id: str, roadmap_id: str, request: Request, model_cal
     if not request.app.state.provider_registry.contains(roadmap.provider_name):
         return _stage_page(request, session, stage_id, "Provider 未配置", 422)
     try:
-        provider = request.app.state.provider_registry.get(roadmap.provider_name)
-        StageService(session).generate_roadmap(roadmap.id, provider)
+        provider = (
+            None if roadmap.provider_name == "compatible"
+            else request.app.state.provider_resolver.resolve(
+                roadmap.provider_name, roadmap.model_name,
+                model_profile_version_id=roadmap.model_profile_version_id,
+            )
+        )
+        StageService(session, provider_resolver=request.app.state.provider_resolver).generate_roadmap(
+            roadmap.id, provider
+        )
     except (ValueError, PermissionError, ProviderError):
         return _stage_page(request, session, stage_id, "路线图生成当前无法执行", 422)
     return RedirectResponse(f"/stages/{stage_id}", status_code=303)

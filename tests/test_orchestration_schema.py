@@ -329,6 +329,7 @@ def test_stage_two_foreign_keys_and_intentional_non_foreign_key_pointers(
     assert _foreign_keys(migrated_engine, "generation_workflows") == {
         ("base_outline_version_id", "outline_versions", "id"),
         ("candidate_batch_id", "writing_batches", "id"),
+        ("model_profile_version_id", "model_profile_versions", "id"),
         ("project_id", "novel_projects", "id"),
     }
     assert _foreign_keys(migrated_engine, "workflow_prompt_snapshots") == {
@@ -398,7 +399,7 @@ def test_alembic_uses_programmatic_url_when_environment_is_absent(
 
     engine = create_engine(configured_url)
     try:
-        assert _revision_number(engine) == "0005_model_profiles"
+        assert _revision_number(engine) == "0006_model_profile_bindings"
     finally:
         engine.dispose()
     assert not fallback_path.exists()
@@ -421,7 +422,7 @@ def test_alembic_environment_url_intentionally_wins(
 
     engine = create_engine(environment_url)
     try:
-        assert _revision_number(engine) == "0005_model_profiles"
+        assert _revision_number(engine) == "0006_model_profile_bindings"
     finally:
         engine.dispose()
     assert not configured_path.exists()

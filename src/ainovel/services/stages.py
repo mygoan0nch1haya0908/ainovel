@@ -1,5 +1,5 @@
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 from uuid import uuid4
 
@@ -15,6 +15,7 @@ from ainovel.models.stage import StoryStage, StageRoadmapVersion, StageModelAtte
 from ainovel.models.workflow import GenerationWorkflow
 from ainovel.providers.contracts import ModelRequest
 from ainovel.services.workflows import DEFAULT_BUDGETS, PROVIDER_NAMES, WorkflowService, WorkflowBudgets
+from ainovel.services.provider_resolution import validate_profile_binding
 
 
 STAGE_PROMPT = "根据作者阶段架构和锁定设定提出精简路线图。仅列有稳定标识的小章节节点；按因果顺序推进，依赖只能引用此前节点。不得生成正文或场景详情。保留已确认节点，必须覆盖关键事件和阶段终态，不得用章数代替节点列表。"
@@ -53,8 +54,9 @@ class StageBatchStart:
 
 
 class StageService:
-    def __init__(self, session):
+    def __init__(self, session, *, provider_resolver=None):
         self.session = session
+        self.provider_resolver = provider_resolver
 
     def get(self, stage_id):
         stage = self.session.get(StoryStage, stage_id)
@@ -95,7 +97,8 @@ class StageService:
     def list_roadmaps(self, stage_id):
         return list(self.session.scalars(select(StageRoadmapVersion).where(StageRoadmapVersion.stage_id == stage_id).order_by(StageRoadmapVersion.version_number)))
 
-    def propose_roadmap(self, stage_id, actor, provider_name, model_name, *, architecture=None, budgets=StageBudgets()):
+    def propose_roadmap(self, stage_id, actor, provider_name, model_name, *, architecture=None,
+                        budgets=StageBudgets(), model_profile_version_id=None):
         if provider_name not in PROVIDER_NAMES or not isinstance(model_name, str) or not model_name.strip():
             raise ValueError("invalid provider/model")
         if any(type(v) is not int or v <= 0 for v in asdict(budgets).values()) or budgets.attempt_limit > 2:
@@ -107,6 +110,13 @@ class StageService:
             raise ValueError("architecture required")
         try:
             project = self._lock_idle_project(stage)
+            profile = validate_profile_binding(self.session, provider_name, model_name, model_profile_version_id)
+            if profile is not None:
+                output = min(budgets.output_tokens, profile.output_limit)
+                incoming = min(budgets.input_tokens, profile.context_limit - output)
+                if incoming < 1:
+                    raise ValueError("model profile context limit is too small")
+                budgets = replace(budgets, input_tokens=incoming, output_tokens=output)
             self._claim_stage(stage)
             constitution = self.session.get(ConstitutionVersion, project.current_constitution_version_id)
             if constitution is None or not constitution.author_approved:
@@ -120,7 +130,8 @@ class StageService:
                 id=str(uuid4()), stage_id=stage.id,
                 version_number=self.session.scalar(select(func.coalesce(func.max(StageRoadmapVersion.version_number), 0) + 1).where(StageRoadmapVersion.stage_id == stage.id)),
                 input_revision=stage.revision, constitution_version_id=constitution.id,
-                provider_name=provider_name, model_name=model_name.strip(), architecture=architecture.strip(),
+                provider_name=provider_name, model_name=model_name if profile is not None else model_name.strip(),
+                model_profile_version_id=model_profile_version_id, architecture=architecture.strip(),
                 prompt_snapshot={"body": STAGE_PROMPT + (HIERARCHY_INSTRUCTION if hierarchy else ""), "schema": StageRoadmapDraft.model_json_schema()},
                 input_snapshot={"architecture": architecture.strip(), "constitution": deepcopy(constitution.content),
                                 "outline": frozen_outline,
@@ -132,7 +143,8 @@ class StageService:
                 attempt_limit=budgets.attempt_limit,
             )
             self.session.add(version)
-            self._audit(stage, "stage_roadmap_requested", actor, {"roadmap_id": version.id})
+            self._audit(stage, "stage_roadmap_requested", actor,
+                        {"roadmap_id": version.id, "model_profile_version_id": model_profile_version_id})
             self.session.commit()
             return version
         except Exception:
@@ -143,6 +155,8 @@ class StageService:
         """Dispatch one durable attempt; a retry must use the same roadmap ID."""
         self.session.expire_all()
         version = self.roadmap(roadmap_id)
+        if version.provider_name == "compatible" and self.provider_resolver is None:
+            raise ValueError("compatible roadmap requires profile resolver")
         if version.status not in {"PENDING", "PAUSED_PROVIDER", "PAUSED_INVALID"}:
             raise ValueError("roadmap is not available for generation")
         stage = self.get(version.stage_id)
@@ -170,6 +184,11 @@ class StageService:
             self.session.commit()
             return version
         try:
+            if version.provider_name == "compatible":
+                provider = self.provider_resolver.resolve(
+                    version.provider_name, version.model_name,
+                    model_profile_version_id=version.model_profile_version_id,
+                )
             capabilities = provider.capabilities(version.model_name)
             output = min(version.output_token_limit, capabilities.max_output_tokens)
             capacity = effective_input_capacity(version.input_token_limit, capabilities.context_window, output)
@@ -293,6 +312,10 @@ class StageService:
         version = self.roadmap(stage.approved_roadmap_id)
         if version.status != "APPROVED":
             raise ValueError("approved roadmap required")
+        if version.model_profile_version_id is not None and (
+            provider_name != version.provider_name or model_name != version.model_name
+        ):
+            raise ValueError("stage batch model binding mismatch")
         if not self._inputs_current(stage, version, check_revision=False):
             raise ValueError("stale stage inputs")
         revision, confirmed, roadmap_id = stage.revision, stage.confirmed_chapters, version.id
@@ -320,7 +343,9 @@ class StageService:
                 nodes.append(mapping)
             self._audit(current, "stage_batch_started", actor, {"workflow_id": workflow.id, "roadmap_id": roadmap_id})
         workflow = WorkflowService(self.session).start(project_id, provider_name, model_name, len(selected), budgets,
-                                                       generation_version=2, _before_commit=attach)
+                                                       generation_version=2,
+                                                       model_profile_version_id=version.model_profile_version_id,
+                                                       _before_commit=attach)
         return StageBatchStart(workflow, tuple(nodes))
 
     def workflow_nodes(self, workflow_id):

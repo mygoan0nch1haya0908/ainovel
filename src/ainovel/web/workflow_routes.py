@@ -252,6 +252,7 @@ def create_workflow(
     request: Request,
     provider_name: str = Form(""),
     model_name: str = Form(""),
+    model_profile_version_id: str = Form(""),
     requested_chapters: str = Form(""),
     session: Session = Depends(get_session),
     _csrf: None = Depends(require_csrf),
@@ -280,6 +281,7 @@ def create_workflow(
             model_name,
             count,
             getattr(request.app.state, "workflow_budgets", DEFAULT_BUDGETS),
+            model_profile_version_id=model_profile_version_id or None,
         )
     except (ValueError, PermissionError) as error:
         return _project_page(
@@ -403,6 +405,7 @@ def diagnose_provider(
     request: Request,
     provider_name: str = Form(""),
     model_name: str = Form(""),
+    model_profile_version_id: str = Form(""),
     session: Session = Depends(get_session),
     _csrf: None = Depends(require_csrf),
 ) -> object:
@@ -413,7 +416,14 @@ def diagnose_provider(
     if not request.app.state.provider_registry.contains(provider_name):
         return _project_page(request, session, project_id, "Provider 未配置", 422)
     try:
-        provider = request.app.state.provider_registry.get(provider_name)
+        provider = (
+            request.app.state.provider_resolver.resolve(
+                provider_name, model_name.strip(),
+                model_profile_version_id=model_profile_version_id or None,
+            )
+            if provider_name == "compatible"
+            else request.app.state.provider_registry.get(provider_name)
+        )
     except Exception:
         return _project_page(
             request,

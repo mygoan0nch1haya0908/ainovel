@@ -3,7 +3,7 @@ from ainovel.providers.diagnostics import ResponseFailure, safe_failure_detail
 
 from collections.abc import Mapping, Callable
 from copy import deepcopy
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
@@ -48,6 +48,7 @@ from ainovel.services.draft_repair import (
     promote_work_draft,
 )
 from ainovel.services.prompts import PromptService
+from ainovel.services.provider_resolution import validate_profile_binding
 
 
 @dataclass(frozen=True)
@@ -63,7 +64,7 @@ class WorkflowBudgets:
 
 
 DEFAULT_BUDGETS = WorkflowBudgets()
-PROVIDER_NAMES = frozenset({"fake", "ollama", "openai", "qwen"})
+PROVIDER_NAMES = frozenset({"fake", "ollama", "openai", "qwen", "compatible"})
 WORKFLOW_STATUSES = frozenset(
     {
         "PREPARING",
@@ -251,6 +252,7 @@ class WorkflowService:
         budgets: WorkflowBudgets,
         *,
         generation_version: int = 1,
+        model_profile_version_id: str | None = None,
         _before_commit: Callable[[GenerationWorkflow], None] | None = None,
     ) -> GenerationWorkflow:
         self._validate_start_arguments(
@@ -294,12 +296,35 @@ class WorkflowService:
                 self.session.rollback()
                 self._raise_start_conflict(project_id)
 
+            profile = validate_profile_binding(
+                self.session, provider_name, model_name, model_profile_version_id
+            )
+            if profile is not None:
+                def cap(input_tokens: int, output_tokens: int) -> tuple[int, int]:
+                    output = min(output_tokens, profile.output_limit)
+                    incoming = min(input_tokens, profile.context_limit - output)
+                    if incoming < 1:
+                        raise ValueError("model profile context limit is too small")
+                    return incoming, output
+
+                planner = cap(budgets.planner_input, budgets.planner_output)
+                writer = cap(budgets.writer_input, budgets.writer_output)
+                summarizer = cap(budgets.summarizer_input, budgets.summarizer_output)
+                reviewer = cap(budgets.reviewer_input, budgets.reviewer_output)
+                budgets = replace(
+                    budgets, planner_input=planner[0], planner_output=planner[1],
+                    writer_input=writer[0], writer_output=writer[1],
+                    summarizer_input=summarizer[0], summarizer_output=summarizer[1],
+                    reviewer_input=reviewer[0], reviewer_output=reviewer[1],
+                )
+
             workflow = GenerationWorkflow(
                 id=workflow_id,
                 project_id=project_id,
                 base_outline_version_id=outline_id,
                 provider_name=provider_name,
-                model_name=model_name.strip(),
+                model_name=model_name if profile is not None else model_name.strip(),
+                model_profile_version_id=model_profile_version_id,
                 requested_chapters=requested_chapters,
                 generation_version=generation_version,
                 model_call_limit=(
@@ -378,6 +403,7 @@ class WorkflowService:
                 {
                     "provider_name": provider_name,
                     "model_name": model_name.strip(),
+                    "model_profile_version_id": model_profile_version_id,
                     "requested_chapters": requested_chapters,
                     "base_outline_version_id": outline_id,
                     "generation_version": generation_version,
