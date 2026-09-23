@@ -1,5 +1,6 @@
 from ainovel.models.audit import AuditEvent
 from ainovel.models.base import Base, TimestampMixin
+from ainovel.models.model_profile import ModelProfile, ModelProfileVersion
 from ainovel.models.batch import Chapter, WritingBatch
 from ainovel.models.context import ContextPacket, ContextPacketItem, ContextSource
 from ainovel.models.outline import OutlineNode, OutlineVersion
