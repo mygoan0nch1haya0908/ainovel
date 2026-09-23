@@ -18,7 +18,8 @@ class StoryStage(TimestampMixin, Base):
 class StageRoadmapVersion(TimestampMixin, Base):
     __tablename__ = "stage_roadmap_versions"
     __table_args__ = (UniqueConstraint("stage_id", "version_number"),
-                      CheckConstraint("attempts_used >= 0 AND attempts_used <= attempt_limit"))
+                      CheckConstraint("attempts_used >= 0 AND attempts_used <= attempt_limit",
+                                      name="ck_stage_roadmap_attempts"))
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     stage_id: Mapped[str] = mapped_column(ForeignKey("story_stages.id"))
     version_number: Mapped[int] = mapped_column(Integer)

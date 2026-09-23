@@ -416,6 +416,8 @@ def diagnose_provider(
     if not request.app.state.provider_registry.contains(provider_name):
         return _project_page(request, session, project_id, "Provider 未配置", 422)
     try:
+        if provider_name != "compatible" and model_profile_version_id:
+            raise ValueError("legacy provider cannot use a model profile")
         provider = (
             request.app.state.provider_resolver.resolve(
                 provider_name, model_name.strip(),

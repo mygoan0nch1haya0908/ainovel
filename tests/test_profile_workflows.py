@@ -1,9 +1,10 @@
 from dataclasses import replace
 import json
+from threading import Event, Thread, current_thread
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 from ainovel.models.audit import AuditEvent
 from ainovel.models.workflow import GenerationWorkflow
@@ -228,3 +229,89 @@ def test_orchestrator_cached_provider_pauses_after_revoke(profile_setup, session
     result = orchestrator.advance(workflow.id)
     assert result.status == "PAUSED_PROVIDER"
     assert transport.calls == []
+
+
+def test_ownership_claim_commits_binding_before_waiting_revoke(profile_setup, session, client, project, official_outline):
+    service, factory, vault, version, _, transport = profile_setup
+    ProjectService(session).add_constitution(project.id, {"genre": "fantasy"}, author_approved=True)
+    revoke_reached_write = Event()
+    revoker_errors = []
+
+    def observe_write(_connection, _cursor, statement, _parameters, _context, _executemany):
+        if current_thread().name == "profile-revoker" and statement.lstrip().upper().startswith("UPDATE MODEL_PROFILES"):
+            revoke_reached_write.set()
+
+    def revoke():
+        try:
+            with factory() as other_session:
+                ModelProfileService(other_session, vault=vault).revoke(version.profile_id)
+        except Exception as error:
+            revoker_errors.append(error)
+
+    thread = Thread(target=revoke, name="profile-revoker")
+
+    def before_commit(_workflow):
+        thread.start()
+        assert revoke_reached_write.wait(5), "revoker did not reach the profile write"
+
+    event.listen(client.app.state.engine, "before_cursor_execute", observe_write)
+    try:
+        workflow = WorkflowService(session).start(
+            project.id, "compatible", "model-a", 1, WorkflowBudgets(),
+            model_profile_version_id=version.version_id, _before_commit=before_commit,
+        )
+        thread.join(10)
+        assert not thread.is_alive()
+        assert revoker_errors == []
+        assert workflow.model_profile_version_id == version.version_id
+        provider = _resolver(factory, vault, transport).resolve
+        with pytest.raises(ProviderAuthenticationError):
+            provider("compatible", "model-a", model_profile_version_id=version.version_id)
+        assert transport.calls == []
+    finally:
+        event.remove(client.app.state.engine, "before_cursor_execute", observe_write)
+        if thread.is_alive():
+            thread.join(10)
+
+
+def test_cached_inflight_call_finishes_but_next_call_after_revoke_is_blocked(profile_setup):
+    service, factory, vault, version, _, _ = profile_setup
+    entered, release = Event(), Event()
+    results, errors = [], []
+
+    class BlockingTransport(Transport):
+        def request_json(self, *args, **kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("in-flight test did not release transport")
+            return super().request_json(*args, **kwargs)
+
+    transport = BlockingTransport()
+    proxy = _resolver(factory, vault, transport).resolve(
+        "compatible", "model-a", model_profile_version_id=version.version_id
+    )
+
+    def dispatch():
+        try:
+            results.append(proxy.generate(_request()).structured)
+        except Exception as error:
+            errors.append(error)
+
+    thread = Thread(target=dispatch, name="profile-inflight")
+    thread.start()
+    try:
+        assert entered.wait(5), "admitted request did not reach transport"
+        service.revoke(version.profile_id)
+        release.set()
+        thread.join(10)
+        assert not thread.is_alive()
+        assert errors == []
+        assert results == [{"ok": True}]
+        assert len(transport.calls) == 1
+        with pytest.raises(ProviderAuthenticationError):
+            proxy.generate(_request())
+        assert len(transport.calls) == 1
+    finally:
+        release.set()
+        if thread.is_alive():
+            thread.join(10)

@@ -1082,6 +1082,27 @@ def test_provider_diagnostic_calls_only_diagnose_and_renders_safe_success(
     assert provider.diagnose_calls == ["local-model"]
 
 
+def test_legacy_diagnostic_rejects_profile_binding_before_provider_call(
+    client: TestClient, ready_project: NovelProject
+) -> None:
+    provider = DiagnosticOnlyProvider(
+        ProviderDiagnostic(True, "internal provider detail", ("local-model",))
+    )
+    client.app.state.provider_registry = ProviderRegistry({"fake": lambda: provider})
+    path = f"/projects/{ready_project.id}"
+    result = client.post(
+        f"{path}/providers/diagnose",
+        data={
+            "provider_name": "fake",
+            "model_name": "local-model",
+            "model_profile_version_id": "unrelated-version",
+            "csrf_token": csrf(client, path),
+        },
+    )
+    assert result.status_code == 200
+    assert provider.diagnose_calls == []
+
+
 def test_provider_diagnostic_redacts_raw_exception_and_headers(
     client: TestClient, ready_project: NovelProject
 ) -> None:
