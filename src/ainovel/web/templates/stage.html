@@ -29,7 +29,7 @@
   <form action="/stages/{{ stage.id }}/roadmaps" method="post" data-confirm="确认冻结这次架构与模型设置？此操作不会调用模型。">
     {% include "_profile_selection.html" %}
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <p><label for="provider-name">Provider</label><select id="provider-name" name="provider_name">{% if chapter_test_mode %}<option value="qwen">Qwen</option>{% else %}<option value="fake">Fake 演示</option><option value="ollama">Ollama</option><option value="openai">OpenAI</option><option value="qwen">Qwen</option>{% endif %}</select></p>
+    <p><label for="provider-name">Provider</label><select id="provider-name" name="provider_name">{% if chapter_test_mode %}<option value="qwen">Qwen</option><option value="fake">Fake 演示</option>{% else %}<option value="fake">Fake 演示</option><option value="ollama">Ollama</option><option value="openai">OpenAI</option><option value="qwen">Qwen</option>{% endif %}</select></p>
     <p><label for="model-name">模型名称</label><input id="model-name" name="model_name" value="{% if chapter_test_mode %}qwen-flash{% else %}demo{% endif %}" required></p>
     <p><label for="architecture-revision">可选：修订后的总体架构</label><textarea id="architecture-revision" name="architecture" rows="6" placeholder="留空则沿用上方架构"></textarea></p>
     <p><label><input type="checkbox" name="author_confirm" value="yes" required> 我确认架构和模型设置。</label></p>

@@ -1,4 +1,5 @@
 from html import unescape
+from html.parser import HTMLParser
 import re
 from uuid import uuid4
 import json
@@ -187,8 +188,13 @@ assert.equal(consent.checked, false); assert.equal(consent.required, true); asse
 consent.checked = true; select.value = ''; select.selectedOptions = [{dataset:{}}]; listeners.change();
 assert.equal(consent.checked, false); assert.equal(consent.required, false); assert.equal(model.value, 'demo');
 assert.equal(model.readOnly, false); assert.equal(provider.disabled, false);
+select.value = 'missing-version'; select.selectedOptions = [{dataset: {model: 'chosen-model', unavailable: 'yes'}}];
+listeners.change();
+assert.equal(select.value, 'missing-version'); assert.equal(model.value, 'chosen-model');
+assert.equal(consent.checked, false); assert.equal(consent.required, true);
+assert.equal(provider.disabled, true); assert(destination.textContent.includes('不可用'));
 '''
-    result = subprocess.run([node, "-e", harness, str(script)], capture_output=True, text=True)
+    result = subprocess.run([node, "-e", harness, str(script)], capture_output=True, text=True, encoding="utf-8")
     assert result.returncode == 0, result.stderr
 
 
@@ -424,3 +430,131 @@ def test_local_check_and_save_never_resolve_dns(profile_client, monkeypatch):
     assert client.post("/model-profiles/check", data=data).status_code == 200
     assert client.post("/model-profiles", data=data).status_code == 200
     assert not dns_calls and not network.calls
+
+
+class SetupSelects(HTMLParser):
+    """Read the selected option as a browser would, defaulting to the first."""
+    def __init__(self, html):
+        super().__init__()
+        self.name = None
+        self.values = {}
+        self.options = {}
+        self.consent_checked = False
+        self.feed(html)
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "select":
+            self.name = attrs.get("name")
+        elif tag == "option" and self.name:
+            self.options.setdefault(self.name, []).append(attrs)
+            if self.name not in self.values or "selected" in attrs:
+                self.values[self.name] = attrs.get("value", "")
+        elif tag == "input" and attrs.get("name") == "provider_consent":
+            self.consent_checked = "checked" in attrs
+
+    def handle_endtag(self, tag):
+        if tag == "select":
+            self.name = None
+
+
+@pytest.fixture
+def setup_client(database_url):
+    from ainovel.chapter_test import create_chapter_test_app
+    app = create_chapter_test_app(database_url, profile_vault=Vault(), profile_transport=Transport())
+    Base.metadata.create_all(app.state.engine)
+    with TestClient(app) as client:
+        yield client
+
+
+def setup_form(client, **changes):
+    page = client.get("/chapter-test")
+    submission = unescape(re.search(r'name="submission_token" value="([^"]+)"', page.text).group(1))
+    return dict(project_title="Novel", setting_style="Fantasy", provisional_ending="End", book_outline="Book",
+                chapter_outline="Chapter", stage_architecture="Stage", setup_mode="single_chapter", author_confirm="yes",
+                csrf_token=csrf(client), submission_token=submission, **changes)
+
+
+@pytest.mark.parametrize("provider", ["compatible", "compatible_revised", "fake", "qwen"])
+def test_setup_validation_error_roundtrips_explicit_model_selection(setup_client, provider):
+    client = setup_client
+    version_id = ""
+    revised = provider == "compatible_revised"
+    if revised:
+        provider = "compatible"
+    if provider == "compatible":
+        location = save(client)
+        with client.app.state.session_factory() as session:
+            version_id = client.app.state.model_profile_service_factory(session).list_public()[0].version_id
+        if revised:
+            assert client.post(location + "/revise", data={**FORM, "model_name": "model-b", "api_key": "",
+                "keep_existing_key": "yes", "csrf_token": csrf(client)}).status_code == 200
+    data = setup_form(client, provider_name="qwen" if provider == "compatible" else provider,
+                      model_name="model-a" if version_id else "custom-model", model_profile_version_id=version_id,
+                      provider_consent="yes")
+    data["project_title"] = ""
+    invalid = client.post("/chapter-test", data=data)
+    assert invalid.status_code == 422
+    rendered = SetupSelects(invalid.text)
+    assert rendered.values["model_profile_version_id"] == version_id
+    if version_id:
+        selected = next(option for option in rendered.options["model_profile_version_id"] if option["value"] == version_id)
+        assert selected.get("data-unavailable") != "yes"
+    if not version_id:
+        assert rendered.values["provider_name"] == provider
+    assert not rendered.consent_checked
+    corrected = {**data, **rendered.values, "project_title": "Corrected", "provider_consent": ""}
+    if version_id:
+        assert client.post("/chapter-test", data=corrected).status_code == 422
+        corrected["provider_consent"] = "yes"
+    result = client.post("/chapter-test", data=corrected, follow_redirects=False)
+    assert result.status_code == 303
+    with client.app.state.session_factory() as session:
+        workflow = session.scalar(select(GenerationWorkflow))
+        assert workflow.provider_name == provider
+        assert workflow.model_profile_version_id == (version_id or None)
+        assert workflow.model_name == data["model_name"]
+    assert not client.app.state.provider_resolver.transport.calls
+
+
+@pytest.mark.parametrize("state", ["disabled", "missing"])
+def test_unavailable_setup_selection_survives_errors_without_fallback(setup_client, state):
+    client = setup_client
+    version_id = "missing-profile-version"
+    if state == "disabled":
+        save(client)
+        with client.app.state.session_factory() as session:
+            service = client.app.state.model_profile_service_factory(session)
+            version_id = service.list_public()[0].version_id
+            service.set_enabled(version_id, False)
+    data = setup_form(client, model_profile_version_id=version_id, model_name="chosen-model", provider_consent="yes")
+    response = client.post("/chapter-test", data=data)
+    assert response.status_code == 422
+    rendered = SetupSelects(response.text)
+    assert rendered.values["model_profile_version_id"] == version_id
+    selected = next(option for option in rendered.options["model_profile_version_id"] if option["value"] == version_id)
+    assert selected.get("data-unavailable") == "yes" and "disabled" not in selected
+    assert not rendered.consent_checked
+    assert client.post("/chapter-test", data={**data, **rendered.values}).status_code == 422
+    with client.app.state.session_factory() as session:
+        assert session.scalar(select(GenerationWorkflow)) is None
+    assert not client.app.state.provider_resolver.transport.calls
+
+
+@pytest.mark.parametrize("mode", ["hierarchical", "stage"])
+@pytest.mark.parametrize("provider", ["fake", "qwen"])
+def test_explicit_legacy_stage_setup_freezes_selected_provider_model(setup_client, mode, provider):
+    client = setup_client
+    data = setup_form(client, provider_name=provider, model_name="custom-stage-model")
+    data["setup_mode"] = mode
+    result = client.post("/chapter-test", data=data, follow_redirects=False)
+    assert result.status_code == 303
+    with client.app.state.session_factory() as session:
+        roadmap = session.scalar(select(StageRoadmapVersion))
+        assert roadmap is not None
+        assert (roadmap.provider_name, roadmap.model_name) == (provider, "custom-stage-model")
+        assert roadmap.model_profile_version_id is None
+    stage_page = client.get(result.headers["location"])
+    options = SetupSelects(stage_page.text).options["provider_name"]
+    assert {option["value"] for option in options} >= {"fake", "qwen"}
+    assert not client.app.state.provider_resolver.transport.calls

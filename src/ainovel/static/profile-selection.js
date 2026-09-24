@@ -17,7 +17,9 @@ document.querySelectorAll("[data-profile-selector]").forEach((selector) => {
     provider.disabled = bound;
     if (bound) {
       model.value = option.dataset.model;
-      destination.textContent = `认证目标：${option.dataset.target} · 模型：${option.dataset.model}`;
+      destination.textContent = option.dataset.unavailable === "yes"
+        ? "原选择不可用；请明确重新选择配置，不会自动改用环境 Provider。"
+        : `认证目标：${option.dataset.target} · 模型：${option.dataset.model}`;
     } else {
       if (wasBound) model.value = legacyModel;
       destination.textContent = "使用环境配置 / 本地演示；请选择并核对下方模型。";

@@ -48,7 +48,8 @@
       <p><label for="chapter_hook">章末钩子</label><textarea id="chapter_hook" name="chapter_hook" maxlength="{{ field_limits.chapter_hook }}" rows="3">{{ chapter_form.chapter_hook }}</textarea></p>
     </details></fieldset>
     {% include "_profile_selection.html" %}
-    <p><label>环境 Provider <select name="provider_name"><option value="qwen">环境 Qwen</option><option value="fake">Fake 本地演示</option></select></label></p>
+    {% set selected_provider = chapter_form.get('provider_name', 'qwen') %}
+    <p><label>环境 Provider <select name="provider_name"><option value="qwen"{% if selected_provider in ['qwen', 'compatible'] %} selected{% endif %}>环境 Qwen</option><option value="fake"{% if selected_provider == 'fake' %} selected{% endif %}>Fake 本地演示</option>{% if selected_provider not in ['qwen', 'fake', 'compatible'] %}<option value="{{ selected_provider }}" selected>原 Provider 不可用，请重新选择</option>{% endif %}</select></label></p>
     <p><label for="model_name">模型名称</label><input id="model_name" name="model_name" maxlength="{{ field_limits.model_name }}" value="{{ chapter_form.model_name }}" required></p>
     <div data-outline-modes="single_chapter">
     <p><label><input type="checkbox" name="repair_mode" value="yes"{% if chapter_form.repair_mode == "yes" %} checked{% endif %}> 独立单章默认启用 v2 短稿修补与章节覆盖检查（每章首次生成后最多两轮修补；会增加有界模型调用，仍不保证文学质量）。</label></p>

@@ -1,5 +1,6 @@
 <fieldset data-profile-selector><legend>已保存模型接口（可选）</legend>
-<label>配置版本 <select name="model_profile_version_id" data-profile-select><option value="">使用下方环境配置 / 本地演示</option>{% for item in model_profiles %}<option value="{{ item.version_id }}" data-model="{{ item.model_name }}" data-target="{{ item.base_url }}">{{ item.name }} · {{ item.base_url }} · {{ item.model_name }} · {{ item.version_id }}</option>{% endfor %}</select></label>
+{% set selected_version = selected_profile_version_id|default('') %}
+<label>配置版本 <select name="model_profile_version_id" data-profile-select><option value=""{% if not selected_version %} selected{% endif %}>使用下方环境配置 / 本地演示</option>{% for item in model_profiles %}<option value="{{ item.version_id }}" data-model="{{ item.model_name }}" data-target="{{ item.base_url }}"{% if item.version_id == selected_version %} selected{% endif %}>{{ item.name }} · {{ item.base_url }} · {{ item.model_name }} · {{ item.version_id }}</option>{% endfor %}{% if unavailable_profile_selection %}<option value="{{ selected_version }}" data-unavailable="yes" data-model="{{ selected_profile_model }}" selected>原选择不可用：{{ selected_version }}；请明确重新选择配置</option>{% endif %}</select></label>
 <p data-profile-destination>请选择配置以查看认证目标与模型；将固定此版本，修改配置不会改变已建任务。</p>
-<label><input type="checkbox" name="provider_consent" value="yes" data-profile-consent>我确认小说设定、提纲与正文将发送给所选目标服务商，调用可能收费。</label>
+<label><input type="checkbox" name="provider_consent" value="yes" data-profile-consent{% if selected_version %} required{% endif %}>我确认小说设定、提纲与正文将发送给所选目标服务商，调用可能收费。</label>
 <p><a href="/model-profiles">管理模型接口配置</a> · 保存或创建任务不会自动调用模型。</p></fieldset>

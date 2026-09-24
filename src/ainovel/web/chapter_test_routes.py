@@ -146,6 +146,15 @@ def _render(
     project_id: str | None = None,
     reuse_notice: str | None = None,
 ) -> object:
+    profiles = available_profiles(request, session)
+    selected_version = values.get("model_profile_version_id", "")
+    if selected_version and not any(item.version_id == selected_version for item in profiles):
+        try:
+            submitted = request.app.state.model_profile_service_factory(session).get_public(selected_version)
+            if submitted.enabled:
+                profiles.append(submitted)
+        except ValueError:
+            pass
     return templates.TemplateResponse(
         request,
         "chapter_test.html",
@@ -154,7 +163,11 @@ def _render(
             "csrf_token": csrf_token(request),
             "submission_token": submission_token,
             "chapter_form": values,
-            "model_profiles": available_profiles(request, session),
+            "model_profiles": profiles,
+            "selected_profile_version_id": selected_version,
+            "unavailable_profile_selection": bool(selected_version and not any(
+                item.version_id == selected_version for item in profiles)),
+            "selected_profile_model": values.get("model_name", ""),
             "error": error,
             "projects": ProjectService(session).list_projects(),
             "confirmed_input": _confirmed_input(session, project_id),
@@ -339,9 +352,10 @@ def _create_workflow_atomically(
             story_stage = StageService(session).create(
                 project.id, values["stage_architecture"].strip(), "author"
             )
-            if values.get("model_profile_version_id"):
-                StageService(session).propose_roadmap(story_stage.id, "author", "compatible", values["model_name"],
-                    model_profile_version_id=values["model_profile_version_id"])
+            if values.get("model_profile_version_id") or values.get("provider_choice_explicit") == "yes":
+                stage = "roadmap_propose"
+                StageService(session).propose_roadmap(story_stage.id, "author", values["provider_name"], values["model_name"],
+                    model_profile_version_id=values.get("model_profile_version_id") or None)
             project_id, target_id = project.id, story_stage.id
         else:
             stage = "budget_validate"
@@ -516,7 +530,7 @@ def create_chapter_test(
     chapter_goal: str = Form(""),
     chapter_hook: str = Form(""),
     model_name: str = Form("qwen-flash"),
-    provider_name: str = Form("qwen"),
+    provider_name: str | None = Form(None),
     model_profile_version_id: str = Form(""),
     provider_consent: str = Form(""),
     setup_mode: str = Form("single_chapter"),
@@ -537,7 +551,8 @@ def create_chapter_test(
         "chapter_goal": chapter_goal,
         "chapter_hook": chapter_hook,
         "model_name": model_name,
-        "provider_name": provider_name,
+        "provider_name": provider_name if provider_name is not None else "qwen",
+        "provider_choice_explicit": "yes" if provider_name is not None else "",
         "model_profile_version_id": model_profile_version_id,
         "setup_mode": setup_mode,
         "stage_architecture": stage_architecture,
@@ -551,7 +566,7 @@ def create_chapter_test(
             values["provider_name"], values["model_name"] = "compatible", view.model_name
         except ValueError:
             selection_error = "请选择可用配置并确认将小说内容发送给目标服务商"
-    elif provider_name not in {"qwen", "fake"} or not request.app.state.provider_registry.contains(provider_name):
+    elif values["provider_name"] not in {"qwen", "fake"} or not request.app.state.provider_registry.contains(values["provider_name"]):
         selection_error = "请选择环境 Qwen 或本地演示"
     error = selection_error or _validation_error(values)
     if error is not None:
