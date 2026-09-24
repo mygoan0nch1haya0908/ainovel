@@ -1,4 +1,4 @@
-# Secure model profiles: consolidated final fix
+# Secure model profiles: acceptance and final fixes
 
 Base: `cfabb0faa59f5a113db50606dca6294a16c0af63` (clean checkout before this wave).
 
@@ -46,3 +46,32 @@ Result: **156 passed, 1 known Starlette/AnyIO deprecation warning**, 0 failures,
 - Confirmed public-only context is used for retry display. Historical enabled selections remain selected; disabled, revoked and missing versions use a visibly unavailable option. Retrying them remains rejected without creating a workflow or roadmap. Correcting unrelated errors requires renewed consent and binds the same version. Raw model IDs remain in form values and are escaped by Jinja or assigned via `textContent`.
 - Confirmed the provider diagnostic rejects `1`, `1.0` and strings while accepting literal `true`; no payload/credential serialization or fixed-error path changed.
 - No live key, network call, runtime database, service restart, push, or browser visual claim. The full repository suite is left to the main agent after this focused review.
+
+## Final acceptance
+
+The main agent ran the full offline suite on product commit `afc143b8e7ce4d769e2d1e1155ffacbc113dbd53`, with the same process-only environment above, from the isolated qwen-adapter worktree:
+
+```powershell
+& 'D:/ainovel/.worktrees/phase2-orchestration-context/.venv/Scripts/python.exe' -m pytest -o 'addopts=--strict-markers --basetemp=.pytest-tmp' -q --tb=short
+```
+
+Result: **751 passed, 1 skipped, 1 warning in 86.50 seconds**, exit 0. The skip is the existing opt-in live model test; the warning is the pre-existing Starlette/AnyIO BlockingPortal deprecation.
+
+Independent task reviews and scoped fix reviews are complete. Final whole-branch review covered `992bcbb..cfabb0f` using risk-based integration passes; its two Important findings and one Minor finding were fixed in `afc143b`. Final scoped re-review found all three addressed, no new Critical/Important breakage, and no open findings. This document relocation and acceptance appendix change documentation only after that tested product commit.
+
+Implemented entry: `/model-profiles`. Supports protected credential storage, immutable configuration versions, explicit model-list/connection-test operations, and selection for project, single-chapter and hierarchical/stage flows. Offline acceptance exercised author plan/body approval, revision isolation, revocation, real shipped JavaScript, and sentinel scans of HTML, logs, database, prompts, artifacts and official chapter serialization.
+
+The existing runtime database/service has NOT been upgraded or restarted. Before enabling the new page there, obtain author authorization, verify no active model call, create a consistent SQLite backup, migrate only that exact isolated database to `0006_model_profile_bindings`, then restart and check local readiness. Do not automatically import an existing key or make a paid call. No new push or merge was performed.
+
+## Recorded decisions and remaining verification boundaries
+
+1. A changed normalized target requires newly entered credentials rather than copying an existing key. This chooses the stricter approved option; its cost is key re-entry.
+2. Keyless loopback-to-loopback revisions may stay keyless because local credentials are optional. The network loopback checks remain essential; an incorrect boundary would permit an unintended local destination.
+3. Model identifiers stay exact raw data, with HTML escaping only at template/textContent boundaries. Pre-escaping changes protocol identifiers; bypassing the rendering boundary would risk unsafe display.
+4. Existing environment-provider SDK transports were preserved, not redesigned. Their legacy risks are not covered by the new pinned-profile transport protections.
+5. No export endpoint exists; acceptance covers actual official-chapter serialization. A future exporter needs its own privacy acceptance.
+6. No live provider, billing or production-key check was performed without author authorization. Real-provider interoperability still requires author testing.
+7. Actual browser layout QA remains unperformed after two browser-controller failures. Template/TestClient/Node verification does not rule out visual or accessibility defects.
+8. The existing Starlette/AnyIO warning is left for dependency maintenance. Future dependency compatibility needs follow-up.
+
+Already admitted/in-progress requests may finish after revocation; subsequent dispatches recheck authorization and stop. Neither ciphertext deletion nor revocation erases old backups, recalls provider-received content, or guarantees process-memory erasure.
