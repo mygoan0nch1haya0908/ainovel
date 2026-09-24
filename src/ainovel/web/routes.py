@@ -17,7 +17,7 @@ from ainovel.services.outlines import OutlineService
 from ainovel.services.projects import ProjectService
 from ainovel.services.stages import StageService
 from ainovel.web.security import csrf_token, require_csrf
-from ainovel.web.profile_selection import available_profiles
+from ainovel.web.profile_selection import available_profiles, retry_selection_context
 
 router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent / "templates"))
@@ -97,10 +97,14 @@ def _project_page(
     error: str | None = None,
     status_code: int = 200,
     diagnostic: dict[str, object] | None = None,
+    workflow_form: dict[str, str] | None = None,
 ) -> object:
     context = _project_context(request, session, project_id)
     context["error"] = error
     context["diagnostic"] = diagnostic
+    context["workflow_form"] = workflow_form or {}
+    if workflow_form is not None:
+        context.update(retry_selection_context(request, session, workflow_form))
     return templates.TemplateResponse(request, "project.html", context, status_code=status_code)
 
 

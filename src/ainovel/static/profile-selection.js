@@ -7,7 +7,7 @@ document.querySelectorAll("[data-profile-selector]").forEach((selector) => {
   const provider = form.elements.provider_name;
   let legacyModel = model.value;
   let wasBound = false;
-  const update = () => {
+  const update = (initial = false) => {
     const bound = Boolean(select.value);
     if (bound && !wasBound) legacyModel = model.value;
     const option = select.selectedOptions[0];
@@ -16,7 +16,7 @@ document.querySelectorAll("[data-profile-selector]").forEach((selector) => {
     model.readOnly = bound;
     provider.disabled = bound;
     if (bound) {
-      model.value = option.dataset.model;
+      if (!initial || !model.value) model.value = option.dataset.model;
       destination.textContent = option.dataset.unavailable === "yes"
         ? "原选择不可用；请明确重新选择配置，不会自动改用环境 Provider。"
         : `认证目标：${option.dataset.target} · 模型：${option.dataset.model}`;
@@ -26,6 +26,6 @@ document.querySelectorAll("[data-profile-selector]").forEach((selector) => {
     }
     wasBound = bound;
   };
-  select.addEventListener("change", update);
-  update();
+  select.addEventListener("change", () => update());
+  update(true);
 });

@@ -36,9 +36,10 @@
   <form action="/projects/{{ summary.project.id }}/workflows" method="post">
     {% include "_profile_selection.html" %}
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <p><label for="provider_name">Provider</label><select id="provider_name" name="provider_name"><option value="fake">Fake 演示</option><option value="ollama">Ollama</option><option value="openai">OpenAI</option><option value="qwen">Qwen</option></select></p>
-    <p><label for="model_name">模型名称</label><input id="model_name" name="model_name" value="demo" required></p>
-    <p><label for="requested_chapters">计划章节数{% if chapter_test_mode %}（固定为 1）{% else %}（1 至 5）{% endif %}</label><input id="requested_chapters" name="requested_chapters" type="number" min="1" max="{% if chapter_test_mode %}1{% else %}5{% endif %}" value="1" required{% if chapter_test_mode %} readonly{% endif %}></p>
+    {% set selected_provider = workflow_form.get('provider_name', 'fake') %}
+    <p><label for="provider_name">Provider</label><select id="provider_name" name="provider_name"><option value="fake"{% if selected_provider == 'fake' %} selected{% endif %}>Fake 演示</option><option value="ollama"{% if selected_provider == 'ollama' %} selected{% endif %}>Ollama</option><option value="openai"{% if selected_provider == 'openai' %} selected{% endif %}>OpenAI</option><option value="qwen"{% if selected_provider == 'qwen' %} selected{% endif %}>Qwen</option>{% if selected_provider not in ['fake', 'ollama', 'openai', 'qwen'] %}<option value="{{ selected_provider }}" selected>原 Provider 不可用，请重新选择</option>{% endif %}</select></p>
+    <p><label for="model_name">模型名称</label><input id="model_name" name="model_name" value="{{ workflow_form.get('model_name', 'demo') }}" required></p>
+    <p><label for="requested_chapters">计划章节数{% if chapter_test_mode %}（固定为 1）{% else %}（1 至 5）{% endif %}</label><input id="requested_chapters" name="requested_chapters" type="number" min="1" max="{% if chapter_test_mode %}1{% else %}5{% endif %}" value="{{ workflow_form.get('requested_chapters', '1') }}" required{% if chapter_test_mode %} readonly{% endif %}></p>
     <p>预算上限：规划 16000/4000，主笔 32000/12000，摘要 16000/4000，审核 32000/{% if chapter_test_mode %}4000{% else %}6000{% endif %}（输入/输出 Token）。</p>
     <p>此步骤只建立生成任务，不调用模型。进入下一页后再点击生成计划。</p>
     <button type="submit">创建生成任务</button>

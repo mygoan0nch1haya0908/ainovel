@@ -1,6 +1,8 @@
 from html import unescape
 from html.parser import HTMLParser
+from concurrent.futures import ThreadPoolExecutor, wait
 import re
+from threading import Event
 from uuid import uuid4
 import json
 from pathlib import Path
@@ -193,6 +195,15 @@ listeners.change();
 assert.equal(select.value, 'missing-version'); assert.equal(model.value, 'chosen-model');
 assert.equal(consent.checked, false); assert.equal(consent.required, true);
 assert.equal(provider.disabled, true); assert(destination.textContent.includes('不可用'));
+const retrySelect = {value: 'version', selectedOptions: [{dataset: {model: 'saved-model', target: 'https://example.com/v1'}}], addEventListener: () => {}};
+const retryModel = {value: 'submitted-model', readOnly: false};
+const retryProvider = {disabled: false};
+const retryConsent = {checked: true, required: false};
+const retryForm = {elements: {model_name: retryModel, provider_name: retryProvider}};
+const retrySelector = {closest: () => retryForm, querySelector: (key) => ({'[data-profile-select]': retrySelect, '[data-profile-consent]': retryConsent, '[data-profile-destination]': destination})[key]};
+vm.runInNewContext(fs.readFileSync(process.argv[1], 'utf8'), {document: {querySelectorAll: () => [retrySelector]}});
+assert.equal(retryModel.value, 'submitted-model'); assert.equal(retryModel.readOnly, true);
+assert.equal(retryProvider.disabled, true); assert.equal(retryConsent.checked, false);
 '''
     result = subprocess.run([node, "-e", harness, str(script)], capture_output=True, text=True, encoding="utf-8")
     assert result.returncode == 0, result.stderr
@@ -418,6 +429,40 @@ def test_provider_key_echo_is_never_rendered_or_logged(profile_client, caplog, o
     assert 'name="model_name"' in response.text
 
 
+@pytest.mark.parametrize("operation", ["models", "test"])
+def test_blocked_diagnostic_allows_health_and_revoke(profile_client, operation):
+    client, _, network = profile_client
+    save(client)
+    with client.app.state.session_factory() as session:
+        view = client.app.state.model_profile_service_factory(session).list_public()[0]
+    token = csrf(client)
+    entered, release = Event(), Event()
+    original_request = network.request_json
+
+    def blocked_request(endpoint, method, path, **kwargs):
+        entered.set()
+        if not release.wait(5):
+            raise AssertionError("diagnostic was not released")
+        return original_request(endpoint, method, path, **kwargs)
+
+    network.request_json = blocked_request
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        diagnostic = pool.submit(client.post, f"/model-profiles/versions/{view.version_id}/{operation}",
+                                 data={"csrf_token": token, "confirm": "yes"})
+        try:
+            assert entered.wait(2)
+            health = pool.submit(client.get, "/health")
+            revoke = pool.submit(client.post, f"/model-profiles/{view.profile_id}/revoke",
+                                 data={"csrf_token": token, "confirm": "yes"})
+            completed, _ = wait((health, revoke), timeout=1)
+            assert len(completed) == 2, "diagnostic blocked an independent request"
+        finally:
+            release.set()
+        assert health.result().json() == {"status": "ready"}
+        assert revoke.result().status_code == 200
+        assert diagnostic.result().status_code in (200, 422)
+
+
 def test_local_check_and_save_never_resolve_dns(profile_client, monkeypatch):
     client, _, network = profile_client
     import socket
@@ -439,6 +484,9 @@ class SetupSelects(HTMLParser):
         self.name = None
         self.values = {}
         self.options = {}
+        self.inputs = {}
+        self.textareas = {}
+        self.textarea_name = None
         self.consent_checked = False
         self.feed(html)
 
@@ -452,10 +500,20 @@ class SetupSelects(HTMLParser):
                 self.values[self.name] = attrs.get("value", "")
         elif tag == "input" and attrs.get("name") == "provider_consent":
             self.consent_checked = "checked" in attrs
+        elif tag == "input" and attrs.get("name"):
+            self.inputs.setdefault(attrs["name"], attrs.get("value", ""))
+        elif tag == "textarea":
+            self.textarea_name = attrs.get("name")
+
+    def handle_data(self, data):
+        if self.textarea_name:
+            self.textareas[self.textarea_name] = self.textareas.get(self.textarea_name, "") + data
 
     def handle_endtag(self, tag):
         if tag == "select":
             self.name = None
+        elif tag == "textarea":
+            self.textarea_name = None
 
 
 @pytest.fixture
@@ -539,6 +597,98 @@ def test_unavailable_setup_selection_survives_errors_without_fallback(setup_clie
     with client.app.state.session_factory() as session:
         assert session.scalar(select(GenerationWorkflow)) is None
     assert not client.app.state.provider_resolver.transport.calls
+
+
+@pytest.mark.parametrize("destination", ["project", "stage"])
+@pytest.mark.parametrize("state", ["current", "historical", "disabled", "revoked", "missing"])
+def test_creation_error_retains_saved_destination(profile_client, destination, state):
+    from ainovel.services.stages import StageService
+
+    client, _, network = profile_client
+    location = save(client)
+    project_id = ready_project(client)
+    with client.app.state.session_factory() as session:
+        service = client.app.state.model_profile_service_factory(session)
+        view = service.list_public()[0]
+        version_id = view.version_id
+        if state == "disabled":
+            service.set_enabled(version_id, False)
+        elif state == "revoked":
+            service.revoke(view.profile_id)
+        if destination == "stage":
+            stage_id = StageService(session).create(project_id, "Architecture", "author").id
+    if state == "historical":
+        revised = client.post(location + "/revise", data={**FORM, "model_name": "model-b", "api_key": "",
+            "keep_existing_key": "yes", "csrf_token": csrf(client)})
+        assert revised.status_code == 200
+    if state == "missing":
+        version_id = "missing-profile-version"
+
+    path = f"/projects/{project_id}/workflows" if destination == "project" else f"/stages/{stage_id}/roadmaps"
+    data = {"csrf_token": csrf(client), "model_profile_version_id": version_id,
+            "provider_name": "qwen", "model_name": "chosen-model", "provider_consent": "yes",
+            "requested_chapters": "bad" if state in {"current", "historical"} else "1",
+            "architecture": "Revised architecture", "author_confirm": "" if state in {"current", "historical"} else "yes"}
+    response = client.post(path, data=data)
+    assert response.status_code == 422
+    rendered = SetupSelects(response.text)
+    assert rendered.values["model_profile_version_id"] == version_id
+    assert rendered.values["provider_name"] == "qwen"
+    assert rendered.inputs["model_name"] == "chosen-model"
+    assert not rendered.consent_checked
+    selected = next(option for option in rendered.options["model_profile_version_id"] if option["value"] == version_id)
+    assert (selected.get("data-unavailable") == "yes") == (state in {"disabled", "revoked", "missing"})
+    if destination == "project":
+        assert rendered.inputs["requested_chapters"] == data["requested_chapters"]
+    else:
+        assert rendered.textareas["architecture"] == "Revised architecture"
+    if state in {"disabled", "revoked", "missing"}:
+        assert client.post(path, data=data).status_code == 422
+        with client.app.state.session_factory() as session:
+            assert session.scalar(select(GenerationWorkflow if destination == "project" else StageRoadmapVersion)) is None
+    else:
+        corrected = {**data, "provider_consent": "", "requested_chapters": "1", "author_confirm": "yes"}
+        assert client.post(path, data=corrected).status_code == 422
+        assert client.post(path, data={**corrected, "provider_consent": "yes"}, follow_redirects=False).status_code == 303
+        with client.app.state.session_factory() as session:
+            created = session.scalar(select(GenerationWorkflow if destination == "project" else StageRoadmapVersion))
+            assert created.model_profile_version_id == version_id
+            assert (created.provider_name, created.model_name) == ("compatible", "model-a")
+    assert not network.calls
+
+
+@pytest.mark.parametrize("destination", ["project", "stage"])
+@pytest.mark.parametrize("provider", ["fake", "qwen"])
+def test_creation_error_retains_explicit_legacy_destination(profile_client, destination, provider):
+    from ainovel.services.stages import StageService
+
+    client, _, network = profile_client
+    project_id = ready_project(client)
+    if destination == "stage":
+        with client.app.state.session_factory() as session:
+            stage_id = StageService(session).create(project_id, "Architecture", "author").id
+    path = f"/projects/{project_id}/workflows" if destination == "project" else f"/stages/{stage_id}/roadmaps"
+    data = {"csrf_token": csrf(client), "model_profile_version_id": "", "provider_name": provider,
+            "model_name": "custom-model", "requested_chapters": "bad", "author_confirm": "",
+            "architecture": "Revised architecture"}
+    response = client.post(path, data=data)
+    assert response.status_code == 422
+    rendered = SetupSelects(response.text)
+    assert rendered.values["model_profile_version_id"] == ""
+    assert rendered.values["provider_name"] == provider
+    assert rendered.inputs["model_name"] == "custom-model"
+    assert not rendered.consent_checked
+    if destination == "project":
+        assert rendered.inputs["requested_chapters"] == "bad"
+        data["requested_chapters"] = "1"
+    else:
+        assert rendered.textareas["architecture"] == "Revised architecture"
+        data["author_confirm"] = "yes"
+    assert client.post(path, data=data, follow_redirects=False).status_code == 303
+    with client.app.state.session_factory() as session:
+        created = session.scalar(select(GenerationWorkflow if destination == "project" else StageRoadmapVersion))
+        assert (created.provider_name, created.model_name, created.model_profile_version_id) == (provider, "custom-model", None)
+    assert not network.calls
 
 
 @pytest.mark.parametrize("mode", ["hierarchical", "stage"])

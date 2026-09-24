@@ -29,10 +29,11 @@
   <form action="/stages/{{ stage.id }}/roadmaps" method="post" data-confirm="确认冻结这次架构与模型设置？此操作不会调用模型。">
     {% include "_profile_selection.html" %}
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <p><label for="provider-name">Provider</label><select id="provider-name" name="provider_name">{% if chapter_test_mode %}<option value="qwen">Qwen</option><option value="fake">Fake 演示</option>{% else %}<option value="fake">Fake 演示</option><option value="ollama">Ollama</option><option value="openai">OpenAI</option><option value="qwen">Qwen</option>{% endif %}</select></p>
-    <p><label for="model-name">模型名称</label><input id="model-name" name="model_name" value="{% if chapter_test_mode %}qwen-flash{% else %}demo{% endif %}" required></p>
-    <p><label for="architecture-revision">可选：修订后的总体架构</label><textarea id="architecture-revision" name="architecture" rows="6" placeholder="留空则沿用上方架构"></textarea></p>
-    <p><label><input type="checkbox" name="author_confirm" value="yes" required> 我确认架构和模型设置。</label></p>
+    {% set selected_provider = roadmap_form.get('provider_name', 'qwen' if chapter_test_mode else 'fake') %}
+    <p><label for="provider-name">Provider</label><select id="provider-name" name="provider_name">{% if chapter_test_mode %}<option value="qwen"{% if selected_provider == 'qwen' %} selected{% endif %}>Qwen</option><option value="fake"{% if selected_provider == 'fake' %} selected{% endif %}>Fake 演示</option>{% else %}<option value="fake"{% if selected_provider == 'fake' %} selected{% endif %}>Fake 演示</option><option value="ollama"{% if selected_provider == 'ollama' %} selected{% endif %}>Ollama</option><option value="openai"{% if selected_provider == 'openai' %} selected{% endif %}>OpenAI</option><option value="qwen"{% if selected_provider == 'qwen' %} selected{% endif %}>Qwen</option>{% endif %}{% if selected_provider not in (['qwen', 'fake'] if chapter_test_mode else ['fake', 'ollama', 'openai', 'qwen']) %}<option value="{{ selected_provider }}" selected>原 Provider 不可用，请重新选择</option>{% endif %}</select></p>
+    <p><label for="model-name">模型名称</label><input id="model-name" name="model_name" value="{{ roadmap_form.get('model_name', 'qwen-flash' if chapter_test_mode else 'demo') }}" required></p>
+    <p><label for="architecture-revision">可选：修订后的总体架构</label><textarea id="architecture-revision" name="architecture" rows="6" placeholder="留空则沿用上方架构">{{ roadmap_form.get('architecture', '') }}</textarea></p>
+    <p><label><input type="checkbox" name="author_confirm" value="yes"{% if roadmap_form.get('author_confirm') == 'yes' %} checked{% endif %} required> 我确认架构和模型设置。</label></p>
     <button type="submit">创建路线图提案（不会调用模型）</button>
   </form>
 </section>

@@ -183,6 +183,7 @@ class CompatibleProvider:
             {'type': 'object', 'properties': {'ok': {'type': 'boolean'}}, 'required': ['ok'], 'additionalProperties': False},
             self._context - output, output, 30.0, {})
         response = self._generate(request, max_response_bytes=65536)
-        if response.structured != {'ok': True}:
+        if (not isinstance(response.structured, dict) or set(response.structured) != {'ok'}
+                or response.structured['ok'] is not True):
             raise ProviderProtocolError('model connection test returned an invalid response')
         return ProviderDiagnostic(True, 'Model connection test succeeded', (self._model,))

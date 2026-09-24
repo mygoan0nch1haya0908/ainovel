@@ -264,11 +264,14 @@ def create_workflow(
         ProjectService(session).get(project_id)
     except ValueError as error:
         raise HTTPException(status_code=404, detail="项目不存在") from error
+    workflow_form = {"provider_name": provider_name, "model_name": model_name,
+                     "model_profile_version_id": model_profile_version_id,
+                     "requested_chapters": requested_chapters}
     try:
         count = int(requested_chapters)
     except ValueError:
         return _project_page(
-            request, session, project_id, "计划章节数必须是整数", 422
+            request, session, project_id, "计划章节数必须是整数", 422, workflow_form=workflow_form
         )
     required_count = getattr(request.app.state, "required_workflow_chapters", None)
     if model_profile_version_id:
@@ -276,13 +279,14 @@ def create_workflow(
             view = selected_profile(request, session, model_profile_version_id, provider_consent)
             provider_name, model_name = "compatible", view.model_name
         except ValueError:
-            return _project_page(request, session, project_id, "请选择可用配置并确认将小说内容发送给目标服务商", 422)
+            return _project_page(request, session, project_id, "请选择可用配置并确认将小说内容发送给目标服务商", 422,
+                                 workflow_form=workflow_form)
     if required_count is not None and count != required_count:
         return _project_page(
-            request, session, project_id, "单章测试仅允许生成 1 章", 422
+            request, session, project_id, "单章测试仅允许生成 1 章", 422, workflow_form=workflow_form
         )
     if not request.app.state.provider_registry.contains(provider_name):
-        return _project_page(request, session, project_id, "Provider 未配置", 422)
+        return _project_page(request, session, project_id, "Provider 未配置", 422, workflow_form=workflow_form)
     try:
         workflow = WorkflowService(session).start(
             project_id,
@@ -299,6 +303,7 @@ def create_workflow(
             project_id,
             _start_error_message(error),
             422,
+            workflow_form=workflow_form,
         )
     return RedirectResponse(f"/workflows/{workflow.id}", status_code=303)
 

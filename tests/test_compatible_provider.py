@@ -164,6 +164,13 @@ def test_connection_test_is_short_synthetic_and_does_not_accept_novel_context(ap
     assert SENTINEL not in json.dumps(kwargs['payload'])
 
 
+@pytest.mark.parametrize('value', [1, 1.0, 'true', '1'])
+def test_connection_test_requires_literal_boolean_true(api, value):
+    p, _ = provider(api, reply(json.dumps({'ok': value})))
+    with pytest.raises(ProviderError):
+        p.test_connection()
+
+
 @pytest.mark.parametrize('changes', [{'model':'other'}, {'max_output_tokens':12001}, {'max_input_tokens':32001}, {'timeout_seconds':0}])
 def test_invalid_or_unbound_requests_do_not_dispatch(api, changes):
     p, t = provider(api, reply())

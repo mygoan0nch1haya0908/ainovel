@@ -17,7 +17,7 @@ from ainovel.services.workflows import WorkflowBudgets
 from ainovel.web.presentation import STAGE_ROADMAP_LABELS, WORKFLOW_LABELS
 from ainovel.web.routes import _project_page, templates
 from ainovel.web.security import csrf_token, require_csrf
-from ainovel.web.profile_selection import available_profiles, selected_profile, bound_profile
+from ainovel.web.profile_selection import available_profiles, selected_profile, bound_profile, retry_selection_context
 
 
 router = APIRouter()
@@ -85,9 +85,13 @@ def _stage_context(request: Request, session: Session, stage_id: str) -> dict[st
     }
 
 
-def _stage_page(request: Request, session: Session, stage_id: str, error: str | None = None, status_code: int = 200) -> object:
+def _stage_page(request: Request, session: Session, stage_id: str, error: str | None = None, status_code: int = 200,
+                roadmap_form: dict[str, str] | None = None) -> object:
     context = _stage_context(request, session, stage_id)
     context["error"] = error
+    context["roadmap_form"] = roadmap_form or {}
+    if roadmap_form is not None:
+        context.update(retry_selection_context(request, session, roadmap_form))
     return templates.TemplateResponse(request, "stage.html", context, status_code=status_code)
 
 
@@ -116,24 +120,27 @@ def create_stage(project_id: str, request: Request, architecture: str = Form("")
 @router.post("/stages/{stage_id}/roadmaps")
 def propose_roadmap(stage_id: str, request: Request, provider_name: str = Form(""), model_name: str = Form(""), model_profile_version_id: str = Form(""), provider_consent: str = Form(""), architecture: str = Form(""), author_confirm: str = Form(""), session: Session = Depends(get_session), _csrf: None = Depends(require_csrf)) -> object:
     _stage_context(request, session, stage_id)
+    roadmap_form = {"provider_name": provider_name, "model_name": model_name,
+                    "model_profile_version_id": model_profile_version_id,
+                    "architecture": architecture, "author_confirm": author_confirm}
     if author_confirm != "yes":
-        return _stage_page(request, session, stage_id, "请确认架构与模型设置", 422)
+        return _stage_page(request, session, stage_id, "请确认架构与模型设置", 422, roadmap_form)
     if model_profile_version_id:
         try:
             view = selected_profile(request, session, model_profile_version_id, provider_consent)
             provider_name, model_name = "compatible", view.model_name
         except ValueError:
-            return _stage_page(request, session, stage_id, "请选择可用配置并确认发送小说内容", 422)
+            return _stage_page(request, session, stage_id, "请选择可用配置并确认发送小说内容", 422, roadmap_form)
     if not request.app.state.provider_registry.contains(provider_name):
-        return _stage_page(request, session, stage_id, "Provider 未配置", 422)
+        return _stage_page(request, session, stage_id, "Provider 未配置", 422, roadmap_form)
     if not model_name.strip():
-        return _stage_page(request, session, stage_id, "模型名称不能为空", 422)
+        return _stage_page(request, session, stage_id, "模型名称不能为空", 422, roadmap_form)
     try:
         StageService(session).propose_roadmap(stage_id, "author", provider_name, model_name if model_profile_version_id else model_name.strip(),
             architecture=architecture.strip() or None,
             model_profile_version_id=model_profile_version_id or None)
     except (ValueError, PermissionError):
-        return _stage_page(request, session, stage_id, "路线图提案创建失败，请检查项目状态", 422)
+        return _stage_page(request, session, stage_id, "路线图提案创建失败，请检查项目状态", 422, roadmap_form)
     return RedirectResponse(f"/stages/{stage_id}", status_code=303)
 
 
