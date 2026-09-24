@@ -402,7 +402,7 @@ class WorkflowService:
                 "author",
                 {
                     "provider_name": provider_name,
-                    "model_name": model_name.strip(),
+                    "model_name": model_name if profile is not None else model_name.strip(),
                     "model_profile_version_id": model_profile_version_id,
                     "requested_chapters": requested_chapters,
                     "base_outline_version_id": outline_id,

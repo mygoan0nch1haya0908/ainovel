@@ -20,6 +20,7 @@
   <p><strong>{{ workflow_labels.get(workflow.status, workflow.status) }}</strong> <span class="muted">{{ workflow.status }}</span></p>
   {% if workflow.status in ["CANCELLED", "FAILED", "REJECTED"] %}<p class="notice error">本次生成已结束，不会继续自动生成。已有计划和正文（如有）仍保留在此页。请返回项目处理候选批次后，按需创建新任务。</p>{% endif %}
   <p>Provider / 模型：{{ workflow.provider_name }} / {{ workflow.model_name }}</p>
+  {% if bound_profile %}<p>固定认证目标：{{ bound_profile.base_url }} · 模型 {{ bound_profile.model_name }} · 版本 {{ bound_profile.version_id }}。{{ '配置可用' if bound_profile.enabled else '配置已停用或撤销，后续模型调用会暂停' }}</p>{% endif %}
   <p>计划章节：{{ workflow.requested_chapters }}；当前位置：{{ workflow.current_position }}</p>
   {% if stage_context %}<p><a href="/stages/{{ stage_context.stage_id }}">返回剧情阶段</a> · 本批从已确认 {{ stage_context.confirmed_chapters }} 章后开始</p><ul>{% for node in stage_context.nodes %}<li>批内第 {{ node.ordinal }} 章 · 阶段第 {{ node.stage_ordinal }} 章 · 全书第 {{ node.book_ordinal }} 章 · {{ node.title }}</li>{% endfor %}</ul>{% endif %}
   {% if is_paused or workflow.last_error_code %}
@@ -38,6 +39,7 @@
   <h2 id="workflow-action-heading">下一步</h2>
   {% if can_run %}
   <form action="/workflows/{{ workflow.id }}/run" method="post">
+    {% if bound_profile %}<label><input type="checkbox" name="provider_consent" value="yes" required>确认将小说设定、提纲与正文发送给 {{ bound_profile.base_url }}，使用 {{ bound_profile.model_name }}，可能收费。</label>{% endif %}
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <button type="submit">{{ run_label }}</button>
   </form>

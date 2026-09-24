@@ -173,10 +173,12 @@ def create_app(
     from ainovel.web.routes import router as web_router
     from ainovel.web.workflow_routes import router as workflow_router
     from ainovel.web.stage_routes import router as stage_router
+    from ainovel.web.model_profile_routes import router as model_profile_router
 
     app.include_router(web_router)
     app.include_router(workflow_router)
     app.include_router(stage_router)
+    app.include_router(model_profile_router)
 
     @app.get("/health")
     def health() -> dict[str, str]:

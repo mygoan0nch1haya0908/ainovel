@@ -161,6 +161,20 @@ class ModelProfileService:
             .where(StageRoadmapVersion.model_profile_version_id.in_(versions))) or 0
         return {"workflows": workflows, "active_workflows": active, "roadmaps": roadmaps}
 
+    def list_versions_public(self, profile_id: str) -> list[ProfileView]:
+        """Historical controls receive the same credential-free DTO as current versions."""
+        try:
+            pairs = self.session.execute(
+                select(ModelProfileVersion, ModelProfile).join(ModelProfile,
+                    ModelProfile.id == ModelProfileVersion.profile_id)
+                .where(ModelProfile.id == profile_id)
+                .order_by(ModelProfileVersion.version_number.desc())
+                .execution_options(populate_existing=True)
+            ).all()
+            return [self._view(*pair) for pair in pairs]
+        except Exception:
+            raise ModelProfileError("model profile unavailable") from None
+
     def _credential(self, version: ModelProfileVersion) -> str | None:
         if version.credential_ref:
             return self.vault.get(version.credential_ref)
@@ -178,7 +192,7 @@ class ModelProfileService:
                 reference = self.vault.put(api_key)
             version = ModelProfileVersion(id=str(uuid4()), profile_id=profile_id, version_number=number,
                 name=values.name.strip(), base_url=endpoint.base_url, connection_kind=endpoint.kind,
-                model_name=values.model_name.strip(), context_limit=values.context_limit,
+                model_name=values.model_name, context_limit=values.context_limit,
                 output_limit=values.output_limit, credential_ref=reference, enabled=True, revoked=False)
             self.session.add(version)
             self.session.commit()

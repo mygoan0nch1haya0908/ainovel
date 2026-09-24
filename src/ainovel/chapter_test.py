@@ -36,6 +36,10 @@ CHAPTER_TEST_BUDGETS = WorkflowBudgets(
 def create_chapter_test_app(
     database_url: str | None = None,
     provider_registry: ProviderRegistry | None = None,
+    *,
+    profile_vault=None,
+    profile_transport=None,
+    provider_resolver=None,
 ) -> FastAPI:
     """Build the loopback-only isolated stage-planning and chapter test app."""
     if database_url is None:
@@ -56,6 +60,9 @@ def create_chapter_test_app(
         resolved_database_url,
         provider_registry=registry,
         orchestrator_request_timeout_seconds=CHAPTER_TEST_REQUEST_TIMEOUT_SECONDS,
+        profile_vault=profile_vault,
+        profile_transport=profile_transport,
+        provider_resolver=provider_resolver,
     )
     app.title = "AI Novel Studio · Author Planning TEST"
     app.state.chapter_test_mode = True

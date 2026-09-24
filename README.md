@@ -277,3 +277,76 @@ Remove-Item Env:AINOVEL_OPENAI_API_KEY, Env:AINOVEL_ALLOW_REAL_OPENAI
 Do not place credentials in the database, command history, README, screenshots,
 or logs. If either environment variable is absent, OpenAI remains unavailable
 without making application startup fail.
+
+## Visual model profiles (local deployment only)
+
+Open **模型接口配置** (`/model-profiles`) to enter a name, connection type,
+Base URL, password-style API key, exact model ID and capability limits. This uses
+OpenAI-compatible Chat Completions with JSON objects, not the legacy OpenAI
+Responses adapter. Existing environment Qwen and Fake/demo choices remain.
+Remote profiles require HTTPS and a key; explicitly selected local profiles
+allow only loopback destinations and may omit the key. No key-file uploads,
+custom headers, URL tokens or proxy settings are supported.
+
+Saving and **检查配置** perform local validation without DNS or provider calls.
+**获取模型列表** and **测试连接** each require an explicit POST confirmation.
+The connection test sends only a short synthetic prompt and may cost money.
+List failure leaves manual model entry usable; a listed model does not establish
+its capabilities. The pages use `Cache-Control: no-store`, local scripts and
+escaped text. Password fields are never repopulated, including validation errors.
+The key is never placed in browser storage, session cookies or a URL. Forms
+accept bounded URL-encoded bodies only; multipart and files are rejected.
+
+The browser necessarily sends the entered key once to the local backend. Keys
+are encrypted with Windows current-user DPAPI in the separate credential vault
+at `.superpowers/runtime/model-profiles/credentials.db`; the application database
+contains opaque references and public configuration metadata. This is coupled to
+the Windows account and device: copying the vault to another account is not a
+portable credential backup. Non-Windows or protection failures fail closed;
+there is no plaintext fallback. Do not include the credential vault in source,
+ordinary novel exports or diagnostic bundles. Existing environment keys are
+never imported automatically.
+
+On an authorized call, the selected provider receives its API key and the novel
+context needed for that call. Check the displayed normalized destination and
+model before confirming. Same-account malware, administrators, a compromised
+browser and a malicious authorized provider are outside this protection boundary.
+The process briefly decrypts a key; provable memory erasure is not promised.
+Do not put secrets into ordinary names, model IDs or novel prose. Keep the web
+server listening on loopback only; this is not a public multi-user service.
+
+Single-chapter and hierarchical setup, project workflow starts and stage proposals
+can select an exact profile version. Novel dispatch requires destination/model
+consent. Stage batches inherit the approved roadmap binding; to change providers,
+create and approve a new proposal. Revisions create new endpoint/model/credential
+versions and never silently change existing tasks. Same-target key reuse requires
+an explicit checkbox; changing target requires entering a new key if the old
+configuration had one. Keyless local-to-local changes can remain keyless.
+The profile detail page has separate current and historical version controls.
+
+Disabling a version blocks its later dispatches. Revoking a profile destroys its
+credentials while retaining historical public metadata and shows historical
+workflow/roadmap counts plus a separate active-workflow count. A request already
+admitted to transport or in progress may finish; revocation is not instantaneous
+cancellation and cannot recall sent content or erase earlier backups. Subsequent
+bound calls pause without falling back to environment defaults.
+
+Remote address checks reject nonpublic IPv4/IPv6 destinations and mixed DNS answers;
+connections pin validated addresses while preserving Host/SNI/TLS checks. Local
+mode is loopback-only, not arbitrary private LAN access. Redirects, environment
+proxies and implicit retries are disabled. Limits: names 120, URLs 2048, exact
+model IDs 255 and keys 8192 characters; keys are printable ASCII without whitespace.
+Context is at most 32000 tokens; output is at most 12000 and no greater than context.
+Model lists are capped at 1 MiB / 200 unique IDs; generation at 2 MiB; synthetic
+tests at 64 KiB / 128 output tokens. Connect timeout is 10 seconds and total calls
+are bounded by 180 seconds or a lower workflow limit. Existing chapter-length,
+total-call/token budgets, local structure validation and author approvals still
+apply; configuring a model does not guarantee usable chapter output.
+
+Offline acceptance injects a synthetic vault and compatible transport. It exercises
+save/list/select/plan/approve/write/approve, revision isolation and revoke pause,
+and scans database contents, pages, logs, snapshots, audit, artifacts and serialized
+official chapter fields for a sentinel key. Selector JavaScript is executed under
+Node separately; that is not a browser layout test. Before any real testing-database
+upgrade or restart, obtain authorization, verify no running calls, and create a
+consistent SQLite backup. No real key or live endpoint is needed by the default suite.

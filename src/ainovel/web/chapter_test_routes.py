@@ -17,6 +17,7 @@ from ainovel.services.stages import StageService
 from ainovel.services.workflows import WorkflowBudgets, WorkflowService
 from ainovel.web.routes import templates
 from ainovel.web.security import csrf_token, require_csrf
+from ainovel.web.profile_selection import available_profiles, selected_profile
 
 
 router = APIRouter()
@@ -32,7 +33,7 @@ FIELD_LIMITS = {
     "chapter_goal": 1_000,
     "chapter_hook": 1_000,
     "stage_architecture": 12_000,
-    "model_name": 128,
+    "model_name": 255,
 }
 FIELD_LABELS = {
     "project_title": "项目名称",
@@ -153,6 +154,7 @@ def _render(
             "csrf_token": csrf_token(request),
             "submission_token": submission_token,
             "chapter_form": values,
+            "model_profiles": available_profiles(request, session),
             "error": error,
             "projects": ProjectService(session).list_projects(),
             "confirmed_input": _confirmed_input(session, project_id),
@@ -337,6 +339,9 @@ def _create_workflow_atomically(
             story_stage = StageService(session).create(
                 project.id, values["stage_architecture"].strip(), "author"
             )
+            if values.get("model_profile_version_id"):
+                StageService(session).propose_roadmap(story_stage.id, "author", "compatible", values["model_name"],
+                    model_profile_version_id=values["model_profile_version_id"])
             project_id, target_id = project.id, story_stage.id
         else:
             stage = "budget_validate"
@@ -344,13 +349,14 @@ def _create_workflow_atomically(
             if not isinstance(budgets, WorkflowBudgets):
                 raise RuntimeError("chapter test workflow budgets are invalid")
             stage = "workflow_start"
-            start_args = (project.id, "qwen", values["model_name"], 1, budgets)
+            start_args = (project.id, values.get("provider_name", "qwen"), values["model_name"], 1, budgets)
+            binding = {"model_profile_version_id": values["model_profile_version_id"]} if values.get("model_profile_version_id") else {}
             if values.get("repair_mode") == "yes":
                 workflow = WorkflowService(session).start(
-                    *start_args, generation_version=2
+                    *start_args, generation_version=2, **binding
                 )
             else:
-                workflow = WorkflowService(session).start(*start_args)
+                workflow = WorkflowService(session).start(*start_args, **binding)
             project_id, target_id = project.id, workflow.id
         stage = "session_close"
         session.close()
@@ -510,6 +516,9 @@ def create_chapter_test(
     chapter_goal: str = Form(""),
     chapter_hook: str = Form(""),
     model_name: str = Form("qwen-flash"),
+    provider_name: str = Form("qwen"),
+    model_profile_version_id: str = Form(""),
+    provider_consent: str = Form(""),
     setup_mode: str = Form("single_chapter"),
     stage_architecture: str = Form(""),
     repair_mode: str = Form(""),
@@ -528,12 +537,23 @@ def create_chapter_test(
         "chapter_goal": chapter_goal,
         "chapter_hook": chapter_hook,
         "model_name": model_name,
+        "provider_name": provider_name,
+        "model_profile_version_id": model_profile_version_id,
         "setup_mode": setup_mode,
         "stage_architecture": stage_architecture,
         "repair_mode": repair_mode,
         "author_confirm": author_confirm,
     }
-    error = _validation_error(values)
+    selection_error = None
+    if model_profile_version_id:
+        try:
+            view = selected_profile(request, session, model_profile_version_id, provider_consent)
+            values["provider_name"], values["model_name"] = "compatible", view.model_name
+        except ValueError:
+            selection_error = "请选择可用配置并确认将小说内容发送给目标服务商"
+    elif provider_name not in {"qwen", "fake"} or not request.app.state.provider_registry.contains(provider_name):
+        selection_error = "请选择环境 Qwen 或本地演示"
+    error = selection_error or _validation_error(values)
     if error is not None:
         current_token = request.session.get(SUBMISSION_SESSION_KEY)
         if not isinstance(current_token, str):

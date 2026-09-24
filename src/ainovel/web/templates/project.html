@@ -34,6 +34,7 @@
   <p>当前候选批次完成审批后才能启动新的生成工作流。</p>
 {% elif official_outline and summary.current_constitution_version_number %}
   <form action="/projects/{{ summary.project.id }}/workflows" method="post">
+    {% include "_profile_selection.html" %}
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <p><label for="provider_name">Provider</label><select id="provider_name" name="provider_name"><option value="fake">Fake 演示</option><option value="ollama">Ollama</option><option value="openai">OpenAI</option><option value="qwen">Qwen</option></select></p>
     <p><label for="model_name">模型名称</label><input id="model_name" name="model_name" value="demo" required></p>

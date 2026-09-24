@@ -27,6 +27,7 @@ from ainovel.services.workflows import (
 from ainovel.web.routes import _project_page, templates
 from ainovel.web.security import csrf_token, require_csrf
 from ainovel.web.presentation import WORKFLOW_LABELS, RUN_LABELS, STEP_LABELS
+from ainovel.web.profile_selection import selected_profile, bound_profile
 
 
 router = APIRouter()
@@ -164,6 +165,7 @@ def _workflow_context(
     return {
         "request": request,
         "workflow": workflow,
+        "bound_profile": bound_profile(request, session, workflow.model_profile_version_id),
         "workflow_labels": WORKFLOW_LABELS,
         "run_label": RUN_LABELS.get(workflow.status, "继续生成"),
         "progress_step": (
@@ -253,6 +255,7 @@ def create_workflow(
     provider_name: str = Form(""),
     model_name: str = Form(""),
     model_profile_version_id: str = Form(""),
+    provider_consent: str = Form(""),
     requested_chapters: str = Form(""),
     session: Session = Depends(get_session),
     _csrf: None = Depends(require_csrf),
@@ -268,6 +271,12 @@ def create_workflow(
             request, session, project_id, "计划章节数必须是整数", 422
         )
     required_count = getattr(request.app.state, "required_workflow_chapters", None)
+    if model_profile_version_id:
+        try:
+            view = selected_profile(request, session, model_profile_version_id, provider_consent)
+            provider_name, model_name = "compatible", view.model_name
+        except ValueError:
+            return _project_page(request, session, project_id, "请选择可用配置并确认将小说内容发送给目标服务商", 422)
     if required_count is not None and count != required_count:
         return _project_page(
             request, session, project_id, "单章测试仅允许生成 1 章", 422
@@ -298,10 +307,13 @@ def create_workflow(
 def run_workflow(
     workflow_id: str,
     request: Request,
+    provider_consent: str = Form(""),
     session: Session = Depends(get_session),
     _csrf: None = Depends(require_csrf),
 ) -> object:
-    _workflow_row(session, workflow_id)
+    workflow = _workflow_row(session, workflow_id)
+    if workflow.model_profile_version_id and provider_consent != "yes":
+        return _workflow_page(request, session, workflow_id, "请确认将小说内容发送给此版本目标服务商", 422)
     session.rollback()
     try:
         request.app.state.orchestrator_factory().run_until_blocked(workflow_id)

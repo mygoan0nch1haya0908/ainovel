@@ -27,6 +27,7 @@
   <h2 id="roadmap-create-heading">新路线图提案</h2>
   <p>先创建冻结提案，不调用模型；下一步由作者明确点击生成。</p>
   <form action="/stages/{{ stage.id }}/roadmaps" method="post" data-confirm="确认冻结这次架构与模型设置？此操作不会调用模型。">
+    {% include "_profile_selection.html" %}
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <p><label for="provider-name">Provider</label><select id="provider-name" name="provider_name">{% if chapter_test_mode %}<option value="qwen">Qwen</option>{% else %}<option value="fake">Fake 演示</option><option value="ollama">Ollama</option><option value="openai">OpenAI</option><option value="qwen">Qwen</option>{% endif %}</select></p>
     <p><label for="model-name">模型名称</label><input id="model-name" name="model_name" value="{% if chapter_test_mode %}qwen-flash{% else %}demo{% endif %}" required></p>
@@ -43,10 +44,12 @@
   <article>
     <h3>版本 {{ roadmap.version_number }} · {{ stage_status_labels.get(roadmap.status, roadmap.status) }}</h3>
     <p>Provider / 模型：{{ roadmap.provider_name }} / {{ roadmap.model_name }}；尝试 {{ roadmap.attempts_used }} / {{ roadmap.attempt_limit }}</p>
+    {% if row.profile %}<p>固定认证目标：{{ row.profile.base_url }} · 模型 {{ row.profile.model_name }} · 版本 {{ row.profile.version_id }}</p>{% endif %}
     <p>累计用量：输入 {{ roadmap.actual_input_tokens if roadmap.actual_input_tokens is not none else "未知" }} / 输出 {{ roadmap.actual_output_tokens if roadmap.actual_output_tokens is not none else "未知" }} Token{% if roadmap.actual_input_tokens is none or roadmap.actual_output_tokens is none %}（含未知项，合计不完整）{% endif %}</p>
     {% if roadmap.status in ["PENDING", "PAUSED_PROVIDER", "PAUSED_INVALID"] %}
     <form action="/stages/{{ stage.id }}/roadmaps/{{ roadmap.id }}/generate" method="post" data-confirm="确认调用 {{ roadmap.provider_name }} / {{ roadmap.model_name }} 生成路线图？可能产生费用。">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="model_call_confirm" value="yes">
+      {% if row.profile %}<label><input type="checkbox" name="provider_consent" value="yes" required>确认将小说设定与提纲发送给 {{ row.profile.base_url }}，使用 {{ row.profile.model_name }}，可能收费。</label>{% endif %}
       <button type="submit">调用模型生成路线图（可能收费）</button>
     </form>
     {% elif roadmap.status == "RUNNING" %}<p class="notice error">该尝试记录为生成中。进程中断后不会自动恢复、重置预算或另建提案；请先人工核查持久状态。</p>{% endif %}
@@ -68,6 +71,7 @@
   {% if can_start_batch %}
   <p>将从未确认节点中自动选择下一段；单批最多五章。启动任务不会调用模型，之后仍须分别生成并确认批次计划、生成并确认正文。</p>
   <form action="/stages/{{ stage.id }}/batches" method="post" data-confirm="确认建立下一批工作流？此操作不会调用模型。">
+    {% if approved_profile %}<p>本批继承已批准版本：{{ approved_profile.base_url }} · {{ approved_profile.model_name }} · {{ approved_profile.version_id }}。更换接口需要新建并批准路线图提案。</p>{% endif %}
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <p><label for="requested-chapters">本批最多章节数（1 至 5）</label><input id="requested-chapters" name="requested_chapters" type="number" min="1" max="5" value="5" required></p>
     <p><label><input type="checkbox" name="author_confirm" value="yes" required> 我确认建立下一批任务。</label></p>

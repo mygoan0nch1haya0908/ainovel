@@ -17,6 +17,7 @@ from ainovel.services.outlines import OutlineService
 from ainovel.services.projects import ProjectService
 from ainovel.services.stages import StageService
 from ainovel.web.security import csrf_token, require_csrf
+from ainovel.web.profile_selection import available_profiles
 
 router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent / "templates"))
@@ -72,6 +73,7 @@ def _project_context(request: Request, session: Session, project_id: str) -> dic
     ).all()
     return {
         "request": request, "summary": summary, "official_outline": official_outline,
+        "model_profiles": available_profiles(request, session),
         "csrf_token": csrf_token(request),
         "batches": batch_rows,
         "batch_info": {batch.id: _batch_readiness(batch, by_batch.get(batch.id, []), summary.project.active_batch_id) for batch in batch_rows},

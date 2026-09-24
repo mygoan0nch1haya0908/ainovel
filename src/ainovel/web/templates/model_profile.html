@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}{{ profile.name }} · 模型接口{% endblock %}
+{% block content %}
+<h1>{{ profile.name }}</h1><p><a href="/model-profiles">全部模型配置</a></p>
+{% if message %}<p role="status">{{ message }}</p>{% endif %}
+<p>认证目标：{{ profile.base_url }} · 模型：{{ profile.model_name }} · 版本 {{ profile.version_id }} · {{ '已撤销' if profile.revoked else '已启用' if profile.enabled else '已停用' }}</p>
+<p>修改保存为新版本，旧任务继续绑定原端点、模型与凭据。更换阶段模型需要创建并批准新的路线图提案。</p>
+<form method="post" action="/model-profiles/{{ profile.profile_id }}/revise">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% include "_profile_fields.html" %}
+<button type="submit" formaction="/model-profiles/check">检查配置（仅本地）</button><button type="submit" {% if profile.revoked %}disabled{% endif %}>保存新版本</button></form>
+{% for action, label, warning in [('models', '获取模型列表', '向上述目标发送认证请求；不会发送小说内容。失败后仍可手填模型名。'), ('test', '测试连接', '发送短合成请求，可能收费；不会发送小说内容。'), ('enabled', '停用' if profile.enabled else '启用', '改变此版本可用状态；停用后，依赖它的任务后续调用会暂停。')] %}
+<form method="post" action="/model-profiles/versions/{{ profile.version_id }}/{{ action }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="enabled" value="{{ 'no' if profile.enabled else 'yes' }}">
+<label><input type="checkbox" name="confirm" value="yes" required>我确认：{{ warning }}</label><button type="submit" {% if profile.revoked %}disabled{% endif %}>{{ label }}</button></form>
+{% endfor %}
+<section><h2>历史版本与绑定</h2><p>当前表单只修订最新版本。历史任务保留其原版本；下面的开关只影响指定版本，启用历史版本不会把它变成新任务的默认选项。</p>
+{% for version in versions %}<article><h3>{{ '当前版本' if version.version_id == profile.version_id else '历史版本' }} · {{ version.version_id }}</h3>
+<p>{{ version.base_url }} · {{ version.model_name }} · {{ '已撤销' if version.revoked else '已启用' if version.enabled else '已停用' }} · 凭据{{ '已配置' if version.has_key else '未配置' }}</p>
+{% if version.version_id != profile.version_id and not version.revoked %}<form method="post" action="/model-profiles/versions/{{ version.version_id }}/enabled"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="enabled" value="{{ 'no' if version.enabled else 'yes' }}"><label><input type="checkbox" name="confirm" value="yes" required>确认{{ '停用' if version.enabled else '启用' }}此历史版本；影响绑定它的任务后续调用，已获准执行的请求可能完成。</label><button type="submit">{{ '停用' if version.enabled else '启用' }}历史版本</button></form>{% endif %}</article>{% endfor %}</section>
+<section><h2>撤销配置并销毁凭据</h2><p>历史绑定：{{ counts.workflows }} 个工作流、{{ counts.roadmaps }} 个路线图；其中 {{ counts.active_workflows }} 个工作流尚未结束。保留历史非秘密元数据。</p>
+<p>已获准进入传输或正在执行的请求可能完成；撤销后的新调用会被阻止。无法撤回已发送内容，也无法清除您此前制作的备份。</p>
+<form method="post" action="/model-profiles/{{ profile.profile_id }}/revoke"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label><input type="checkbox" name="confirm" value="yes" required>我确认撤销全部版本并销毁凭据</label><button type="submit">撤销配置</button></form></section>
+{% endblock %}
