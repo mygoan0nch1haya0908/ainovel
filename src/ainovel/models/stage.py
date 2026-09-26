@@ -47,7 +47,8 @@ class StageRoadmapVersion(TimestampMixin, Base):
 
     @property
     def estimated_chapters(self):
-        return len(self.payload["nodes"]) if self.payload else None
+        from ainovel.services.stage_planning import roadmap_chapter_count
+        return roadmap_chapter_count(self.payload) if self.payload else None
 
 
 class StageModelAttempt(TimestampMixin, Base):
