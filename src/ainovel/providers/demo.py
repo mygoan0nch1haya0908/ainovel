@@ -48,9 +48,19 @@ class DemoFakeProvider:
     @staticmethod
     def _stage_roadmap(request: ModelRequest) -> dict[str, object]:
         previous = request.input_payload.get("previous_roadmap")
-        if isinstance(previous, dict):
+        plot_format = 'points' in request.output_schema.get('properties', {})
+        revision = request.input_payload.get('revision', {})
+        previous = revision.get('source_payload', previous)
+        if isinstance(previous, dict) and ('points' in previous) == plot_format:
             from copy import deepcopy
             return deepcopy(previous)
+        if plot_format:
+            return {'format': 'plot_points_v1', 'goal': '查明演示事件', 'start_state': '疑点出现',
+                    'end_state': '真相公开', 'key_events': ['调查线索', '揭露真相'], 'foreshadowing': ['遗失的铜铃'],
+                    'points': [dict(point_id=f'demo-{i}', ordinal=i, title=title, goal=goal,
+                                    key_events=[goal], character_changes=[], foreshadowing=[],
+                                    chapter_count=count, dependencies=['demo-1'] if i == 2 else [])
+                               for i,title,goal,count in [(1,'入城调查','取得关键线索',3),(2,'追查真相','揭露主使',4)]]}
         return {"goal": "查明演示事件", "start_state": "疑点出现", "end_state": "真相公开",
                 "key_events": ["调查线索", "揭露真相"], "foreshadowing": ["遗失的铜铃"],
                 "nodes": [{"node_id": f"demo-{i}", "ordinal": i, "title": f"演示第{i}章",
@@ -71,7 +81,12 @@ class DemoFakeProvider:
                     "ending_hook": f"演示悬念{ordinal}",
             }
             stage = request.input_payload.get("stage")
-            if isinstance(stage, dict):
+            if isinstance(stage, dict) and stage.get('format') == 'plot_points_v1':
+                slot = stage['slots'][ordinal - 1]
+                chapter.update(slot_id=slot['node_id'], point_id=slot['point_id'], point_ordinal=slot['point_ordinal'])
+                chapter['title'] = f"演示第{slot['stage_ordinal']}章"
+                chapter['goal'] = f"推进{slot['point_id']}的第{slot['point_ordinal']}步局部调查"
+            elif isinstance(stage, dict):
                 node = stage["nodes"][ordinal - 1]
                 chapter["title"], chapter["goal"] = node["title"], node["goal"]
             if request.metadata.get("generation_version") == "2":

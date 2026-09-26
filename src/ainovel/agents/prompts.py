@@ -64,6 +64,9 @@ V2_BUILTIN_PROMPTS: Mapping[str, str] = {
 }
 
 
+PLOT_PLANNER_PROMPT = V2_BUILTIN_PROMPTS['batch_planner'] + "本批按 stage.slots 预留位置细化剧情点。每章 slot_id 必须对应 node_id，point_id 和 point_ordinal 必须原样绑定；只输出本批连续章节。结合已确认摘要与点内进度，为每章拟定不同的具体标题、局部目标、场景和章末钩子；不得每章重复整个剧情点目标或提前完成未来事件。"
+
+
 V2_AGENT_SCHEMAS: Mapping[str, type[BaseModel]] = {
     "batch_planner": BatchPlanDraftV2,
     "chapter_writer": WorkChapterDraft,

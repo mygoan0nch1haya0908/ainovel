@@ -75,6 +75,16 @@ class BatchPlanDraftV2(AgentSchema):
         return self
 
 
+class PlotPointChapterPlan(ChapterPlanV2):
+    slot_id: str = Field(pattern=r'^[A-Za-z0-9_-]{1,32}:[1-9][0-9]{0,2}$')
+    point_id: str = Field(pattern=r'^[A-Za-z0-9_-]{1,32}$')
+    point_ordinal: int = Field(ge=1, le=100, strict=True)
+
+
+class PlotPointBatchPlanDraft(BatchPlanDraftV2):
+    chapters: list[PlotPointChapterPlan] = Field(min_length=1, max_length=5)
+
+
 class WorkChapterDraft(AgentSchema):
     title: str
     body: str

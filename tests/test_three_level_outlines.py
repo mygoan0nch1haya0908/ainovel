@@ -137,7 +137,7 @@ def test_frozen_hierarchy_reaches_planner_and_only_first_node_across_batches(cha
     with factory() as session:
         service = StageService(session)
         stage = service.get(stage_id)
-        version = service.propose_roadmap(stage_id, "author", "fake", "demo")
+        version = service.propose_roadmap(stage_id, "author", "fake", "demo", roadmap_format='legacy')
         frozen = deepcopy(version.input_snapshot)
         provider = FakeProvider([response(roadmap_payload(3), 1)])
         assert service.generate_roadmap(version.id, provider).status == "PROPOSED"

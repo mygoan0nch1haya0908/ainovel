@@ -22,7 +22,7 @@
   <p>Provider / 模型：{{ workflow.provider_name }} / {{ workflow.model_name }}</p>
   {% if bound_profile %}<p>固定认证目标：{{ bound_profile.base_url }} · 模型 {{ bound_profile.model_name }} · 版本 {{ bound_profile.version_id }}。{{ '配置可用' if bound_profile.enabled else '配置已停用或撤销，后续模型调用会暂停' }}</p>{% endif %}
   <p>计划章节：{{ workflow.requested_chapters }}；当前位置：{{ workflow.current_position }}</p>
-  {% if stage_context %}<p><a href="/stages/{{ stage_context.stage_id }}">返回剧情阶段</a> · 本批从已确认 {{ stage_context.confirmed_chapters }} 章后开始</p><ul>{% for node in stage_context.nodes %}<li>批内第 {{ node.ordinal }} 章 · 阶段第 {{ node.stage_ordinal }} 章 · 全书第 {{ node.book_ordinal }} 章 · {{ node.title }}</li>{% endfor %}</ul>{% endif %}
+  {% if stage_context %}<p><a href="/stages/{{ stage_context.stage_id }}">返回剧情阶段</a> · 本批从已确认 {{ stage_context.confirmed_chapters }} 章后开始</p><ul>{% for node in stage_context.get('slots', stage_context.get('nodes', [])) %}<li>批内第 {{ node.ordinal }} 章 · 阶段第 {{ node.stage_ordinal }} 章 · 全书第 {{ node.book_ordinal }} 章{% if node.point_id %} · 剧情点 {{ node.point_id }} 的第 {{ node.point_ordinal }} 章{% else %} · {{ node.title }}{% endif %}</li>{% endfor %}</ul>{% endif %}
   {% if is_paused or workflow.last_error_code %}
   <details open>
     <summary>最近的暂停 / 失败原因</summary>

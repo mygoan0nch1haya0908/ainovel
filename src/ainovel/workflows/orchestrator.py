@@ -421,6 +421,7 @@ class WorkflowOrchestrator:
             return provider
 
     def _result_type(self, step: WorkflowStep) -> type[BaseModel]:
+        from ainovel.services.workflows import planning_schema_for_workflow
         with self._session_factory() as session:
             workflow = session.get(GenerationWorkflow, step.workflow_id)
             if workflow is None:
@@ -430,6 +431,8 @@ class WorkflowOrchestrator:
                 if workflow.generation_version == 2
                 else _RESULT_BY_STEP.get(step.kind)
             )
+            if step.kind == 'PLANNING':
+                result_type = planning_schema_for_workflow(session, workflow.id)
             session.rollback()
         if result_type is None:
             raise ValueError("workflow step does not have a result schema")
@@ -920,21 +923,18 @@ class WorkflowOrchestrator:
             generation_version = workflow.generation_version
             session.rollback()
         if step.kind == "PLANNING":
-            expected_plan = BatchPlanDraftV2 if generation_version == 2 else BatchPlanDraft
+            expected_plan = self._result_type(step)
             if not isinstance(result, expected_plan):
                 raise ResponseFailure(FailureReason.PLAN)
             with self._session_factory() as session:
                 workflow = session.get(GenerationWorkflow, step.workflow_id)
                 if workflow is None or len(result.chapters) != workflow.requested_chapters:
                     raise ResponseFailure(FailureReason.PLAN)
-                from ainovel.services.stages import StageService
-
-                stage_context = StageService(session).workflow_context(workflow.id)
-                if stage_context is not None and any(
-                    chapter.goal != node["goal"] or chapter.title != node["title"]
-                    for chapter, node in zip(result.chapters, stage_context["nodes"], strict=True)
-                ):
-                    raise ResponseFailure(FailureReason.PLAN)
+                from ainovel.services.workflows import validate_stage_plan
+                try:
+                    validate_stage_plan(session, workflow.id, result.model_dump())
+                except ValueError:
+                    raise ResponseFailure(FailureReason.PLAN) from None
                 session.rollback()
             return {}
         if step.kind == "VALIDATING_CHAPTER":
@@ -993,7 +993,10 @@ class WorkflowOrchestrator:
         title: str,
         body: str,
     ) -> dict[str, object]:
-        plan_type = ChapterPlanV2 if workflow.generation_version == 2 else ChapterPlan
+        from ainovel.services.workflows import planning_schema_for_workflow
+        from ainovel.agents.contracts import PlotPointBatchPlanDraft, PlotPointChapterPlan
+        plan_type = (PlotPointChapterPlan if planning_schema_for_workflow(session, workflow.id) is PlotPointBatchPlanDraft
+                     else ChapterPlanV2 if workflow.generation_version == 2 else ChapterPlan)
         chapter_plan = plan_type.model_validate(
             self._chapter_plan(session, workflow, ordinal)
         )
