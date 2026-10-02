@@ -192,6 +192,7 @@ class WorkflowOrchestrator:
             budget_service.session.close()
         with self._session_factory() as session:
             workflow = session.get(GenerationWorkflow, claim.workflow_id)
+            project_id = workflow.project_id
             is_v2_repair = (
                 workflow is not None
                 and workflow.generation_version == 2
@@ -239,9 +240,11 @@ class WorkflowOrchestrator:
         finally:
             attempt_service.session.close()
         try:
-            run = self._runner.run_with_response(
-                self._provider(claim), request, self._result_type(claim)
-            )
+            from ainovel.services.project_llm_guard import project_call
+            with project_call(self._session_factory, project_id, attempt.id):
+                run = self._runner.run_with_response(
+                    self._provider(claim), request, self._result_type(claim)
+                )
         except ProviderError as error:
             return self._record_failure(
                 attempt.id, error, getattr(error, "response", None)
@@ -286,6 +289,21 @@ class WorkflowOrchestrator:
             if workflow is None:
                 raise ValueError("workflow not found")
             role = _ROLE_BY_STEP.get(persisted_step.kind)
+            from ainovel.services.scoped_context import ScopedContextService, MemoryContextBlocked, active_policy
+            policy = active_policy(session, workflow.id)
+            if policy is not None and policy.strategy == 'scoped_story_v1':
+                scoped = ScopedContextService(session)
+                try:
+                    request = scoped.build_request(workflow.id, persisted_step.id,
+                        capabilities=self._provider(persisted_step).capabilities(workflow.model_name),
+                        timeout_seconds=self._request_timeout_seconds)
+                except RequiredContextOverflow:
+                    raise
+                except ValueError:
+                    raise MemoryContextBlocked(['memory source validation failed / 记忆来源校验失败，请查看输入预览']) from None
+                scoped.save_packet(request)
+                session.commit()
+                return request
             if role is None:
                 raise ValueError("workflow step does not use a model")
             snapshot = next(
@@ -520,11 +538,13 @@ class WorkflowOrchestrator:
             session.rollback()
             return result
 
+    @classmethod
     def _task_payload(
         self,
         session: Session,
         workflow: GenerationWorkflow,
         step: WorkflowStep,
+        *, readonly: bool = False,
     ) -> dict[str, object]:
         if step.kind == "PLANNING":
             project = session.get(NovelProject, workflow.project_id)
@@ -617,7 +637,7 @@ class WorkflowOrchestrator:
                 ),
             }
         if step.kind == "REVIEWING":
-            return self._reviewer_payload(session, workflow, step)
+            return self._reviewer_payload(session, workflow, step, readonly=readonly)
         raise ValueError("workflow step does not use a task payload")
 
     def _request(
@@ -642,6 +662,8 @@ class WorkflowOrchestrator:
                 "schema_name": _SCHEMA_NAME_BY_STEP[step.kind],
                 "workflow_id": workflow.id,
                 "step_id": step.id,
+                "attempt": str(step.attempt_count + 1),
+                "round": str(step.position),
                 "ordinal": "" if step.ordinal is None else str(step.ordinal),
                 "generation_version": str(workflow.generation_version),
             },
@@ -698,6 +720,7 @@ class WorkflowOrchestrator:
             raise ValueError("batch plan has not been approved")
         return artifact
 
+    @classmethod
     def _chapter_plan(
         self,
         session: Session,
@@ -733,6 +756,7 @@ class WorkflowOrchestrator:
             )
         )
 
+    @classmethod
     def _prior_summaries(
         self,
         session: Session,
@@ -767,11 +791,13 @@ class WorkflowOrchestrator:
             for row in rows
         ]
 
+    @classmethod
     def _reviewer_payload(
         self,
         session: Session,
         workflow: GenerationWorkflow,
         step: WorkflowStep,
+        *, readonly: bool = False,
     ) -> dict[str, object]:
         plan = self._plan_artifact(session, workflow.id)
         reports: list[dict[str, object]] = []
@@ -784,7 +810,7 @@ class WorkflowOrchestrator:
             )
             if chapter is None or summary is None:
                 raise ValueError("reviewer requires completed chapter reports")
-            validation = self._validation_payload(session, chapter)
+            validation = self._validation_payload(session, chapter, readonly=readonly)
             reports.append(
                 {
                     "ordinal": ordinal,
@@ -985,6 +1011,7 @@ class WorkflowOrchestrator:
             raise ResponseFailure(FailureReason.REPEATED)
         return validations
 
+    @classmethod
     def _chapter_validation_results(
         self,
         session: Session,
@@ -1085,8 +1112,9 @@ class WorkflowOrchestrator:
             )
             session.commit()
 
+    @classmethod
     def _validation_payload(
-        self, session: Session, chapter: WorkflowArtifact
+        self, session: Session, chapter: WorkflowArtifact, *, readonly: bool = False
     ) -> dict[str, object]:
         row = session.scalar(
             select(WorkflowArtifact).where(
@@ -1125,6 +1153,8 @@ class WorkflowOrchestrator:
                 payload["coverage_evidence_valid"] = coverage_is_valid(
                     session, coverage_step, coverage.payload
                 )
+            if readonly:
+                return deepcopy(payload)
             canonical = _canonical_json(payload)
             row = WorkflowArtifact(
                 id=str(uuid4()),

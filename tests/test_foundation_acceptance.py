@@ -78,8 +78,8 @@ def test_model_defaults_match_migration_server_defaults() -> None:
 def test_readiness_revision_matches_the_migration_head() -> None:
     config = Config(str(PROJECT_ROOT / "alembic.ini"))
 
-    assert getattr(database, "ALEMBIC_HEAD_REVISION", None) == "0006_model_profile_bindings"
-    assert ScriptDirectory.from_config(config).get_current_head() == "0006_model_profile_bindings"
+    assert getattr(database, "ALEMBIC_HEAD_REVISION", None) == "0010_memory_extraction"
+    assert ScriptDirectory.from_config(config).get_current_head() == "0010_memory_extraction"
 
 
 def test_migration_round_trip_creates_current_schema(
@@ -97,7 +97,7 @@ def test_migration_round_trip_creates_current_schema(
         command.upgrade(config, "head")
         command.check(config)
         assert FOUNDATION_TABLES < _table_names(database_url)
-        assert _revision_number(database_url) == "0006_model_profile_bindings"
+        assert _revision_number(database_url) == "0010_memory_extraction"
 
         command.downgrade(config, "base")
         assert _table_names(database_url) == {"alembic_version"}
@@ -105,7 +105,7 @@ def test_migration_round_trip_creates_current_schema(
         command.upgrade(config, "head")
         command.check(config)
         assert FOUNDATION_TABLES < _table_names(database_url)
-        assert _revision_number(database_url) == "0006_model_profile_bindings"
+        assert _revision_number(database_url) == "0010_memory_extraction"
     finally:
         _remove_database_artifacts(database_path, resolved_temporary_root)
 

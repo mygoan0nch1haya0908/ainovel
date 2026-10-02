@@ -354,8 +354,12 @@ def _create_workflow_atomically(
             )
             if values.get("model_profile_version_id") or values.get("provider_choice_explicit") == "yes":
                 stage = "roadmap_propose"
+                capacity = {}
+                if not values.get("model_profile_version_id"):
+                    caps = request.app.state.provider_registry.get(values["provider_name"]).capabilities(values["model_name"])
+                    capacity = {"context_window": caps.context_window, "max_output_tokens": caps.max_output_tokens}
                 StageService(session).propose_roadmap(story_stage.id, "author", values["provider_name"], values["model_name"],
-                    model_profile_version_id=values.get("model_profile_version_id") or None)
+                    model_profile_version_id=values.get("model_profile_version_id") or None, **capacity)
             project_id, target_id = project.id, story_stage.id
         else:
             stage = "budget_validate"

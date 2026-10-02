@@ -10,6 +10,7 @@
 </aside>
 {% endif %}
 <h1>生成工作流</h1>
+<p><a href="/workflows/{{ workflow.id }}/context-preview">预览精简后的写作输入</a> · <a href="/projects/{{ project.id }}/memory">小说记忆与约束卡</a></p>
 <ol class="progress" aria-label="创作进度">
 {% for label in ["确认输入", "生成计划", "确认计划", "生成正文", "审阅正文"] %}
 <li{% if loop.index0 == progress_step %} aria-current="step"{% elif loop.index0 < progress_step %} class="done"{% endif %}>{{ loop.index }} · {{ label }}</li>
@@ -89,6 +90,7 @@
   <ol>{% for row in failed_attempts %}<li>
     <strong>{{ step_labels.get(row.step.kind, row.step.kind) }}{% if row.step.ordinal %} · 第 {{ row.step.ordinal }} 章{% endif %} · 第 {{ row.attempt.attempt_number }} 次</strong>
     <p>{{ row.attempt.error_code or "未分类" }} · {{ row.attempt.error_detail or "没有详细记录" }}</p>
+    {% with diagnostic=llm_diagnostics.get(row.attempt.id) %}{% include '_llm_diagnostic.html' %}{% endwith %}
     <p>用量：输入 {{ row.attempt.input_tokens if row.attempt.input_tokens is not none else "未知" }} / 输出 {{ row.attempt.output_tokens if row.attempt.output_tokens is not none else "未知" }} Token{% if row.step.ordinal in work_draft_by_ordinal %}{% set draft = work_draft_by_ordinal[row.step.ordinal] %}；工作稿修补 {{ draft.repair_count }} / 2 轮{% endif %}</p>
     {% if row.attempt.error_code == 'provider_protocol' and row.attempt.error_detail in [none, 'provider returned an invalid response'] %}<p class="muted">未记录细分原因，不能从这条旧记录还原根因。</p>{% endif %}
   </li>{% endfor %}</ol>

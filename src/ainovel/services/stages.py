@@ -5,7 +5,8 @@ from uuid import uuid4
 
 from sqlalchemy import select, update, func
 
-from ainovel.agents.stage_contracts import StageRoadmapDraft
+from ainovel.agents.stage_contracts import StageRoadmapDraft, StagePlotRoadmapDraft
+from ainovel.services.stage_planning import PLOT_FORMAT, parse_stage_roadmap, validate_locked_prefix, chapter_slots
 from ainovel.agents.runner import AgentRunner
 from ainovel.context import ConservativeEstimator, effective_input_capacity
 from ainovel.models.audit import AuditEvent
@@ -14,12 +15,18 @@ from ainovel.models.project import NovelProject, ConstitutionVersion
 from ainovel.models.stage import StoryStage, StageRoadmapVersion, StageModelAttempt, StageWorkflow, StageWorkflowNode
 from ainovel.models.workflow import GenerationWorkflow
 from ainovel.providers.contracts import ModelRequest
+from ainovel.providers.diagnostics import safe_failure_code
+from ainovel.services.llm_diagnostics import failure_details, enforce_cooldown
 from ainovel.services.workflows import DEFAULT_BUDGETS, PROVIDER_NAMES, WorkflowService, WorkflowBudgets
 from ainovel.services.provider_resolution import validate_profile_binding
 
 
 STAGE_PROMPT = "根据作者阶段架构和锁定设定提出精简路线图。仅列有稳定标识的小章节节点；按因果顺序推进，依赖只能引用此前节点。不得生成正文或场景详情。保留已确认节点，必须覆盖关键事件和阶段终态，不得用章数代替节点列表。"
+PLOT_PROMPT = "根据作者阶段架构和锁定设定提出剧情点规划，每个剧情点分配 chapter_count 章，不列单章或场景详情。按因果顺序安排目标、关键事件、人物变化和伏笔；稳定 point_id，依赖只能引用此前点。60章可安排约8—12个剧情点，不强制凑数；总章数遵守作者要求。已开始并确认正文的剧情点整体锁定内容、顺序和章数。返回完整 plot_points_v1 JSON。"
+PLOT_COMPACT_INSTRUCTION = "精简输出但不删作者硬约束：顶层 goal/start_state/end_state 各用一句话；顶层 key_events 仅列3—5个全阶段转折，foreshadowing 仅列跨阶段未解钩子，不复述各点清单。每点 goal 一句话，key_events 通常2—4条，character_changes 和 foreshadowing 通常各0—2条；每条短句，不写对白、场景、战斗过程或解释性评论。必要约束可超出建议条数；已锁定点保持原样。先统筹全部剧情点的章数，包含高潮与收束，再输出完整JSON；章数总和必须符合作者要求，不为前半段耗尽章数。具体场景留到写作前批次细化。"
+PLOT_REVISION = "本次根据 revision.source_payload 与 revision.feedback 修订，返回完整规划；保持未涉及点的稳定标识。previous_roadmap 中累计起始章号不大于 confirmed_chapters 的所有点整体禁止修改。不得改变已锁定设定、全书与阶段约束。"
 HIERARCHY_INSTRUCTION = "遵守设定与锁定结局；总剧情大纲约束阶段大纲，阶段大纲约束单章展开。不得静默改写上层约束。first_chapter 或 author_chapter_outline 仅适用于当前阶段第1章，不得作为所有章节的任务；未提供时自行按阶段大纲拆章。路线图和章节计划均须作者核对三层一致性后批准。"
+REVISION_INSTRUCTION = "本次是作者反馈修订：以 revision.source_payload 为原安排，按 revision.feedback 修改并返回完整新安排，不只返回修改片段。未涉及的节点尽量保持稳定标识与内容。previous_roadmap 的前 confirmed_chapters 个节点为已确认正文对应节点，禁止改动。意见不得覆盖已锁定设定、全书与阶段约束。"
 
 
 def _outline_hierarchy(nodes):
@@ -51,6 +58,44 @@ class StageBudgets:
 class StageBatchStart:
     workflow: GenerationWorkflow
     nodes: tuple[StageWorkflowNode, ...]
+
+
+def compact_stage_input(snapshot):
+    """Lossless references to repeated long strings; never edit the audit snapshot."""
+    seen = {}
+
+    def visit(value, path):
+        if isinstance(value, str) and len(value) >= 256:
+            if value in seen:
+                return {"$context_ref": seen[value]}
+            seen[value] = path
+        if isinstance(value, dict):
+            return {key: visit(item, path + "/" + str(key).replace("~", "~0").replace("/", "~1"))
+                    for key, item in value.items()}
+        if isinstance(value, list):
+            return [visit(item, path + "/" + str(index)) for index, item in enumerate(value)]
+        return value
+
+    return visit(snapshot, "")
+
+
+def stage_request(version, context_window, max_output_tokens):
+    output = min(version.output_token_limit, max_output_tokens)
+    capacity = effective_input_capacity(version.input_token_limit, context_window, output)
+    return ModelRequest(
+        version.model_name,
+        version.prompt_snapshot["body"] + '\n{"$context_ref":"/path"} represents the exact same full text at that JSON Pointer in this input; apply all constraints there, not a missing value.',
+        compact_stage_input(version.input_snapshot), deepcopy(version.prompt_snapshot["schema"]),
+        capacity, output, 600.0,
+        {"agent_role": "stage_planner", "schema_name": "stage_roadmap", "generation_version": "2", "roadmap_id": version.id},
+    )
+
+
+def stage_context_report(version, context_window, max_output_tokens):
+    request = stage_request(version, context_window, max_output_tokens)
+    estimated = ConservativeEstimator().estimate(json.dumps(asdict(request), ensure_ascii=False))
+    return {"estimated": estimated, "capacity": request.max_input_tokens,
+            "output": request.max_output_tokens, "overflow": estimated > request.max_input_tokens}
 
 
 class StageService:
@@ -98,11 +143,16 @@ class StageService:
         return list(self.session.scalars(select(StageRoadmapVersion).where(StageRoadmapVersion.stage_id == stage_id).order_by(StageRoadmapVersion.version_number)))
 
     def propose_roadmap(self, stage_id, actor, provider_name, model_name, *, architecture=None,
-                        budgets=StageBudgets(), model_profile_version_id=None):
+                        budgets=None, model_profile_version_id=None, context_window=32000,
+                        max_output_tokens=8000, source_roadmap_id=None, feedback=None, expected_revision=None,
+                        roadmap_format=PLOT_FORMAT, requested_output_tokens=None):
         if provider_name not in PROVIDER_NAMES or not isinstance(model_name, str) or not model_name.strip():
             raise ValueError("invalid provider/model")
-        if any(type(v) is not int or v <= 0 for v in asdict(budgets).values()) or budgets.attempt_limit > 2:
+        if budgets is not None and (any(type(v) is not int or v <= 0 for v in asdict(budgets).values()) or budgets.attempt_limit > 2):
             raise ValueError("invalid finite stage budgets")
+        if requested_output_tokens is not None and (type(requested_output_tokens) is not int
+                or not 1 <= requested_output_tokens <= 2147483647 or budgets is not None):
+            raise ValueError('invalid or conflicting stage output budget')
         self.session.expire_all()
         stage = self.get(stage_id)
         architecture = stage.architecture if architecture is None else architecture
@@ -110,7 +160,39 @@ class StageService:
             raise ValueError("architecture required")
         try:
             project = self._lock_idle_project(stage)
+            revision = None
+            if source_roadmap_id is not None:
+                source = self.roadmap(source_roadmap_id)
+                if (source.stage_id != stage.id or source.payload is None
+                        or not isinstance(feedback, str) or not feedback.strip()
+                        or (expected_revision is not None and expected_revision != stage.revision)
+                        or not ((source.status == 'PROPOSED' and self._inputs_current(stage, source))
+                                or (source.status == 'APPROVED' and stage.approved_roadmap_id == source.id
+                                    and self._inputs_current(stage, source, check_revision=False)))):
+                    raise ValueError('feedback source is unavailable or stale')
+                revision = {'source_roadmap_id': source.id, 'source_version': source.version_number,
+                            'source_payload': deepcopy(source.payload), 'feedback': feedback.strip()}
+                roadmap_format = source.payload.get('format', 'legacy')
+            if roadmap_format not in {'legacy', PLOT_FORMAT}:
+                raise ValueError('unknown roadmap format')
+            previous = self.roadmap(stage.approved_roadmap_id) if stage.approved_roadmap_id else None
+            if previous and stage.confirmed_chapters and previous.payload.get('format', 'legacy') != roadmap_format:
+                raise ValueError('cannot change roadmap format after confirmed chapters / 已确认正文的阶段不能转换规划格式')
+            schema = StagePlotRoadmapDraft if roadmap_format == PLOT_FORMAT else StageRoadmapDraft
+            prompt = PLOT_PROMPT + PLOT_COMPACT_INSTRUCTION if roadmap_format == PLOT_FORMAT else STAGE_PROMPT
+            revision_prompt = PLOT_REVISION if roadmap_format == PLOT_FORMAT else REVISION_INSTRUCTION
             profile = validate_profile_binding(self.session, provider_name, model_name, model_profile_version_id)
+            if budgets is None:
+                window = profile.context_limit if profile is not None else context_window
+                maximum_output = profile.output_limit if profile is not None else max_output_tokens
+                if type(window) is not int or not 1 <= window <= 2147483647 or type(maximum_output) is not int or maximum_output < 1:
+                    raise ValueError("invalid model capacity")
+                output = min(32000, maximum_output) if requested_output_tokens is None else requested_output_tokens
+                if output > maximum_output:
+                    raise ValueError('stage output budget exceeds model output capacity')
+                incoming = effective_input_capacity(window, window, output)
+                budgets = StageBudgets(input_tokens=incoming, output_tokens=output,
+                                       total_input_tokens=incoming * 2, total_output_tokens=output * 2)
             if profile is not None:
                 output = min(budgets.output_tokens, profile.output_limit)
                 incoming = min(budgets.input_tokens, profile.context_limit - output)
@@ -132,10 +214,11 @@ class StageService:
                 input_revision=stage.revision, constitution_version_id=constitution.id,
                 provider_name=provider_name, model_name=model_name if profile is not None else model_name.strip(),
                 model_profile_version_id=model_profile_version_id, architecture=architecture.strip(),
-                prompt_snapshot={"body": STAGE_PROMPT + (HIERARCHY_INSTRUCTION if hierarchy else ""), "schema": StageRoadmapDraft.model_json_schema()},
+                prompt_snapshot={"body": prompt + (HIERARCHY_INSTRUCTION if hierarchy else "") + (revision_prompt if revision else ""), "schema": schema.model_json_schema()},
                 input_snapshot={"architecture": architecture.strip(), "constitution": deepcopy(constitution.content),
                                 "outline": frozen_outline,
                                 **({"outline_hierarchy": hierarchy} if hierarchy else {}),
+                                **({"revision": revision} if revision else {}),
                                 "confirmed_chapters": stage.confirmed_chapters,
                                 "previous_roadmap": deepcopy(previous.payload) if previous else None},
                 input_token_limit=budgets.input_tokens, output_token_limit=budgets.output_tokens,
@@ -145,11 +228,23 @@ class StageService:
             self.session.add(version)
             self._audit(stage, "stage_roadmap_requested", actor,
                         {"roadmap_id": version.id, "model_profile_version_id": model_profile_version_id})
+            if revision:
+                self._audit(stage, 'stage_roadmap_feedback_saved', actor,
+                            {'roadmap_id': version.id, 'source_roadmap_id': source_roadmap_id})
             self.session.commit()
             return version
         except Exception:
             self.session.rollback()
             raise
+
+    def revise_roadmap(self, stage_id, roadmap_id, feedback, actor='author', *, expected_revision=None):
+        """Save an immutable feedback proposal; never call a provider here."""
+        source = self.roadmap(roadmap_id)
+        budgets = StageBudgets(source.input_token_limit, source.output_token_limit, source.attempt_limit,
+                               source.total_input_token_limit, source.total_output_token_limit)
+        return self.propose_roadmap(stage_id, actor, source.provider_name, source.model_name,
+            architecture=source.architecture, budgets=budgets, model_profile_version_id=source.model_profile_version_id,
+            source_roadmap_id=roadmap_id, feedback=feedback, expected_revision=expected_revision)
 
     def generate_roadmap(self, roadmap_id, provider):
         """Dispatch one durable attempt; a retry must use the same roadmap ID."""
@@ -160,6 +255,7 @@ class StageService:
         if version.status not in {"PENDING", "PAUSED_PROVIDER", "PAUSED_INVALID"}:
             raise ValueError("roadmap is not available for generation")
         stage = self.get(version.stage_id)
+        enforce_cooldown(self.session,stage.id)
         if not self._inputs_current(stage, version):
             version.status = "PAUSED_STALE_VERSION"
             self.session.commit()
@@ -190,12 +286,8 @@ class StageService:
                     model_profile_version_id=version.model_profile_version_id,
                 )
             capabilities = provider.capabilities(version.model_name)
-            output = min(version.output_token_limit, capabilities.max_output_tokens)
-            capacity = effective_input_capacity(version.input_token_limit, capabilities.context_window, output)
-            request = ModelRequest(version.model_name, version.prompt_snapshot["body"], deepcopy(version.input_snapshot),
-                                   deepcopy(version.prompt_snapshot["schema"]), capacity, output, 120.0,
-                                   {"agent_role": "stage_planner", "schema_name": "stage_roadmap", "generation_version": "2", "roadmap_id": version.id})
-            if ConservativeEstimator().estimate(json.dumps(asdict(request), ensure_ascii=False)) > capacity:
+            request = stage_request(version, capabilities.context_window, capabilities.max_output_tokens)
+            if ConservativeEstimator().estimate(json.dumps(asdict(request), ensure_ascii=False)) > request.max_input_tokens:
                 version.status = "PAUSED_CONTEXT_OVERFLOW"
                 self.session.commit()
                 return version
@@ -216,13 +308,28 @@ class StageService:
         response = None
         payload = None
         status = "PROPOSED"
+        failure_code = None
+        schema_issues = []
+        diagnostic_details = None
+        request = replace(request, metadata={**request.metadata, 'round': str(version.version_number), 'attempt': str(number)})
         try:
-            result = AgentRunner().run_with_response(provider, request, StageRoadmapDraft)
+            schema = StagePlotRoadmapDraft if 'points' in version.prompt_snapshot['schema'].get('properties', {}) else StageRoadmapDraft
+            from sqlalchemy.orm import sessionmaker
+            from ainovel.services.project_llm_guard import project_call
+            with project_call(sessionmaker(bind=self.session.bind), stage.project_id, attempt.id):
+                result = AgentRunner().run_with_response(provider, request, schema)
             response = result.response
             payload = result.result.model_dump()
         except Exception as error:
             response = getattr(error, "response", None)
+            diagnostic_details = failure_details(error,roadmap_id=version.id,attempt_number=number)
+            failure_code = safe_failure_code(error)
+            if failure_code == 'schema_mismatch':
+                from ainovel.agents.schema_diagnostics import safe_schema_issues
+                schema_issues = safe_schema_issues(getattr(error, 'schema_issues', []), version.prompt_snapshot['schema'])
             status = "PAUSED_INVALID" if response is not None else "PAUSED_PROVIDER"
+            if failure_code in {"provider_quota", "provider_api", "provider_rate_limit", "provider_temporary"}:
+                status = "PAUSED_PROVIDER"
         # A schema failure can still carry billable usage. Apply the same ceiling
         # checks to both successful and failed responses before saving either.
         if response is not None and (
@@ -257,8 +364,15 @@ class StageService:
             ):
                 status, payload = "PAUSED_BUDGET", None
             attempt.status = status
-            attempt.error_code = None if status == "PROPOSED" else status.lower()
+            attempt.error_code = (None if status == "PROPOSED" else
+                                  failure_code if status in {"PAUSED_INVALID", "PAUSED_PROVIDER"} and failure_code
+                                  else status.lower())
             version.status, version.payload = status, payload
+            if diagnostic_details:
+                self._audit(stage,'llm_call_failed','system',diagnostic_details)
+            if schema_issues:
+                self._audit(stage, 'stage_schema_validation_failed', 'system',
+                            {'roadmap_id': version.id, 'attempt_number': number, 'issues': schema_issues})
             self.session.commit()
             return version
         except Exception:
@@ -276,10 +390,10 @@ class StageService:
             self._lock_idle_project(stage)
             if version.status != "PROPOSED" or not self._inputs_current(stage, version):
                 raise ValueError("roadmap approval conflict or stale version")
-            draft = StageRoadmapDraft.model_validate(version.payload)
+            draft = parse_stage_roadmap(version.payload)
             previous = self.roadmap(stage.approved_roadmap_id) if stage.approved_roadmap_id else None
-            if previous and previous.payload["nodes"][:stage.confirmed_chapters] != version.payload["nodes"][:stage.confirmed_chapters]:
-                raise ValueError("revision cannot change confirmed nodes")
+            if previous:
+                validate_locked_prefix(previous.payload, version.payload, stage.confirmed_chapters)
             self._claim_stage(stage)
             stage.approved_roadmap_id = version.id
             stage.architecture = version.architecture
@@ -296,7 +410,8 @@ class StageService:
         if version.stage_id != stage.id or version.payload is None:
             raise ValueError("roadmap does not belong to stage or has no payload")
         previous = self.roadmap(stage.approved_roadmap_id) if stage.approved_roadmap_id else None
-        before = previous.payload if previous else {}
+        revision = version.input_snapshot.get('revision')
+        before = revision['source_payload'] if revision else previous.payload if previous else {}
         return {key: {"before": deepcopy(before.get(key)), "after": deepcopy(value)} for key, value in version.payload.items() if before.get(key) != value}
 
     def start_next_batch(
@@ -319,7 +434,7 @@ class StageService:
         if not self._inputs_current(stage, version, check_revision=False):
             raise ValueError("stale stage inputs")
         revision, confirmed, roadmap_id = stage.revision, stage.confirmed_chapters, version.id
-        selected = deepcopy(version.payload["nodes"][confirmed:confirmed + requested_chapters])
+        selected = chapter_slots(version.payload, confirmed, requested_chapters)
         if not selected:
             raise ValueError("stage is complete")
         project_id = stage.project_id
@@ -338,12 +453,13 @@ class StageService:
             self.session.flush()
             for ordinal, node in enumerate(selected, 1):
                 mapping = StageWorkflowNode(workflow_id=workflow.id, ordinal=ordinal, node_id=node["node_id"],
-                                           stage_ordinal=node["ordinal"], book_ordinal=project.next_official_chapter_number + ordinal - 1)
+                                           stage_ordinal=node["stage_ordinal"], book_ordinal=project.next_official_chapter_number + ordinal - 1)
                 self.session.add(mapping)
                 nodes.append(mapping)
             self._audit(current, "stage_batch_started", actor, {"workflow_id": workflow.id, "roadmap_id": roadmap_id})
         workflow = WorkflowService(self.session).start(project_id, provider_name, model_name, len(selected), budgets,
                                                        generation_version=2,
+                                                       _planning_format=version.payload.get('format'),
                                                        model_profile_version_id=version.model_profile_version_id,
                                                        _before_commit=attach)
         return StageBatchStart(workflow, tuple(nodes))
@@ -351,7 +467,7 @@ class StageService:
     def workflow_nodes(self, workflow_id):
         return list(self.session.scalars(select(StageWorkflowNode).where(StageWorkflowNode.workflow_id == workflow_id).order_by(StageWorkflowNode.ordinal)))
 
-    def workflow_context(self, workflow_id, ordinal=None, *, include_roadmap=False):
+    def workflow_context(self, workflow_id, ordinal=None, *, include_roadmap=False, scoped_memory=False):
         mapping = self.session.get(StageWorkflow, workflow_id)
         if mapping is None:
             return None
@@ -359,23 +475,34 @@ class StageService:
         nodes = self.workflow_nodes(workflow_id)
         result = {"stage_id": mapping.stage_id, "roadmap_id": version.id,
                   "confirmed_chapters": mapping.confirmed_start,
-                  "goal": version.payload["goal"],
+                  "goal": version.payload["goal"]}
+        if version.payload.get('format') == PLOT_FORMAT:
+            slots = {slot['stage_ordinal']: slot for slot in chapter_slots(version.payload, mapping.confirmed_start, len(nodes))}
+            selected = [{**slots[n.stage_ordinal], 'ordinal': n.ordinal, 'book_ordinal': n.book_ordinal}
+                        for n in nodes if ordinal is None or n.ordinal == ordinal]
+            point_ids = {slot['point_id'] for slot in selected}
+            result.update(format=PLOT_FORMAT, slots=selected,
+                          points=[deepcopy(p) for p in version.payload['points'] if p['point_id'] in point_ids],
+                          instruction='只细化预留章节位置，按点内进度分配不同的单章目标、场景与悬念，不得每章完成整个剧情点或提前消耗后续剧情点。')
+        else:
+            result.update({
                   "instruction": "只展开所选节点；保留节点标题和目标，场景不得提前消耗后续节点事件。",
                   "nodes": [{**deepcopy(version.payload["nodes"][n.stage_ordinal - 1]),
                              "ordinal": n.ordinal, "stage_ordinal": n.stage_ordinal, "book_ordinal": n.book_ordinal}
-                            for n in nodes if ordinal is None or n.ordinal == ordinal]}
-        if include_roadmap:
+                            for n in nodes if ordinal is None or n.ordinal == ordinal]})
+        if include_roadmap and not scoped_memory:
             result["roadmap"] = deepcopy(version.payload)
         hierarchy = version.input_snapshot.get("outline_hierarchy")
         if hierarchy:
-            result["outline_constraints"] = {key: deepcopy(value) for key, value in hierarchy.items() if key != "first_chapter"}
-            result["instruction"] += HIERARCHY_INSTRUCTION
+            if not scoped_memory:
+                result["outline_constraints"] = {key: deepcopy(value) for key, value in hierarchy.items() if key != "first_chapter"}
+                result["instruction"] += HIERARCHY_INSTRUCTION
             first_chapter = hierarchy.get("first_chapter")
             if first_chapter:
                 # This internal key lets the caller exclude the duplicate raw
                 # outline source from both its tree and retrieval packet.
                 result["_scoped_outline_keys"] = [first_chapter["outline_key"]]
-                for node in result["nodes"]:
+                for node in result.get('slots', result.get('nodes', [])):
                     if node["stage_ordinal"] == 1:
                         node["author_chapter_outline"] = deepcopy(first_chapter)
         return result

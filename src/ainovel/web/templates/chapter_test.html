@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_reading_panels.html" import reading_panel, reading_controls %}
 {% block title %}创作规划测试 · AI 小说工作台{% endblock %}
 {% block content %}
 <aside aria-label="测试环境提示">
@@ -6,12 +7,12 @@
   <p><strong>这是独立测试数据库，不是正式出版或发布入口。</strong></p>
   <p>数据库位置：<code>{{ database_path }}</code></p>
   <p><strong>付费调用警告：</strong>只有您明确点击“生成章节计划”“生成正文”或继续检查时才会调用 Qwen，可能产生 API 费用；协议失败最多尝试 2 次，短稿修补另行计数，每次模型调用都可能计费。</p>
-  <p>默认使用“三层大纲规划”：填写总剧情大纲与当前阶段大纲，单章大纲可选；AI 按阶段自动拆分章节，路线图经作者批准后按每批最多 5 章推进。也可选择“独立单章测试”，固定生成 1 章。主笔输出上限为 12000 Token，请求超时为 180 秒；规划、摘要、审核输出上限均为 4000 Token。</p>
+  <p>默认使用“三层大纲规划”：填写总剧情大纲与当前阶段大纲，单章大纲可选；AI 按阶段自动拆分章节，章节安排经作者批准后按每批最多 5 章推进。也可选择“独立单章测试”，固定生成 1 章。主笔输出上限为 12000 Token，请求超时为 180 秒；规划、摘要、审核输出上限均为 4000 Token。</p>
   <p>v1 单章正文须逐字包含获批计划中的 goal 与 ending_hook（忽略空白差异）；v2 通过语义覆盖审查，并核对正文中的原样连续摘录。每章仍须达到 4500–6000 个可见字符，计划与正文分别由作者批准。</p>
   <p>协议失败重试与短稿修补分别计数：协议尝试维持现有上限；v2 每章首次生成后最多两轮修补。两者都受工作流总调用与 Token 预算约束，重启或继续不会重置修补次数。</p>
 </aside>
 <ol class="progress" aria-label="单章测试进度"><li aria-current="step">单章 1 · 确认输入</li><li>2 · 生成计划</li><li>3 · 确认计划</li><li>4 · 生成正文</li><li>5 · 审阅正文</li></ol>
-<ol class="progress" aria-label="阶段规划进度"><li aria-current="step">阶段 1 · 确认架构</li><li>2 · 生成路线图</li><li>3 · 确认路线图</li><li>4 · 分批创作</li></ol>
+<ol class="progress" aria-label="阶段规划进度"><li aria-current="step">阶段 1 · 确认架构</li><li>2 · 生成章节安排</li><li>3 · 确认章节安排</li><li>4 · 分批创作</li></ol>
 {% if projects %}<p><a class="button secondary" href="#saved-tests-heading">继续已有测试，不重复创建</a></p>{% endif %}
 
 <section aria-labelledby="setup-heading">
@@ -35,7 +36,7 @@
     </fieldset>
     <fieldset data-outline-modes="hierarchical stage"><legend>阶段大纲</legend>
       <p><label for="stage_architecture">阶段大纲（当前剧情阶段总体架构，必填）</label><textarea id="stage_architecture" name="stage_architecture" maxlength="{{ field_limits.stage_architecture }}" rows="10"{% if chapter_form.setup_mode in ["hierarchical", "stage"] %} required{% endif %}>{{ chapter_form.stage_architecture }}</textarea></p>
-      <p class="muted">填写当前阶段的起点、关键事件和终态。创建阶段不会调用模型，进入阶段页后明确生成路线图并由作者批准。</p>
+      <p class="muted">填写当前阶段的起点、关键事件和终态。创建阶段不会调用模型，进入阶段页后明确生成章节安排并由作者批准。</p>
     </fieldset>
     <fieldset data-outline-modes="hierarchical single_chapter"><legend>单章大纲</legend>
     <p><label for="chapter_outline" data-chapter-outline-label>{% if chapter_form.setup_mode == "single_chapter" %}第一章提纲（独立单章必填）{% else %}单章大纲（可选，当前阶段第一章）{% endif %}</label><textarea id="chapter_outline" name="chapter_outline" maxlength="{{ field_limits.chapter_outline }}" rows="8"{% if chapter_form.setup_mode == "single_chapter" %} required{% endif %}>{{ chapter_form.chapter_outline }}</textarea></p>
@@ -49,7 +50,7 @@
     </details></fieldset>
     {% include "_profile_selection.html" %}
     {% set selected_provider = chapter_form.get('provider_name', 'qwen') %}
-    <p><label>环境 Provider <select name="provider_name"><option value="qwen"{% if selected_provider in ['qwen', 'compatible'] %} selected{% endif %}>环境 Qwen</option><option value="fake"{% if selected_provider == 'fake' %} selected{% endif %}>Fake 本地演示</option>{% if selected_provider not in ['qwen', 'fake', 'compatible'] %}<option value="{{ selected_provider }}" selected>原 Provider 不可用，请重新选择</option>{% endif %}</select></label></p>
+    <p><label>备用模型服务商 <select name="provider_name"><option value="qwen"{% if selected_provider in ['qwen', 'compatible'] %} selected{% endif %}>环境 Qwen</option><option value="fake"{% if selected_provider == 'fake' %} selected{% endif %}>Fake 本地演示</option>{% if selected_provider not in ['qwen', 'fake', 'compatible'] %}<option value="{{ selected_provider }}" selected>原模型服务商不可用，请重新选择</option>{% endif %}</select></label></p>
     <p><label for="model_name">模型名称</label><input id="model_name" name="model_name" maxlength="{{ field_limits.model_name }}" value="{{ chapter_form.model_name }}" required></p>
     <div data-outline-modes="single_chapter">
     <p><label><input type="checkbox" name="repair_mode" value="yes"{% if chapter_form.repair_mode == "yes" %} checked{% endif %}> 独立单章默认启用 v2 短稿修补与章节覆盖检查（每章首次生成后最多两轮修补；会增加有界模型调用，仍不保证文学质量）。</label></p>
@@ -68,14 +69,15 @@
 {% endif %}
 
 {% if confirmed_input %}
-<section aria-labelledby="confirmed-input-heading">
+<section aria-labelledby="confirmed-input-heading" data-disclosure-scope>
   <h2 id="confirmed-input-heading">作者已确认的测试输入</h2>
   <p>项目：{{ confirmed_input.project.title }}</p>
-  <h3>设定与文风</h3><div style="white-space: pre-wrap">{{ confirmed_input.setting_style }}</div>
-  <h3>暂定结局</h3><div style="white-space: pre-wrap">{{ confirmed_input.provisional_ending }}</div>
-  {% if confirmed_input.book_outline %}<h3>总剧情大纲</h3><div style="white-space: pre-wrap">{{ confirmed_input.book_outline }}</div>{% endif %}
-  {% if confirmed_input.stage_architecture %}<h3>阶段大纲 · 剧情阶段总体架构</h3><div style="white-space: pre-wrap">{{ confirmed_input.stage_architecture }}</div>{% endif %}
-  <h3>章节提纲{% if confirmed_input.book_outline %} · 当前阶段第一章{% endif %}</h3><div style="white-space: pre-wrap">{{ confirmed_input.chapter_outline or "未提供单章大纲，由 AI 按阶段拆分" }}</div>
+  {{ reading_controls() }}
+  {{ reading_panel("设定与文风", confirmed_input.setting_style) }}
+  {{ reading_panel("暂定结局", confirmed_input.provisional_ending) }}
+  {% if confirmed_input.book_outline %}{{ reading_panel("总剧情大纲", confirmed_input.book_outline) }}{% endif %}
+  {% if confirmed_input.stage_architecture %}{{ reading_panel("阶段大纲 · 剧情阶段总体架构", confirmed_input.stage_architecture) }}{% endif %}
+  {{ reading_panel("章节提纲 · 当前阶段第一章", confirmed_input.chapter_outline or "未提供单章大纲，由 AI 按阶段拆分") }}
   {% if confirmed_input.chapter_title %}<p>建议标题：{{ confirmed_input.chapter_title }}</p>{% endif %}
   {% if confirmed_input.chapter_goal %}<p>建议目标：{{ confirmed_input.chapter_goal }}</p>{% endif %}
   {% if confirmed_input.chapter_hook %}<p>建议钩子：{{ confirmed_input.chapter_hook }}</p>{% endif %}

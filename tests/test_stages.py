@@ -1,4 +1,5 @@
 import pytest
+import json
 
 from test_orchestrator import ready_project, response, session_factory, clock, make_orchestrator
 from ainovel.providers.fake import FakeProvider
@@ -17,11 +18,112 @@ def roadmap_payload(count=7):
     }
 
 
+def test_stage_default_budget_uses_configured_capacity(session, ready_project):
+    from ainovel.services.stages import StageService
+    service = StageService(session)
+    stage = service.create(ready_project.id, "长" * 18000)
+    version = service.propose_roadmap(stage.id, "author", "fake", "scripted", roadmap_format="legacy", context_window=32000)
+    provider = FakeProvider([response(roadmap_payload(), 1)])
+    result = service.generate_roadmap(version.id, provider)
+    assert result.status == "PROPOSED"
+    assert provider.requests[0].max_input_tokens == 22976
+    assert version.total_input_token_limit == 45952
+
+
+def test_stage_request_deduplicates_long_text_without_changing_snapshot(session, ready_project):
+    from ainovel.services.stages import StageService
+    service = StageService(session)
+    text = "不可丢弃的作者约束" * 400
+    stage = service.create(ready_project.id, text)
+    version = service.propose_roadmap(stage.id, "author", "fake", "scripted", roadmap_format="legacy")
+    version.input_snapshot = {**version.input_snapshot, "outline_hierarchy": {"stage_architecture": text}}
+    session.commit()
+    provider = FakeProvider([response(roadmap_payload(), 1)])
+    assert service.generate_roadmap(version.id, provider).status == "PROPOSED"
+    payload = provider.requests[0].input_payload
+    assert json.dumps(payload, ensure_ascii=False).count(text) == 1
+    assert payload["outline_hierarchy"]["stage_architecture"] == {"$context_ref": "/architecture"}
+    assert version.input_snapshot["outline_hierarchy"]["stage_architecture"] == text
+
+
+def test_stage_retains_safe_response_reason_without_failed_content(session, ready_project):
+    from ainovel.services.stages import StageService
+    from ainovel.models.stage import StageModelAttempt
+    from ainovel.providers.diagnostics import ResponseFailure, FailureReason
+    service = StageService(session)
+    stage = service.create(ready_project.id, "test architecture")
+    version = service.propose_roadmap(stage.id, "author", "fake", "scripted", roadmap_format="legacy")
+    error = ResponseFailure(FailureReason.JSON, response=response({}, 1))
+    error.args = ("SECRET_SENTINEL_FROM_PROVIDER",)
+    service.generate_roadmap(version.id, FakeProvider([error]))
+    attempt = session.query(StageModelAttempt).filter_by(roadmap_id=version.id).one()
+    assert attempt.error_code == "response_json"
+    assert version.payload is None
+    assert "SECRET_SENTINEL_FROM_PROVIDER" not in "\n".join(session.connection().connection.driver_connection.iterdump())
+
+
 def proposed(service, project_id, payload=None):
     stage = service.create(project_id, "入城查案，七次追查后揭露主使", "author")
-    version = service.propose_roadmap(stage.id, "author", "fake", "scripted")
+    version = service.propose_roadmap(stage.id, "author", "fake", "scripted", roadmap_format="legacy")
     version = service.generate_roadmap(version.id, FakeProvider([response(payload or roadmap_payload(), 1)]))
     return stage, version
+
+
+def test_author_feedback_freezes_source_and_generates_separate_revision(session, ready_project):
+    from copy import deepcopy
+    from ainovel.services.stages import StageService
+    service = StageService(session)
+    stage, source = proposed(service, ready_project.id)
+    original = deepcopy(source.payload)
+    revision = service.revise_roadmap(stage.id, source.id, '推迟第二章揭密', 'author')
+    assert revision.status == 'PENDING' and revision.attempts_used == 0
+    assert revision.payload is None and source.payload == original
+    assert revision.input_snapshot['revision']['feedback'] == '推迟第二章揭密'
+    assert revision.input_snapshot['revision']['source_payload'] == original
+    assert revision.input_snapshot['revision']['source_roadmap_id'] == source.id
+    assert revision.model_name == source.model_name
+    changed = deepcopy(original)
+    changed['nodes'][1]['goal'] = '暂不揭露主使'
+    provider = FakeProvider([response(changed, 2)])
+    service.generate_roadmap(revision.id, provider)
+    assert provider.requests[0].input_payload['revision']['feedback'] == '推迟第二章揭密'
+    assert service.get(stage.id).approved_roadmap_id is None
+    assert service.roadmap_diff(stage.id, revision.id)['nodes']['before'] == original['nodes']
+    service.approve_roadmap(stage.id, revision.id, 'author')
+    assert service.get(stage.id).approved_roadmap_id == revision.id
+    assert source.payload == original
+
+
+def test_feedback_rejects_stale_cross_stage_empty_and_duplicate_requests(session, ready_project):
+    from ainovel.services.stages import StageService
+    service = StageService(session)
+    stage, source = proposed(service, ready_project.id)
+    other = service.create(ready_project.id, '另一阶段', 'author')
+    for stage_id, feedback in [(other.id, '改一下'), (stage.id, '   ')]:
+        with pytest.raises(ValueError):
+            service.revise_roadmap(stage_id, source.id, feedback, 'author')
+    expected_revision = service.get(stage.id).revision
+    service.revise_roadmap(stage.id, source.id, '改第二章', 'author', expected_revision=expected_revision)
+    with pytest.raises(ValueError):
+        service.revise_roadmap(stage.id, source.id, '重复提交', 'author', expected_revision=expected_revision)
+    assert len(service.list_roadmaps(stage.id)) == 2
+
+
+def test_feedback_revision_cannot_approve_changes_to_confirmed_chapters(session, ready_project):
+    from copy import deepcopy
+    from ainovel.services.stages import StageService
+    service = StageService(session)
+    stage, source = proposed(service, ready_project.id)
+    service.approve_roadmap(stage.id, source.id, 'author')
+    stage.confirmed_chapters = 1
+    session.commit()
+    revision = service.revise_roadmap(stage.id, source.id, '改后续章节', 'author')
+    altered = deepcopy(source.payload)
+    altered['nodes'][0]['goal'] = '越权修改已确认章'
+    service.generate_roadmap(revision.id, FakeProvider([response(altered, 2)]))
+    with pytest.raises(ValueError, match='confirmed nodes'):
+        service.approve_roadmap(stage.id, revision.id, 'author')
+    assert service.get(stage.id).approved_roadmap_id == source.id
 
 
 def test_stage_requires_explicit_roadmap_approval_before_start(session, ready_project):
@@ -113,7 +215,7 @@ def test_demo_provider_can_propose_a_stage_roadmap(session, ready_project):
     from ainovel.services.stages import StageService
     service = StageService(session)
     stage = service.create(ready_project.id, "入城查案", "author")
-    version = service.propose_roadmap(stage.id, "author", "fake", "demo")
+    version = service.propose_roadmap(stage.id, "author", "fake", "demo", roadmap_format="legacy")
     result = service.generate_roadmap(version.id, DemoFakeProvider())
     assert result.status == "PROPOSED"
     assert result.estimated_chapters > 5
@@ -153,7 +255,7 @@ def test_roadmap_budget_limits_do_not_truncate_or_dispatch_over_budget(session, 
     service = StageService(session)
     stage = service.create(ready_project.id, "架构" * 20000 if budget_kind == "input" else "查案", "author")
     budgets = StageBudgets(total_output_tokens=1) if budget_kind == "total" else StageBudgets()
-    version = service.propose_roadmap(stage.id, "author", "fake", "scripted", budgets=budgets)
+    version = service.propose_roadmap(stage.id, "author", "fake", "scripted", roadmap_format="legacy", budgets=budgets)
     provider = FakeProvider([response(roadmap_payload(), 1, output_tokens=8001)]) if budget_kind == "output" else FakeProvider([])
     result = service.generate_roadmap(version.id, provider)
     assert result.status == ("PAUSED_CONTEXT_OVERFLOW" if budget_kind == "input" else "PAUSED_BUDGET")
@@ -167,11 +269,11 @@ def test_roadmap_completion_is_fenced_when_author_revises_inputs_during_call(ses
     from ainovel.services.stages import StageService
     service = StageService(session)
     stage = service.create(ready_project.id, "查案", "author")
-    version = service.propose_roadmap(stage.id, "author", "fake", "scripted")
+    version = service.propose_roadmap(stage.id, "author", "fake", "scripted", roadmap_format="legacy")
     class RevisingProvider(DemoFakeProvider):
         def generate(self, request):
             with session_factory() as other:
-                StageService(other).propose_roadmap(stage.id, "author", "fake", "scripted", architecture="重新调查")
+                StageService(other).propose_roadmap(stage.id, "author", "fake", "scripted", roadmap_format="legacy", architecture="重新调查")
             return response(roadmap_payload(), 1)
     result = service.generate_roadmap(version.id, RevisingProvider())
     assert result.status == "PAUSED_STALE_VERSION"
@@ -267,7 +369,7 @@ def test_revision_diff_preserves_approved_records_and_confirmed_node_prefix(sess
     WorkflowService(session).reconcile_batch_decision(started.workflow.id)
     changed = deepcopy(old_payload)
     changed["nodes"][1]["goal"] = "改为调查码头"
-    new = service.propose_roadmap(stage.id, "author", "fake", "scripted", architecture="改查码头")
+    new = service.propose_roadmap(stage.id, "author", "fake", "scripted", roadmap_format="legacy", architecture="改查码头")
     service.generate_roadmap(new.id, FakeProvider([response(changed, 2)]))
     diff = service.roadmap_diff(stage.id, new.id)
     assert diff["nodes"]["before"][1]["goal"] == "取得线索2"
@@ -277,7 +379,7 @@ def test_revision_diff_preserves_approved_records_and_confirmed_node_prefix(sess
     assert service.roadmap(original.id).payload == old_payload
     assert service.get(stage.id).confirmed_chapters == 1
     changed["nodes"][0]["goal"] = "改写已确认章"
-    invalid = service.propose_roadmap(stage.id, "author", "fake", "scripted")
+    invalid = service.propose_roadmap(stage.id, "author", "fake", "scripted", roadmap_format="legacy")
     service.generate_roadmap(invalid.id, FakeProvider([response(changed, 3)]))
     with pytest.raises(ValueError, match="confirmed nodes"):
         service.approve_roadmap(stage.id, invalid.id, "author")
@@ -344,13 +446,13 @@ def test_active_batch_blocks_roadmap_edits_and_stale_map_blocks_approval(session
     service = StageService(session)
     stage, version = proposed(service, ready_project.id)
     service.approve_roadmap(stage.id, version.id, "author")
-    future = service.propose_roadmap(stage.id, "author", "fake", "scripted")
+    future = service.propose_roadmap(stage.id, "author", "fake", "scripted", roadmap_format="legacy")
     service.generate_roadmap(future.id, FakeProvider([response(roadmap_payload(8), 2)]))
     started, batch_id = candidate_batch(service, stage, session, session_factory, clock)
     with pytest.raises(ValueError, match="active"):
         service.approve_roadmap(stage.id, future.id, "author")
     with pytest.raises(ValueError, match="active"):
-        service.propose_roadmap(stage.id, "author", "fake", "scripted")
+        service.propose_roadmap(stage.id, "author", "fake", "scripted", roadmap_format="legacy")
     session.execute(update(StoryStage).where(StoryStage.id == stage.id).values(approved_roadmap_id=future.id))
     session.commit()
     with pytest.raises(ValueError, match="stale"):
@@ -373,7 +475,7 @@ def test_missing_stage_usage_is_unknown_and_never_grants_free_retry(session, rea
     from ainovel.services.stages import StageService
     service = StageService(session)
     stage = service.create(ready_project.id, "查案", "author")
-    version = service.propose_roadmap(stage.id, "author", "fake", "scripted")
+    version = service.propose_roadmap(stage.id, "author", "fake", "scripted", roadmap_format="legacy")
     result = service.generate_roadmap(version.id, FakeProvider([response({}, 1, input_tokens=None, output_tokens=None)]))
     assert result.actual_input_tokens is None
     assert result.actual_output_tokens is None
@@ -399,6 +501,23 @@ def test_planner_cannot_swap_reserved_node_for_a_later_goal(session, ready_proje
     assert service.get(stage.id).confirmed_chapters == 0
 
 
+def test_stage_quota_with_usage_is_provider_pause_not_invalid_json(session, ready_project):
+    from ainovel.providers.llm_response import LLMQuotaError
+    from ainovel.services.stages import StageService
+    from ainovel.models import StageModelAttempt
+    from sqlalchemy import select
+    service = StageService(session)
+    stage = service.create(ready_project.id, '查案', 'author')
+    version = service.propose_roadmap(stage.id, 'author', 'fake', 'scripted', roadmap_format="legacy")
+    error = LLMQuotaError()
+    error.response = response({}, 1)
+    provider = FakeProvider([error])
+    result = service.generate_roadmap(version.id, provider)
+    assert result.status == 'PAUSED_PROVIDER' and result.payload is None
+    attempt = session.scalar(select(StageModelAttempt).where(StageModelAttempt.roadmap_id == version.id))
+    assert attempt.error_code == 'provider_quota' and len(provider.requests) == 1
+
+
 def test_stage_start_propagates_caller_workflow_budgets(session, ready_project):
     from ainovel.services.stages import StageService
     from ainovel.services.workflows import WorkflowBudgets
@@ -409,7 +528,7 @@ def test_stage_start_propagates_caller_workflow_budgets(session, ready_project):
     assert started.workflow.reviewer_output_tokens == 4000
 
 
-@pytest.mark.parametrize("input_tokens,output_tokens", [(16001, 50), (100, 8001), (100, 17000)], ids=["input-call", "output-call", "output-total"])
+@pytest.mark.parametrize("input_tokens,output_tokens", [(22977, 50), (100, 8001), (100, 17000)], ids=["input-call", "output-call", "output-total"])
 def test_invalid_roadmap_with_excess_usage_stops_before_any_retry(session, ready_project, input_tokens, output_tokens):
     from ainovel.services.stages import StageService
     from ainovel.models import StageModelAttempt
@@ -417,7 +536,7 @@ def test_invalid_roadmap_with_excess_usage_stops_before_any_retry(session, ready
 
     service = StageService(session)
     stage = service.create(ready_project.id, "查案", "author")
-    version = service.propose_roadmap(stage.id, "author", "fake", "scripted")
+    version = service.propose_roadmap(stage.id, "author", "fake", "scripted", roadmap_format="legacy")
     provider = FakeProvider([
         response({}, 1, input_tokens=input_tokens, output_tokens=output_tokens),
         response(roadmap_payload(), 2),
@@ -436,7 +555,7 @@ def test_invalid_roadmap_with_excess_usage_stops_before_any_retry(session, ready
     assert service.roadmap(version.id).attempts_used == 1
 
 
-@pytest.mark.parametrize("dimension,actual", [("input", 16001), ("output", 9000), ("output", 17000)], ids=["input-reservation", "output-reservation", "output-spent"])
+@pytest.mark.parametrize("dimension,actual", [("input", 22977), ("output", 9000), ("output", 17000)], ids=["input-reservation", "output-reservation", "output-spent"])
 def test_retry_admission_respects_usage_persisted_before_budget_fix(session, ready_project, dimension, actual):
     from ainovel.services.stages import StageService
     from ainovel.models import StageModelAttempt
@@ -444,7 +563,7 @@ def test_retry_admission_respects_usage_persisted_before_budget_fix(session, rea
 
     service = StageService(session)
     stage = service.create(ready_project.id, "查案", "author")
-    version = service.propose_roadmap(stage.id, "author", "fake", "scripted")
+    version = service.propose_roadmap(stage.id, "author", "fake", "scripted", roadmap_format="legacy")
     service.generate_roadmap(version.id, FakeProvider([response({}, 1)]))
     # Reconstruct a pre-fix paused record: schema failed but excessive usage was
     # persisted. A corrected service must reject its retry before provider dispatch.

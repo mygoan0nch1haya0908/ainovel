@@ -3,6 +3,8 @@ from ainovel.models.base import Base, TimestampMixin
 from ainovel.models.model_profile import ModelProfile, ModelProfileVersion
 from ainovel.models.batch import Chapter, WritingBatch
 from ainovel.models.context import ContextPacket, ContextPacketItem, ContextSource
+from ainovel.models.story_memory import MemoryCardVersion, StoryMemoryEntry, WorkflowContextPolicy
+from ainovel.models.memory_extraction import MemoryExtractionJob, MemoryExtractionChunk, MemoryExtractionAuthorization, MemoryExtractionAttempt, ProjectLLMClaim
 from ainovel.models.outline import OutlineNode, OutlineVersion
 from ainovel.models.prompt import PromptVersion, WorkflowPromptSnapshot
 from ainovel.models.project import ConstitutionVersion, NovelProject

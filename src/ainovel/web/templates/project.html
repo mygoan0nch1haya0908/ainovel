@@ -8,12 +8,12 @@
 {% if active_workflow %}<aside><strong>下一步：</strong>进入生成页面查看当前进度。<p><a class="button" href="/workflows/{{ active_workflow.id }}">继续创作 · {{ workflow_labels.get(active_workflow.status, active_workflow.status) }}</a></p></aside>
 {% elif summary.project.active_batch_id %}<aside><strong>当前有候选批次待处理。</strong><p><a class="button" href="/batches/{{ summary.project.active_batch_id }}">查看正文与批次状态</a></p><p>创建批次不等于生成正文；空批次需要您主动驳回后，才能重新启动生成。</p></aside>{% endif %}
 <section aria-labelledby="versions-heading"><h2 id="versions-heading">当前版本</h2>
-  <p>创作宪法：{% if summary.current_constitution_version_number %}v{{ summary.current_constitution_version_number }}{% else %}尚未确认{% endif %}</p>
+  <p>小说设定与创作规则：{% if summary.current_constitution_version_number %}v{{ summary.current_constitution_version_number }}{% else %}尚未确认{% endif %}</p>
   <p>官方大纲：{% if official_outline %}v{{ official_outline.version_number }}{% else %}尚未确认{% endif %}</p>
   </section>
   <section aria-labelledby="stage-architecture-heading">
     <h2 id="stage-architecture-heading">剧情阶段总体架构</h2>
-    <p>阶段路线图、每批计划与每批正文分别由作者确认；每批最多五章。创建架构和批准操作都不会调用模型。</p>
+    <p>阶段章节安排、每批计划与每批正文分别由作者确认；每批最多五章。创建架构和批准操作都不会调用模型。</p>
     {% if official_outline and summary.current_constitution_version_number %}
     <form action="/projects/{{ summary.project.id }}/stages" method="post" data-confirm="确认保存此剧情阶段总体架构？此操作不会调用模型。">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -21,7 +21,7 @@
       <p><label><input type="checkbox" name="author_confirm" value="yes" required> 我确认该架构作为新阶段的作者输入。</label></p>
       <button type="submit">创建剧情阶段（不会调用模型）</button>
     </form>
-    {% else %}<p>请先确认创作宪法和官方大纲。</p>{% endif %}
+    {% else %}<p>请先确认小说设定与创作规则和官方大纲。</p>{% endif %}
     {% if stages %}<h3>已有剧情阶段</h3><ul>{% for stage in stages %}<li><a href="/stages/{{ stage.id }}">阶段 {{ loop.index }} · 已确认 {{ stage.confirmed_chapters }} 章</a></li>{% endfor %}</ul>{% endif %}
   </section>
 <section aria-labelledby="official-heading"><h2 id="official-heading">官方正文</h2>
@@ -37,7 +37,7 @@
     {% include "_profile_selection.html" %}
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     {% set selected_provider = workflow_form.get('provider_name', 'fake') %}
-    <p><label for="provider_name">Provider</label><select id="provider_name" name="provider_name"><option value="fake"{% if selected_provider == 'fake' %} selected{% endif %}>Fake 演示</option><option value="ollama"{% if selected_provider == 'ollama' %} selected{% endif %}>Ollama</option><option value="openai"{% if selected_provider == 'openai' %} selected{% endif %}>OpenAI</option><option value="qwen"{% if selected_provider == 'qwen' %} selected{% endif %}>Qwen</option>{% if selected_provider not in ['fake', 'ollama', 'openai', 'qwen'] %}<option value="{{ selected_provider }}" selected>原 Provider 不可用，请重新选择</option>{% endif %}</select></p>
+    <p><label for="provider_name">模型服务商</label><select id="provider_name" name="provider_name"><option value="fake"{% if selected_provider == 'fake' %} selected{% endif %}>Fake 演示</option><option value="ollama"{% if selected_provider == 'ollama' %} selected{% endif %}>Ollama</option><option value="openai"{% if selected_provider == 'openai' %} selected{% endif %}>OpenAI</option><option value="qwen"{% if selected_provider == 'qwen' %} selected{% endif %}>Qwen</option>{% if selected_provider not in ['fake', 'ollama', 'openai', 'qwen'] %}<option value="{{ selected_provider }}" selected>原模型服务商不可用，请重新选择</option>{% endif %}</select></p>
     <p><label for="model_name">模型名称</label><input id="model_name" name="model_name" value="{{ workflow_form.get('model_name', 'demo') }}" required></p>
     <p><label for="requested_chapters">计划章节数{% if chapter_test_mode %}（固定为 1）{% else %}（1 至 5）{% endif %}</label><input id="requested_chapters" name="requested_chapters" type="number" min="1" max="{% if chapter_test_mode %}1{% else %}5{% endif %}" value="{{ workflow_form.get('requested_chapters', '1') }}" required{% if chapter_test_mode %} readonly{% endif %}></p>
     <p>预算上限：规划 16000/4000，主笔 32000/12000，摘要 16000/4000，审核 32000/{% if chapter_test_mode %}4000{% else %}6000{% endif %}（输入/输出 Token）。</p>
@@ -45,17 +45,17 @@
     <button type="submit">创建生成任务</button>
   </form>
 {% else %}
-  <p>请先确认创作宪法和官方大纲后再启动生成工作流。</p>
+  <p>请先确认小说设定与创作规则和官方大纲后再启动生成工作流。</p>
 {% endif %}
 </section>
 <section aria-labelledby="history-heading"><h2 id="history-heading">最近生成记录</h2>
 {% if workflow_history %}<ul>{% for item in workflow_history %}<li><a href="/workflows/{{ item.id }}">查看计划 / 正文 / 失败原因</a><span class="badge">{{ workflow_labels.get(item.status, item.status) }}</span> · {{ item.model_name }}</li>{% endfor %}</ul>{% else %}<p>尚未启动过生成任务。</p>{% endif %}
 </section>
 <details{% if diagnostic %} open{% endif %}><summary>模型配置与诊断</summary>
-<section aria-labelledby="diagnostic-heading"><h2 id="diagnostic-heading">Provider 诊断</h2>
+<section aria-labelledby="diagnostic-heading"><h2 id="diagnostic-heading">模型连接检查</h2>
   <form action="/projects/{{ summary.project.id }}/providers/diagnose" method="post">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <p><label for="diagnostic_provider_name">Provider</label><select id="diagnostic_provider_name" name="provider_name"><option value="fake">Fake 演示</option><option value="ollama">Ollama</option><option value="openai">OpenAI</option><option value="qwen">Qwen</option></select></p>
+    <p><label for="diagnostic_provider_name">模型服务商</label><select id="diagnostic_provider_name" name="provider_name"><option value="fake">Fake 演示</option><option value="ollama">Ollama</option><option value="openai">OpenAI</option><option value="qwen">Qwen</option></select></p>
     <p><label for="diagnostic_model_name">模型名称（可选）</label><input id="diagnostic_model_name" name="model_name"></p>
     <button type="submit">运行诊断</button>
   </form>

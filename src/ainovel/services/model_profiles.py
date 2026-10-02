@@ -91,8 +91,8 @@ def validate_profile_input(values: ProfileInput, *, api_key: str | None = None) 
                     or any(ord(c) < 32 or ord(c) == 127 for c in value)):
                 raise ValueError()
         if (type(values.context_limit) is not int or type(values.output_limit) is not int
-                or not 1 <= values.context_limit <= 32000
-                or not 1 <= values.output_limit <= min(12000, values.context_limit)):
+                or not 1 <= values.context_limit <= 2147483647
+                or not 1 <= values.output_limit <= min(64000, values.context_limit)):
             raise ValueError()
         endpoint = normalize_endpoint(values.base_url, values.connection_kind)
         if api_key is not None:

@@ -19,8 +19,8 @@ class ModelProfileVersion(TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint("profile_id", "version_number"),
         CheckConstraint("version_number >= 1"),
-        CheckConstraint("context_limit >= 1 AND context_limit <= 32000"),
-        CheckConstraint("output_limit >= 1 AND output_limit <= 12000 AND output_limit <= context_limit"),
+        CheckConstraint("context_limit >= 1 AND context_limit <= 2147483647"),
+        CheckConstraint("output_limit >= 1 AND output_limit <= 64000 AND output_limit <= context_limit"),
         CheckConstraint("connection_kind IN ('remote', 'loopback')"),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True)

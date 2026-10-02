@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ainovel.db import get_session
+from ainovel.services.llm_diagnostics import diagnostic_rows
 from ainovel.models.prompt import WorkflowPromptSnapshot
 from ainovel.models.project import NovelProject
 from ainovel.models.batch import WritingBatch
@@ -175,6 +176,7 @@ def _workflow_context(
         ),
         "project": project,
         "steps": steps,
+        'llm_diagnostics':{d.get('attempt_id'):d['diagnostic'] for d in diagnostic_rows(session,workflow_id)},
         "attempt_rows": [
             {"attempt": attempt, "step": step_by_id[attempt.step_id]}
             for attempt in attempts

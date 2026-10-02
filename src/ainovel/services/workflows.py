@@ -1,5 +1,6 @@
 from __future__ import annotations
-from ainovel.providers.diagnostics import ResponseFailure, safe_failure_detail
+from ainovel.providers.diagnostics import ResponseFailure, FailureReason, safe_failure_detail, safe_failure_code
+from ainovel.services.llm_diagnostics import failure_details, enforce_cooldown
 
 from collections.abc import Mapping, Callable
 from copy import deepcopy
@@ -12,6 +13,9 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from pydantic import BaseModel
+from ainovel.agents.contracts import PlotPointBatchPlanDraft
+from ainovel.agents.prompts import PLOT_PLANNER_PROMPT
+from ainovel.services.stage_planning import PLOT_FORMAT
 from sqlalchemy import func, select, update, or_
 from sqlalchemy.orm import Session
 
@@ -238,6 +242,36 @@ class _ArtifactValues:
     content_hash: str
 
 
+def planning_schema_for_workflow(session, workflow_id: str) -> type[BaseModel]:
+    workflow = session.get(GenerationWorkflow, workflow_id)
+    if workflow is None:
+        raise ValueError('workflow not found')
+    mapping = session.get(StageWorkflow, workflow_id)
+    if mapping is not None:
+        roadmap = session.get(StageRoadmapVersion, mapping.roadmap_id)
+        if roadmap.payload.get('format') == PLOT_FORMAT:
+            return PlotPointBatchPlanDraft
+    return (V2_AGENT_SCHEMAS if workflow.generation_version == 2 else AGENT_SCHEMAS)['batch_planner']
+
+
+def validate_stage_plan(session, workflow_id: str, payload: dict) -> None:
+    from ainovel.services.stages import StageService
+    workflow = session.get(GenerationWorkflow, workflow_id)
+    plan = planning_schema_for_workflow(session, workflow_id).model_validate(payload)
+    if len(plan.chapters) != workflow.requested_chapters:
+        raise ValueError('plan chapter count mismatch')
+    context = StageService(session).workflow_context(workflow_id)
+    if context is None:
+        return
+    if context.get('format') == PLOT_FORMAT:
+        for chapter, slot in zip(plan.chapters, context['slots'], strict=True):
+            if (chapter.ordinal, chapter.slot_id, chapter.point_id, chapter.point_ordinal) != (slot['ordinal'], slot['node_id'], slot['point_id'], slot['point_ordinal']):
+                raise ValueError('plan chapter slot binding mismatch')
+    elif any(chapter.title != node['title'] or chapter.goal != node['goal']
+             for chapter, node in zip(plan.chapters, context['nodes'], strict=True)):
+        raise ValueError('plan must preserve stage node title and goal')
+
+
 class WorkflowService:
     def __init__(self, session: Session, clock: Clock | None = None) -> None:
         self.session = session
@@ -254,12 +288,15 @@ class WorkflowService:
         generation_version: int = 1,
         model_profile_version_id: str | None = None,
         _before_commit: Callable[[GenerationWorkflow], None] | None = None,
+        _planning_format: str | None = None,
     ) -> GenerationWorkflow:
         self._validate_start_arguments(
             provider_name, model_name, requested_chapters, budgets
         )
         if type(generation_version) is not int or generation_version not in {1, 2}:
             raise ValueError("generation version must be 1 or 2")
+        if _planning_format not in {None, PLOT_FORMAT} or (_planning_format and generation_version != 2):
+            raise ValueError('invalid planning format')
         try:
             initial_state = self._read_valid_start_state(project_id)
         except Exception:
@@ -379,8 +416,8 @@ class WorkflowService:
             else:
                 prompt_service.snapshot_versioned(
                     workflow.id,
-                    V2_BUILTIN_PROMPTS,
-                    V2_AGENT_SCHEMAS,
+                    {**V2_BUILTIN_PROMPTS, 'batch_planner': PLOT_PLANNER_PROMPT} if _planning_format else V2_BUILTIN_PROMPTS,
+                    {**V2_AGENT_SCHEMAS, 'batch_planner': PlotPointBatchPlanDraft} if _planning_format else V2_AGENT_SCHEMAS,
                     self._v2_prompt_parameters(budgets),
                 )
             self.session.add(
@@ -822,9 +859,10 @@ class WorkflowService:
                 .values(
                     status="PAUSED_CONTEXT_OVERFLOW",
                     revision=workflow.revision + 1,
-                    last_error_code="required_context_overflow",
+                    last_error_code=("memory_sources_unavailable" if error.stable_key == "memory_sources_unavailable" else "required_context_overflow"),
                     last_error_detail=(
-                        "required context exceeds the available input budget"
+                        "记忆来源缺失或已失效，请查看输入预览；没有发送模型请求。" if error.stable_key == "memory_sources_unavailable"
+                        else "required context exceeds the available input budget"
                     ),
                 )
             )
@@ -1347,6 +1385,9 @@ class WorkflowService:
         if response is not None:
             self._validate_response(response)
         code, detail, retryable = self._provider_failure(error)
+        diagnostic_details = failure_details(error,attempt_id=attempt_id,now=self.clock.now())
+        if diagnostic_details['diagnostic']['error_category']=='rate_limit' or diagnostic_details['cooldown_seconds']:
+            retryable = False  # Durable pause; no immediate 429 loop or sleeping inside a claim lease.
         now = self._aware_utc(self.clock.now())
         self.session.expire_all()
         attempt = self.session.get(ModelAttempt, attempt_id)
@@ -1458,6 +1499,7 @@ class WorkflowService:
                 or attempt_claim.rowcount != 1
             ):
                 raise ValueError("attempt failure conflict")
+            self._add_audit(workflow.project_id,workflow.id,'llm_call_failed','system',diagnostic_details)
             self.session.commit()
             return workflow
         except Exception:
@@ -1498,6 +1540,8 @@ class WorkflowService:
             self.session.rollback()
             raise ValueError("plan approval requires an active plan artifact")
         self._validate_plan_payload(plan_artifact.payload, workflow.requested_chapters)
+        if self.session.get(StageWorkflow, workflow.id) is not None:
+            validate_stage_plan(self.session, workflow.id, plan_artifact.payload)
         if (
             project is None
             or project.active_workflow_id != workflow.id
@@ -1661,6 +1705,7 @@ class WorkflowService:
             return True
 
     def resume(self, workflow_id: str) -> GenerationWorkflow:
+        enforce_cooldown(self.session,workflow_id,self.clock.now())
         self.session.expire_all()
         workflow = self._get_workflow(workflow_id)
         source_status = workflow.status
@@ -2350,9 +2395,12 @@ class WorkflowService:
                 if workflow.generation_version == 2
                 else AGENT_SCHEMAS
             )
-            payload = schemas[_STEP_PROMPT_ROLES[step.kind]].model_validate(
+            schema = planning_schema_for_workflow(self.session, workflow.id) if step.kind == 'PLANNING' else schemas[_STEP_PROMPT_ROLES[step.kind]]
+            payload = schema.model_validate(
                 payload
             ).model_dump(mode="json", exclude_unset=step.kind == "VALIDATING_CHAPTER")
+            if step.kind == 'PLANNING' and self.session.get(StageWorkflow, workflow.id) is not None:
+                validate_stage_plan(self.session, workflow.id, payload)
         except (KeyError, ValueError, TypeError):
             raise ValueError("artifact payload failed validation") from None
         if step.kind == "WRITING":
@@ -2412,6 +2460,9 @@ class WorkflowService:
     @staticmethod
     def _provider_failure(error: ProviderError) -> tuple[str, str, bool]:
         if isinstance(error, ResponseFailure):
+            if error.reason in {FailureReason.QUOTA, FailureReason.PROVIDER_API, FailureReason.RATE_LIMIT, FailureReason.TEMPORARY, FailureReason.HTTP}:
+                retryable = error.reason in {FailureReason.RATE_LIMIT, FailureReason.TEMPORARY}
+                return safe_failure_code(error), safe_failure_detail(error), retryable
             return "provider_protocol", safe_failure_detail(error), True
         for error_type, code, detail, retryable in _SAFE_PROVIDER_FAILURES:
             if isinstance(error, error_type):

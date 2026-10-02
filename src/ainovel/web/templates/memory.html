@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}小说记忆与约束卡{% endblock %}
+{% block content %}
+<p><a href="/projects/{{ project.id }}">返回项目：{{ project.title }}</a></p>
+<h1>小说记忆与约束卡</h1>
+{% if llm_claim %}<details><summary>本项目有未结束或尚未核对的模型请求</summary>
+<p>仅当所有旧工作进程已停止并已核对供应商用量时，才可核对重启前的规划／写作请求。不会自动重试，用量保持未知。AI 整理请求请到对应整理任务核对。</p>
+<form method="post" action="/projects/{{ project.id }}/memory/reconcile-call"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="owner_id" value="{{ llm_claim.owner_id }}"><label><input type="checkbox" name="author_confirm" value="yes" required>我已停止所有旧工作进程并核对用量</label><button>确认中断并解除旧请求占用</button></form></details>{% endif %}
+<p>完整原文仍保存在项目中。约束卡用较短文字保留规则，写作时再按剧情点选取局部资料。保存草稿不等于批准，也不会调用模型。</p>
+<p>尚未启用自动 AI 提取的项目可在下方明确授权整理；也可继续人工编辑。本地检查不能保证识别所有语义矛盾。</p>
+<section><h2>AI 整理记忆</h2><p>先本地准备分块和预算，不发送原文；确认模型和费用预算后再执行。人工编辑入口始终保留。</p>
+<form method="post" action="/projects/{{ project.id }}/memory/extractions"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>选择模型档案<select name="profile_version_id" required>{% for profile in profiles %}{% if profile.enabled and not profile.revoked %}<option value="{{ profile.version_id }}">{{ profile.name }} · {{ profile.model_name }}</option>{% endif %}{% endfor %}</select></label>{% for entry in pending %}<label><input type="checkbox" name="pending_ids" value="{{ entry.id }}">同时整理正文变化 {{ entry.source_key }}</label>{% endfor %}<button>准备 AI 整理（不调用模型）</button></form>
+{% for job in extraction_jobs %}<p><a href="/memory-extractions/{{ job.id }}">整理任务 · {{ job.created_at }} · {{ job.status }}</a></p>{% endfor %}</section>
+<section><h2>约束卡版本</h2>
+{% for card in cards %}
+<details{% if loop.first %} open{% endif %}><summary>第 {{ card.version_number }} 版 · {{ '作者已确认' if card.status == 'APPROVED' else '待确认草稿' }}{% if card_blockers[card.id] %} · 来源缺失、过期或尚未覆盖{% endif %}</summary>
+{% if not card.entries %}<p class="notice error">这是一张空草稿，没有保存任何精简内容。原设定仍在，但不会自动导入约束卡。</p><p><a href="#memory-editor">去整理原文并填写内容</a></p>{% elif card_blockers[card.id] %}<p>这版卡还不能批准。请补充未覆盖的原文分类后保存新版本。</p><details><summary>查看未覆盖来源的定位信息</summary><ul>{% for blocker in card_blockers[card.id] %}<li>{{ blocker }}</li>{% endfor %}</ul></details>{% endif %}
+{% for entry in card.entries %}<p><strong>{{ entry.kind }}</strong> · {{ '作者级约束（不代表人物知情）' if entry.audience == 'author_only' else '可叙述资料' }}<br>{{ entry.text }}</p>{% endfor %}
+{% if card.status == 'DRAFT' and not card_blockers[card.id] %}<form method="post" action="/projects/{{ project.id }}/memory/cards/{{ card.id }}/approve">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="fingerprint" value="{{ card.source_fingerprint }}">
+<label><input type="checkbox" name="author_confirm" value="yes" required>我已核对原文，确认没有遗漏硬约束，局部关联与揭示范围正确</label>
+<button type="submit">确认这版约束卡（不调用模型）</button></form>{% endif %}
+</details>{% else %}<p>尚无约束卡。先在下方整理原文，再确认保存的草稿。</p>{% endfor %}</section>
+<section id="memory-editor"><h2>整理原文，创建新版本</h2>
+<p>操作顺序：展开原文 → 填写「保留的精简内容」和用途 → 保存草稿 → 核对后批准。只点击保存而不填写内容，不能启用记忆。</p>
+<p>留空的原文不会被当作“不重要”。未分类的设定、大纲和阶段架构会阻止启用。剧情点本身按预留章号自动选择，不必全文复制。</p>
+<form method="post" action="/projects/{{ project.id }}/memory/cards">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="source_fingerprint" value="{{ source_fingerprint }}">
+{% for source in sources %}
+{% if source.needs_classification %}<details><summary>点击展开并填写 · {{ source.ref.source_type }} · {{ source.ref.field_path }} · 原文 {{ source.text|length }} 字符</summary>
+<p class="reading-text">{{ source.text }}</p>
+<label>保留的精简内容<textarea name="text_{{ loop.index0 }}" rows="3"></textarea></label>
+<label>用途<select name="kind_{{ loop.index0 }}"><option value="rule">全局规则（每次必带）</option><option value="character">人物状态</option><option value="fact">局部事实</option><option value="foreshadowing">伏笔</option><option value="summary">剧情结果摘要</option></select></label>
+<label>相关剧情点（逗号分隔；局部资料请填写）<input name="points_{{ loop.index0 }}" placeholder="规划版本ID:p1"></label>
+<label>相关人物或物品 ID（逗号分隔）<input name="entities_{{ loop.index0 }}"></label>
+<label><input type="checkbox" name="locked_{{ loop.index0 }}" value="yes">作者锁定：AI 更新不得覆盖</label>
+<label>知晓范围<select name="audience_{{ loop.index0 }}"><option value="author_only">仅作者规划，不代表人物知情</option><option value="narratable">允许在适用章节叙述</option></select></label>
+</details>{% endif %}{% endfor %}
+<button type="submit">保存为待确认的新版本</button></form>
+<details><summary>高级编辑：修订已有卡、章节范围与原文引用</summary>
+<p>effective_from / effective_until 为全书章号；reveal_from 为最早揭示章号。source_refs 必须匹配原文版本和哈希。修改后保存新版本，旧版不覆盖。</p>
+<form method="post" action="/projects/{{ project.id }}/memory/cards"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<label>约束卡 JSON<textarea name="entries_json" rows="15">{{ entries_json }}</textarea></label><button type="submit">保存修订草稿</button></form>
+</details></section>
+{% if pending %}<section><h2>待人工分类的正文变化</h2><p>以下变化来自已批准章节，但尚未可靠映射到人物、剧情点和有效范围，不会自动成为可检索事实。</p>{% for entry in pending %}<details><summary>待分类 · {{ entry.source_key }}</summary><pre>{{ entry.text }}</pre><pre>{{ entry.source_refs|tojson(indent=2) }}</pre></details>{% endfor %}</section>{% endif %}
+{% endblock %}

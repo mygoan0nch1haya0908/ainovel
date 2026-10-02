@@ -95,6 +95,52 @@ def test_pins_validated_address_preserves_host_and_sni_and_ignores_proxy_env(api
     assert sock.closed
 
 
+def test_response_wait_uses_remaining_request_deadline_not_connect_cap(api, monkeypatch):
+    import ainovel.providers.safe_transport as module
+    clock = [100.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    class SlowSocket(ScriptedSocket):
+        def recv(self, size):
+            if self.response:
+                # A valid non-streaming model may take more than ten seconds.
+                assert self.timeouts[-1] > 10
+                clock[0] += 15
+            return super().recv(size)
+    sock = SlowSocket(response())
+    connector = Connector(sock)
+    result = api.SafeTransport(resolver=lambda *args: ['93.184.216.34'], connector=connector).request_json(
+        normalize_endpoint('https://api.example/v1', 'remote'), 'POST', 'chat/completions',
+        api_key=SENTINEL, payload={}, timeout_seconds=120, max_response_bytes=1024)
+    assert result == {'data': []}
+    assert connector.calls[0][2]['timeout_seconds'] <= 10
+    assert sock.closed
+
+
+def test_response_wait_still_obeys_total_deadline(api, monkeypatch):
+    import ainovel.providers.safe_transport as module
+    clock = [100.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    class ExpiredSocket(ScriptedSocket):
+        def recv(self, size):
+            clock[0] += 121
+            return super().recv(size)
+    sock = ExpiredSocket(response())
+    with pytest.raises(ProviderTimeout):
+        api.SafeTransport(resolver=lambda *args: ['93.184.216.34'], connector=Connector(sock)).request_json(
+            normalize_endpoint('https://api.example/v1', 'remote'), 'POST', 'chat/completions',
+            api_key=SENTINEL, payload={}, timeout_seconds=120, max_response_bytes=1024)
+    assert sock.closed
+
+
+def test_http_failure_preserves_only_status_not_body(api):
+    from ainovel.providers.diagnostics import ResponseFailure, safe_failure_detail
+    with pytest.raises(ResponseFailure) as caught:
+        call(api, response(SENTINEL.encode(), status=b'429 Too Many Requests'))
+    assert caught.value.http_status == 429
+    assert '429' in safe_failure_detail(caught.value)
+    assert SENTINEL not in str(caught.value) + safe_failure_detail(caught.value)
+
+
 def test_mixed_dns_rejection_never_connects_or_sends_key(api):
     sock = ScriptedSocket(response())
     connector = Connector(sock)
@@ -251,6 +297,27 @@ def test_cleanup_error_cannot_expose_secret_or_override_success(api):
         normalize_endpoint('https://api.example', 'remote'), 'GET', 'models', api_key=SENTINEL,
         timeout_seconds=10, max_response_bytes=1024)
     assert result == {'data': []} and sock.closed
+
+
+@pytest.mark.parametrize('body', [b'<html>gateway error</html>', b'```json\n{}\n```', b'[]'])
+def test_invalid_outer_json_has_transport_specific_reason(api, body):
+    from ainovel.providers.diagnostics import ResponseFailure
+    with pytest.raises(ResponseFailure) as caught:
+        call(api, response(body))
+    assert caught.value.reason.value == 'transport_json'
+
+
+@pytest.mark.parametrize('status,body,reason', [
+    (b'429 Too Many Requests', b'{"error":{"code":"insufficient_quota"}}', 'provider_quota'),
+    (b'429 Too Many Requests', b'{"error":{"code":"rate_limit_exceeded"}}', 'provider_rate_limit'),
+    (b'200 OK', b'{"error":{"message":"Insufficient balance"}}', 'provider_quota'),
+    (b'503 Unavailable', b'not json', 'provider_temporary'),
+])
+def test_transport_classifies_provider_error_before_content(api, status, body, reason):
+    from ainovel.providers.diagnostics import ResponseFailure
+    with pytest.raises(ResponseFailure) as caught:
+        call(api, response(body, status=status))
+    assert caught.value.reason.value == reason
 
 
 def test_production_connector_shares_connect_tls_deadline(api, monkeypatch):

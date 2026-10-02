@@ -65,6 +65,12 @@ def test_public_and_sql_are_secret_free_and_save_never_resolves(setup, session, 
         json.dumps(resolved)
 
 
+def test_profile_accepts_author_configured_large_context(setup):
+    service, values, _ = setup
+    created = service.create(replace(values, context_limit=131072), api_key=SENTINEL)
+    assert service.get_public(created.version_id).context_limit == 131072
+
+
 def test_revisions_keep_metadata_and_credentials_bound_to_old_version(setup):
     service, values, vault = setup
     first = service.create(values, api_key=SENTINEL)
@@ -83,8 +89,8 @@ def test_revisions_keep_metadata_and_credentials_bound_to_old_version(setup):
     ({"name": ""}, SENTINEL), ({"name": "x" * 121}, SENTINEL),
     ({"name": SENTINEL}, SENTINEL), ({"model_name": SENTINEL}, SENTINEL),
     ({"model_name": "x" * 256}, SENTINEL), ({"model_name": ""}, SENTINEL),
-    ({"context_limit": 32001}, SENTINEL), ({"context_limit": 0}, SENTINEL),
-    ({"output_limit": 12001}, SENTINEL), ({"output_limit": 0}, SENTINEL),
+    ({"context_limit": 2147483648}, SENTINEL), ({"context_limit": 0}, SENTINEL),
+    ({"output_limit": 32001}, SENTINEL), ({"output_limit": 0}, SENTINEL),
     ({"context_limit": 100, "output_limit": 101}, SENTINEL),
     ({"output_limit": True}, SENTINEL), ({}, None), ({}, ""), ({}, "x" * 8193),
     ({"base_url": "http://example.com/v1"}, SENTINEL),

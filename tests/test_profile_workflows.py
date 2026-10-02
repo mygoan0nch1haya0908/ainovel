@@ -166,7 +166,7 @@ def test_stage_proposal_pins_version_and_batch_inherits_it(profile_setup, sessio
     )
     assert roadmap.model_profile_version_id == version.version_id
     assert roadmap.output_token_limit == 1000
-    assert roadmap.input_token_limit == 7000
+    assert roadmap.input_token_limit == 5976
     roadmap.status = "PROPOSED"
     roadmap.payload = {
         "goal": "goal", "start_state": "start", "end_state": "end",

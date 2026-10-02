@@ -45,7 +45,7 @@ class AgentRunner:
         response = self._validate_provider_response(response)
         try:
             result = result_type.model_validate(response.structured)
-        except ValidationError:
+        except ValidationError as validation_error:
             reason = FailureReason.SCHEMA
             count = None
             if result_type is ChapterDraft:
@@ -60,9 +60,17 @@ class AgentRunner:
                             reason = FailureReason.TOO_SHORT
                         elif count > 6000:
                             reason = FailureReason.TOO_LONG
-            raise ResponseFailure(
+            failure = ResponseFailure(
                 reason, visible_count=count, response=response
-            ) from None
+            )
+            from ainovel.providers.llm_diagnostic import diagnostic_for_error
+            failure.diagnostic = diagnostic_for_error(failure)
+            from ainovel.agents.schema_diagnostics import safe_schema_issues
+            failure.schema_issues = safe_schema_issues(
+                validation_error.errors(include_input=False, include_context=False, include_url=False),
+                result_type.model_json_schema(),
+            )
+            raise failure from None
         return AgentRunResult(result=result, response=response)
 
     @staticmethod

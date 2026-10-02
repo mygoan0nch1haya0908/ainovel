@@ -1,0 +1,17 @@
+{% if diagnostic %}
+<section class="llm-diagnostic">
+<h3>模型调用失败 · 诊断</h3>
+<p>类型：{{ diagnostic.error_category }}；进一步分类：{{ diagnostic.error_subtype }}。</p>
+<p>发生层级：{{ diagnostic.error_layer }}；置信度：{{ diagnostic.confidence }}（medium 为推断，low 表示证据不足）。</p>
+<ul>{% for item in diagnostic.evidence %}<li>{{ item }}</li>{% endfor %}</ul>
+<p>Retry-After：{{ diagnostic.retry_after if diagnostic.retry_after is not none else '未提供' }}{% if diagnostic.retry_after is not none %} 秒{% endif %}。限流后请等待再重试；不会增加尝试次数。</p>
+<ol>{% for item in diagnostic.recommended_actions %}<li>{{ item }}</li>{% endfor %}</ol>
+<details><summary>技术详情（debug）</summary>
+<p>此视图也不包含正文或密钥。{{ diagnostic.metrics_scope }}</p>
+<dl>{% for key in ['model','base_url','http_status','provider_error_code','exception_type','elapsed_seconds','timeout_seconds','request_id','trace_id','cf_ray','sequence','operation_id','attempt','round','message_count','total_chars','estimated_input_tokens','actual_prompt_tokens','completion_tokens','total_tokens','concurrency','requests_last_60s','known_tokens_last_60s','estimated_tokens_last_60s','unknown_usage_requests','operation_calls_last_60s','last_request_interval'] %}<dt>{{ key }}</dt><dd>{{ diagnostic[key] if diagnostic[key] is not none else '未知 / 未记录' }}</dd>{% endfor %}</dl>
+<p>完整用量已知：{{ '是' if diagnostic.usage_known else '否；未知不能当成 0' }}。估算输入 Token 不等于供应商账单。</p>
+<p>实际发送统计仅覆盖本进程，不能排除同一 Key 在其他设备或进程的调用。发送尝试不代表供应商已接受或已计费。</p>
+<dl>{% for key in ['user_request_id','llm_call_id','send_timestamp','pid','thread_id','user_request_actual_calls','actual_process_concurrency','actual_model_concurrency','actual_peak_concurrency_last_60s','actual_requests_last_10s','actual_requests_last_60s','actual_requests_last_300s','actual_process_requests_last_60s','actual_estimated_tokens_last_60s','actual_known_tokens_last_300s'] %}<dt>{{ key }}</dt><dd>{{ diagnostic.get(key) if diagnostic.get(key) is not none else '未知 / 未记录' }}</dd>{% endfor %}</dl>
+</details>
+</section>
+{% endif %}

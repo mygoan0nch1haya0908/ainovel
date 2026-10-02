@@ -193,6 +193,19 @@ def approved_plan_workflow(orchestrator, workflow, session, clock):
     return session.get(GenerationWorkflow, workflow.id)
 
 
+def test_quota_pauses_workflow_without_a_second_dispatch(session_factory, workflow, session, clock):
+    from ainovel.providers.llm_response import LLMQuotaError
+    provider = FakeProvider([LLMQuotaError()])
+    runner = make_orchestrator(session_factory, provider, clock)
+    first = runner.run_until_blocked(workflow.id)
+    assert first.status == 'PAUSED_PROVIDER'
+    second = runner.run_until_blocked(workflow.id)
+    assert second.status == 'PAUSED_PROVIDER'
+    assert len(provider.requests) == 1
+    session.expire_all()
+    assert session.get(GenerationWorkflow, workflow.id).last_error_code == 'provider_quota'
+
+
 def make_request_for_digest() -> ModelRequest:
     return ModelRequest(
         model="m",

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from dataclasses import replace
 from time import perf_counter
 
 from ainovel.providers.contracts import (
@@ -16,7 +17,9 @@ from ainovel.providers.contracts import (
 )
 from ainovel.providers.diagnostics import FailureReason, ResponseFailure
 from ainovel.providers.endpoint_policy import Endpoint, normalize_endpoint
-from ainovel.providers.safe_transport import SafeTransport, parse_json_object
+from ainovel.providers.safe_transport import SafeTransport
+from ainovel.providers.llm_response import LLMProviderError, check_provider_error, parse_llm_json_response, log_diagnostic
+from ainovel.providers.request_diagnostics import trace_request, messages_for, note_response
 
 
 class CompatibleProvider:
@@ -26,8 +29,8 @@ class CompatibleProvider:
         if (normalize_endpoint(endpoint.base_url, endpoint.kind) != endpoint
                 or not isinstance(model_name, str) or not 1 <= len(model_name) <= 255
                 or any(ord(c) < 32 or ord(c) == 127 for c in model_name)
-                or type(context_window_limit) is not int or not 1 <= context_window_limit <= 32000
-                or type(max_output_tokens_limit) is not int or not 1 <= max_output_tokens_limit <= 12000
+                or type(context_window_limit) is not int or not 1 <= context_window_limit <= 2147483647
+                or type(max_output_tokens_limit) is not int or not 1 <= max_output_tokens_limit <= 64000
                 or max_output_tokens_limit > context_window_limit
                 or type(allow_real_calls) is not bool
                 or (api_key is not None and (not isinstance(api_key, str) or not 1 <= len(api_key) <= 8192
@@ -75,24 +78,43 @@ class CompatibleProvider:
             raise ProviderAuthenticationError('model calls are disabled or credentials are missing')
         try:
             result = self._transport.request_json(self._endpoint, method, path, api_key=self._api_key,
-                payload=payload, timeout_seconds=min(timeout_seconds, 180.0), max_response_bytes=max_response_bytes)
+                payload=payload, timeout_seconds=min(timeout_seconds, 600.0), max_response_bytes=max_response_bytes)
             self._reject_secret(result)
             if not isinstance(result, dict):
                 raise ProviderProtocolError('model returned an invalid response')
+            note_response(result)
+            check_provider_error(result)
             return result
         except ProviderAuthenticationError:
             raise ProviderAuthenticationError('model authentication failed') from None
-        except ProviderTimeout:
-            raise ProviderTimeout('model request timed out') from None
+        except ProviderTimeout as error:
+            raise ProviderTimeout('model request timed out', source=error.source, phase=error.phase,
+                                  http_status=error.http_status) from None
+        except ResponseFailure as error:
+            if isinstance(error, LLMProviderError):
+                raise
+            raise ResponseFailure(error.reason, http_status=getattr(error, 'http_status', None)) from None
         except ProviderProtocolError:
             raise ProviderProtocolError('model returned an invalid or unsafe response') from None
+        except ProviderUnavailable:
+            raise
         except Exception:
             raise ProviderUnavailable('model service is unavailable') from None
 
     def generate(self, request: ModelRequest) -> ModelResponse:
-        return self._generate(request, max_response_bytes=2097152)
+        try:
+            self._validate_request(request)
+            if not self._ready():
+                raise ProviderAuthenticationError('model calls are disabled or credentials are missing')
+            with trace_request(request, self._endpoint.base_url, self._api_key) as trace:
+                response = self._generate(request, max_response_bytes=2097152)
+            return replace(response, diagnostic=trace['diagnostic'])
+        except Exception as error:
+            log_diagnostic(model=self._model, base_url=self._endpoint.base_url,
+                           api_key=self._api_key, exception_type=type(error).__name__)
+            raise
 
-    def _generate(self, request: ModelRequest, *, max_response_bytes: int) -> ModelResponse:
+    def _validate_request(self, request: ModelRequest):
         if (request.model != self._model
                 or type(request.max_output_tokens) is not int or not 1 <= request.max_output_tokens <= self._output
                 or type(request.max_input_tokens) is not int or not 1 <= request.max_input_tokens <= self._context
@@ -100,11 +122,11 @@ class CompatibleProvider:
                 or isinstance(request.timeout_seconds, bool) or not isinstance(request.timeout_seconds, (int, float))
                 or not math.isfinite(request.timeout_seconds) or request.timeout_seconds <= 0):
             raise ProviderProtocolError('invalid model request budget or model')
+
+    def _generate(self, request: ModelRequest, *, max_response_bytes: int) -> ModelResponse:
+        self._validate_request(request)
         try:
-            schema = json.dumps(request.output_schema, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
-            payload = {'model': self._model, 'messages': [
-                {'role': 'system', 'content': f'{request.system_prompt}\n\nReturn only one JSON object matching this schema:\n{schema}'},
-                {'role': 'user', 'content': json.dumps(request.input_payload, ensure_ascii=False, allow_nan=False, separators=(',', ':'))}],
+            payload = {'model': self._model, 'messages': messages_for(request),
                 'response_format': {'type': 'json_object'}, 'max_tokens': request.max_output_tokens}
             self._reject_secret(payload)
         except Exception:
@@ -112,6 +134,7 @@ class CompatibleProvider:
         started = perf_counter()
         result = self._dispatch('POST', 'chat/completions', payload=payload,
             timeout_seconds=request.timeout_seconds, max_response_bytes=max_response_bytes)
+        note_response(result)
         response_id = result.get('id')
         if not isinstance(response_id, str) or not re.fullmatch(r'[A-Za-z0-9_.:/-]{1,255}', response_id):
             response_id = None
@@ -140,12 +163,8 @@ class CompatibleProvider:
             if message.get('refusal') is not None:
                 raise ResponseFailure(FailureReason.REFUSED)
             content = message.get('content')
-            if not isinstance(content, str) or not content.strip():
-                raise ResponseFailure(FailureReason.EMPTY)
-            try:
-                structured = parse_json_object(content)
-            except (ValueError, RecursionError):
-                raise ResponseFailure(FailureReason.JSON) from None
+            log_diagnostic(model=self._model, base_url=self._endpoint.base_url, content=content, api_key=self._api_key)
+            structured = parse_llm_json_response(content, api_key=self._api_key)
             self._reject_secret(structured)
             if response_id is None or metadata.input_tokens is None or metadata.output_tokens is None:
                 raise ResponseFailure(FailureReason.METADATA)

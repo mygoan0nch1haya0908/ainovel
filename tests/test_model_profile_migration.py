@@ -7,6 +7,36 @@ from sqlalchemy import inspect, text
 from ainovel.db import create_engine_for_url, database_readiness
 
 
+def test_context_migration_preserves_profiles_and_other_checks(tmp_path, monkeypatch):
+    import pytest
+    from sqlalchemy.exc import IntegrityError
+    url = f"sqlite+pysqlite:///{tmp_path / 'context.db'}"
+    monkeypatch.setenv("AINOVEL_DATABASE_URL", url)
+    config = Config("alembic.ini")
+    command.upgrade(config, "0006_model_profile_bindings")
+    engine = create_engine_for_url(url)
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO model_profiles (id,revision,revoked,created_at,updated_at) VALUES ('p',1,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"))
+        conn.execute(text("INSERT INTO model_profile_versions (id,profile_id,version_number,name,base_url,connection_kind,protocol,model_name,context_limit,output_limit,enabled,revoked,created_at,updated_at) VALUES ('v','p',1,'test','https://example.com','remote','chat_completions_json_object','test',32000,8000,1,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"))
+    command.upgrade(config, "head")
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE model_profile_versions SET context_limit=131072 WHERE id='v'"))
+        conn.execute(text("UPDATE model_profile_versions SET output_limit=32000 WHERE id='v'"))
+        assert conn.execute(text("SELECT profile_id FROM model_profile_versions WHERE id='v'")).scalar_one() == 'p'
+        with pytest.raises(IntegrityError):
+            conn.execute(text("UPDATE model_profile_versions SET output_limit=64001 WHERE id='v'"))
+    with pytest.raises(ValueError):
+        command.downgrade(config, "0006_model_profile_bindings")
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE model_profile_versions SET output_limit=8000 WHERE id='v'"))
+        conn.execute(text("UPDATE model_profile_versions SET context_limit=32000 WHERE id='v'"))
+    command.downgrade(config, "0006_model_profile_bindings")
+    with engine.begin() as conn:
+        with pytest.raises(IntegrityError):
+            conn.execute(text("UPDATE model_profile_versions SET context_limit=131072 WHERE id='v'"))
+    engine.dispose()
+
+
 def test_profile_migration_preserves_0004_data_and_downgrades(tmp_path, monkeypatch):
     url = f"sqlite+pysqlite:///{tmp_path / 'profile-migration.db'}"
     monkeypatch.setenv("AINOVEL_DATABASE_URL", url)

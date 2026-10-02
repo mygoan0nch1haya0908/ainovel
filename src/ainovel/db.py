@@ -6,7 +6,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 
-ALEMBIC_HEAD_REVISION = "0006_model_profile_bindings"
+ALEMBIC_HEAD_REVISION = "0010_memory_extraction"
 
 
 def create_engine_for_url(database_url: str) -> Engine:

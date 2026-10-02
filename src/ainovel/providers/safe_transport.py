@@ -23,6 +23,9 @@ from ainovel.providers.contracts import (
     ProviderTimeout, ProviderUnavailable,
 )
 from ainovel.providers.endpoint_policy import Endpoint, normalize_endpoint, resolve_endpoint
+from ainovel.providers.diagnostics import ResponseFailure, FailureReason
+from ainovel.providers.llm_response import check_provider_error, LLMProviderError, log_diagnostic, parse_json_object
+from ainovel.providers.request_diagnostics import note_transport, note_response, note_actual_send
 
 _DNS_SLOTS = threading.BoundedSemaphore(4)
 
@@ -32,24 +35,6 @@ def _remaining(deadline: float, cap: float = 10.0) -> float:
     if remaining <= 0:
         raise ProviderTimeout('model request timed out')
     return min(cap, remaining)
-
-
-def _reject_constant(value):
-    raise ValueError('invalid JSON constant')
-
-
-def _finite_float(value):
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError('invalid JSON number')
-    return result
-
-
-def parse_json_object(data: str | bytes) -> dict:
-    result = json.loads(data, parse_constant=_reject_constant, parse_float=_finite_float)
-    if not isinstance(result, dict):
-        raise ValueError('JSON object required')
-    return result
 
 
 class PinnedConnector:
@@ -82,7 +67,7 @@ class _DeadlineReader(io.RawIOBase):
         return True
 
     def readinto(self, buffer):
-        self._sock.settimeout(_remaining(self._deadline))
+        self._sock.settimeout(_remaining(self._deadline, cap=600.0))
         data = self._sock.recv(len(buffer))
         _remaining(self._deadline)
         buffer[:len(data)] = data
@@ -174,6 +159,8 @@ class SafeTransport:
                      api_key: str | None, payload=None, timeout_seconds: float,
                      max_response_bytes: int) -> dict:
         sock = response = None
+        status = None
+        phase = 'dns'
         try:
             if (not isinstance(endpoint, Endpoint)
                     or normalize_endpoint(endpoint.base_url, endpoint.kind) != endpoint
@@ -184,7 +171,7 @@ class SafeTransport:
                     or (api_key is not None and (not isinstance(api_key, str) or len(api_key) > 8192
                         or any(ord(c) < 33 or ord(c) > 126 for c in api_key)))):
                 raise ProviderProtocolError('invalid model request configuration')
-            deadline = time.monotonic() + min(timeout_seconds, 180.0)
+            deadline = time.monotonic() + min(timeout_seconds, 600.0)
             body = b'' if payload is None else json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode('utf-8')
             authority = urlsplit(endpoint.base_url).netloc
             headers = [f'{method} {endpoint.path}/{relative_path} HTTP/1.1',
@@ -194,19 +181,27 @@ class SafeTransport:
             if payload is not None:
                 headers.extend(['Content-Type: application/json', f'Content-Length: {len(body)}'])
             wire = ('\r\n'.join(headers) + '\r\n\r\n').encode('ascii') + body
+            note_transport(phase=phase)
             addresses = self._resolve(endpoint, deadline)
+            phase = 'connect'
+            note_transport(phase=phase)
             sock = self._connector.connect(addresses[0], endpoint.port, timeout_seconds=_remaining(deadline),
                 tls_server_name=endpoint.host if endpoint.base_url.startswith('https:') else None)
+            phase = 'write'
+            note_transport(phase=phase)
             sock.settimeout(_remaining(deadline))
+            note_actual_send()
             sock.sendall(wire)
             _remaining(deadline)
             response = http.client.HTTPResponse(_ResponseSocket(sock, deadline), method=method)
+            phase = 'response_headers'
+            note_transport(phase=phase)
             response.begin()
             _remaining(deadline)
-            if response.status in (401, 403):
-                raise ProviderAuthenticationError('model authentication failed')
-            if not 200 <= response.status < 300:
-                raise ProviderProtocolError('model returned an unsuccessful HTTP response')
+            status = response.status
+            note_transport(status=status, headers=response.headers, api_key=api_key)
+            if not 200 <= status < 300:
+                max_response_bytes = min(max_response_bytes, 65536)
             lengths = response.headers.get_all('Content-Length', [])
             encodings = response.headers.get_all('Transfer-Encoding', [])
             if (response.headers.defects or response.headers.get_all('Content-Encoding') or len(lengths) > 1 or len(encodings) > 1
@@ -217,6 +212,8 @@ class SafeTransport:
                 raise ProviderProtocolError('model response exceeds allowed size or has invalid framing')
             chunks = []
             size = 0
+            phase = 'response_body'
+            note_transport(phase=phase)
             if response.chunked:
                 chunks.append(_chunked_body(response.fp, deadline, max_response_bytes))
             while not response.chunked:
@@ -230,13 +227,33 @@ class SafeTransport:
                 if size > max_response_bytes:
                     raise ProviderProtocolError('model response exceeds allowed size')
                 chunks.append(chunk)
-            result = parse_json_object(b''.join(chunks).decode('utf-8'))
+            try:
+                raw = b''.join(chunks).decode('utf-8')
+                if not 200 <= status < 300:
+                    log_diagnostic(model=(payload or {}).get('model', ''), base_url=endpoint.base_url,
+                                   content=raw, api_key=api_key, exception_type='HTTPError')
+                result = parse_json_object(raw)
+            except (ValueError, UnicodeError, RecursionError):
+                if not 200 <= status < 300:
+                    check_provider_error({}, status=status)
+                raise ResponseFailure(FailureReason.TRANSPORT_JSON) from None
             _remaining(deadline)
+            if result.get('error') is not None and 200 <= status < 300:
+                log_diagnostic(model=(payload or {}).get('model', ''), base_url=endpoint.base_url,
+                               content=raw, api_key=api_key, exception_type='APIError')
+            note_response(result)
+            check_provider_error(result, status=status)
             return result
-        except ProviderError:
+        except ProviderTimeout as error:
+            if error.source == 'upstream':
+                raise
+            raise ProviderTimeout('model request timed out', source='client', phase=phase, http_status=status) from None
+        except ProviderError as error:
+            if status is not None and not 200 <= status < 300 and not isinstance(error, (LLMProviderError, ProviderAuthenticationError)):
+                check_provider_error({}, status=status)
             raise
         except (TimeoutError, socket.timeout):
-            raise ProviderTimeout('model request timed out') from None
+            raise ProviderTimeout('model request timed out', source='client', phase=phase, http_status=status) from None
         except (ValueError, UnicodeError, http.client.HTTPException, RecursionError):
             raise ProviderProtocolError('model returned an invalid response') from None
         except Exception:

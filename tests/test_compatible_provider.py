@@ -51,6 +51,55 @@ def request():
         1000, 256, 5.0, {})
 
 
+def test_configured_large_context_can_dispatch_above_old_ceiling(api):
+    p, transport = provider(api, reply(), context_window_limit=131072)
+    result = p.generate(replace(request(), max_input_tokens=64000))
+    assert result.structured["summary"] == "valid"
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.parametrize('fence', ['```json', '```', '```JSON'])
+def test_complete_fenced_object_is_validated_without_retry(api, fence):
+    p, t = provider(api, reply(fence + '\n{"summary":"valid","state_delta":{"chapter":1}}\n```'))
+    result = AgentRunner().run(p, request(), ChapterSummaryDelta)
+    assert result.summary == 'valid'
+    assert len(t.calls) == 1
+
+
+@pytest.mark.parametrize('content', ['explanation\n{}', '```json\n{}', '```json\n{}\n```\nextra', '{} {}', '[]', '```json\n{"x":NaN}\n```'])
+def test_invalid_model_json_is_classified_without_repair(api, content):
+    p, t = provider(api, reply(content))
+    with pytest.raises(ResponseFailure) as caught:
+        p.generate(request())
+    assert caught.value.reason.value == 'model_content_json'
+    assert caught.value.response.text is None
+    assert len(t.calls) == 1
+
+
+def test_fenced_invalid_schema_still_fails(api):
+    p, _ = provider(api, reply('```json\n{"summary":12,"state_delta":{}}\n```'))
+    with pytest.raises(ResponseFailure) as caught:
+        AgentRunner().run(p, request(), ChapterSummaryDelta)
+    assert caught.value.reason.value == 'schema_mismatch'
+
+
+@pytest.mark.parametrize('data', [reply('Your trial quota has been exhausted'), {'error': {'message': 'Insufficient balance'}}])
+def test_quota_is_preserved_and_never_retried(api, data):
+    from ainovel.providers.llm_response import LLMQuotaError
+    p, t = provider(api, data)
+    with pytest.raises(LLMQuotaError):
+        p.generate(request())
+    assert len(t.calls) == 1
+
+
+def test_dispatch_preserves_safe_http_reason(api):
+    from ainovel.providers.diagnostics import ResponseFailure, FailureReason
+    failure = ResponseFailure(FailureReason.HTTP)
+    p, _ = provider(api, failure)
+    with pytest.raises(ResponseFailure):
+        p.generate(request())
+
+
 def test_local_diagnosis_and_capabilities_never_dispatch(api):
     p, t = provider(api, RuntimeError('network forbidden'))
     assert p.diagnose().available
@@ -80,7 +129,7 @@ def test_generic_wire_uses_schema_json_object_no_vendor_options_and_local_valida
     assert caught.value.reason.value == 'schema_mismatch'
 
 
-@pytest.mark.parametrize('content,finish,reason', [('not JSON','stop','response_json'), ('{}','length','response_truncated'), ('{}','content_filter','response_refused')])
+@pytest.mark.parametrize('content,finish,reason', [('not JSON','stop','model_content_json'), ('{}','length','response_truncated'), ('{}','content_filter','response_refused')])
 def test_failures_keep_only_safe_usage(api, content, finish, reason):
     p, _ = provider(api, reply(content, finish))
     with pytest.raises(ResponseFailure) as caught:

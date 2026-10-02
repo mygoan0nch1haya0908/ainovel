@@ -34,6 +34,7 @@ class ModelResponse:
     input_tokens: int | None
     output_tokens: int | None
     latency_ms: int
+    diagnostic: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -56,7 +57,11 @@ class ProviderAuthenticationError(ProviderError):
 
 
 class ProviderTimeout(ProviderError):
-    pass
+    def __init__(self, message='model request timed out', *, source='unknown', phase='unknown', http_status=None):
+        super().__init__(message)
+        self.source = source if source in {'client', 'upstream'} else 'unknown'
+        self.phase = phase if phase in {'dns', 'connect', 'write', 'response_headers', 'response_body'} else 'unknown'
+        self.http_status = http_status if type(http_status) is int and 100 <= http_status <= 599 else None
 
 
 class ProviderProtocolError(ProviderError):

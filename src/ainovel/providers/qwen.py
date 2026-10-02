@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from ainovel.providers.request_diagnostics import trace_request,note_sdk_response
+from ainovel.providers.llm_response import attach_sdk_diagnostic
 from collections.abc import Mapping
 from time import perf_counter
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AuthenticationError, OpenAI
 from ainovel.providers.diagnostics import FailureReason, ResponseFailure
+from ainovel.providers.llm_response import LLMFormatError, parse_llm_json_response, raise_sdk_status_error, log_diagnostic, check_sdk_response_error
 
 from ainovel.providers.contracts import (
     ModelRequest,
@@ -72,6 +76,18 @@ class QwenProvider:
         )
 
     def generate(self, request: ModelRequest) -> ModelResponse:
+        try:
+            if not self._allow_real_calls or not self._api_key_configured:
+                return self._generate(request)
+            with trace_request(request,str(getattr(self._client,'base_url','')),getattr(self._client,'api_key',None)) as trace:
+                response=self._generate(request)
+            return replace(response,diagnostic=trace['diagnostic'])
+        except Exception as error:
+            log_diagnostic(model=request.model, base_url=getattr(self._client, 'base_url', ''),
+                           api_key=getattr(self._client, 'api_key', None), exception_type=type(error).__name__)
+            raise
+
+    def _generate(self, request: ModelRequest) -> ModelResponse:
         if not self._allow_real_calls:
             raise ProviderAuthenticationError("Qwen calls are disabled")
         if not self._api_key_configured:
@@ -85,6 +101,8 @@ class QwenProvider:
         system_content = f"{request.system_prompt}\n\n{JSON_INSTRUCTION}\n{schema}"
         started = perf_counter()
         try:
+            from ainovel.providers.request_diagnostics import note_actual_send
+            note_actual_send()
             response = self._client.chat.completions.create(
                 model=request.model,
                 messages=[
@@ -103,15 +121,17 @@ class QwenProvider:
                 max_tokens=request.max_output_tokens,
                 timeout=request.timeout_seconds,
             )
-        except AuthenticationError:
-            raise ProviderAuthenticationError("Qwen authentication failed") from None
-        except APITimeoutError:
-            raise ProviderTimeout("Qwen request timed out") from None
+        except AuthenticationError as error:
+            raise attach_sdk_diagnostic(ProviderAuthenticationError("Qwen authentication failed"),error,model=request.model,client=self._client) from None
+        except APITimeoutError as error:
+            raise attach_sdk_diagnostic(ProviderTimeout("Qwen request timed out"),error,model=request.model,client=self._client) from None
         except APIConnectionError:
             raise ProviderUnavailable("Qwen service is unavailable") from None
-        except APIStatusError:
-            raise ResponseFailure(FailureReason.HTTP) from None
+        except APIStatusError as error:
+            raise_sdk_status_error(error, model=request.model, client=self._client)
 
+        note_sdk_response(response,api_key=getattr(self._client,'api_key',None))
+        check_sdk_response_error(response)
         # Validate metadata independently before parsing potentially invalid content.
         provider_response_id = getattr(response, "id", None)
         if not isinstance(provider_response_id, str) or not provider_response_id.strip():
@@ -145,14 +165,13 @@ class QwenProvider:
             content = message.content
             if not isinstance(content, str) or not content.strip():
                 raise ResponseFailure(FailureReason.EMPTY)
-            try:
-                structured = json.loads(content)
-            except ValueError:
-                raise ResponseFailure(FailureReason.JSON) from None
-            if not isinstance(structured, dict):
-                raise ResponseFailure(FailureReason.JSON)
+            log_diagnostic(model=request.model, base_url=getattr(self._client, 'base_url', ''),
+                           content=content, api_key=getattr(self._client, 'api_key', None))
+            structured = parse_llm_json_response(content, api_key=getattr(self._client, 'api_key', None))
         except ResponseFailure as error:
             error.response = metadata
+            if isinstance(error, LLMFormatError):
+                error.args = ('Qwen returned malformed structured output',)
             raise
         except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
             raise ResponseFailure(FailureReason.ENVELOPE, response=metadata) from None

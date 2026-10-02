@@ -44,7 +44,7 @@ def summary_request() -> ModelRequest:
 
 @pytest.mark.parametrize(('reply', 'reason'), [
     ('length', 'response_truncated'),
-    ('refusal', 'response_refused'), ('json', 'response_json'),
+    ('refusal', 'response_refused'), ('json', 'model_content_json'),
     ('empty', 'response_empty'), ('metadata', 'response_metadata'),
     ('finish', 'response_finish'), ('envelope', 'response_envelope'),
 ])

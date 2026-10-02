@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from ainovel.providers.request_diagnostics import trace_request,note_sdk_response
+from ainovel.providers.llm_response import attach_sdk_diagnostic
 from collections.abc import Mapping
 from time import perf_counter
 from typing import Any
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AuthenticationError, OpenAI
+from ainovel.providers.llm_response import parse_llm_json_response, raise_sdk_status_error, log_diagnostic, check_sdk_response_error
 
 from ainovel.providers.contracts import (
     ModelRequest,
@@ -60,6 +64,19 @@ class OpenAIProvider:
         )
 
     def generate(self, request: ModelRequest) -> ModelResponse:
+        try:
+            if not self._allow_real_calls or getattr(self._client,'api_key',object()) in (None,''):
+                return self._generate(request)
+            messages=[{'role':'system','content':request.system_prompt},{'role':'user','content':json.dumps(request.input_payload,ensure_ascii=False)}]
+            with trace_request(request,str(getattr(self._client,'base_url','')),getattr(self._client,'api_key',None),messages=messages,response_format='json_schema') as trace:
+                response=self._generate(request)
+            return replace(response,diagnostic=trace['diagnostic'])
+        except Exception as error:
+            log_diagnostic(model=request.model, base_url=getattr(self._client, 'base_url', ''),
+                           api_key=getattr(self._client, 'api_key', None), exception_type=type(error).__name__)
+            raise
+
+    def _generate(self, request: ModelRequest) -> ModelResponse:
         if not self._allow_real_calls:
             raise ProviderAuthenticationError("OpenAI calls are disabled")
         api_key = getattr(self._client, "api_key", object())
@@ -68,6 +85,8 @@ class OpenAIProvider:
 
         started = perf_counter()
         try:
+            from ainovel.providers.request_diagnostics import note_actual_send
+            note_actual_send()
             response = self._client.responses.create(
                 model=request.model,
                 instructions=request.system_prompt,
@@ -84,21 +103,23 @@ class OpenAIProvider:
                 timeout=request.timeout_seconds,
             )
         except AuthenticationError as error:
-            raise ProviderAuthenticationError("OpenAI authentication failed") from None
+            raise attach_sdk_diagnostic(ProviderAuthenticationError("OpenAI authentication failed"),error,model=request.model,client=self._client) from None
         except APITimeoutError as error:
-            raise ProviderTimeout("OpenAI request timed out") from None
+            raise attach_sdk_diagnostic(ProviderTimeout("OpenAI request timed out"),error,model=request.model,client=self._client) from None
         except APIConnectionError as error:
             raise ProviderUnavailable("OpenAI service is unavailable") from None
         except APIStatusError as error:
-            raise ProviderProtocolError("OpenAI returned an unsuccessful response") from None
+            raise_sdk_status_error(error, model=request.model, client=self._client)
 
+        note_sdk_response(response,responses_api=True,api_key=getattr(self._client,'api_key',None))
+        check_sdk_response_error(response)
         try:
             output_text = response.output_text
             if not isinstance(output_text, str):
                 raise ValueError("output text is not a string")
-            structured = json.loads(output_text)
-            if not isinstance(structured, dict):
-                raise ValueError("structured response is not an object")
+            log_diagnostic(model=request.model, base_url=getattr(self._client, 'base_url', ''),
+                           content=output_text, api_key=getattr(self._client, 'api_key', None))
+            structured = parse_llm_json_response(output_text, api_key=getattr(self._client, 'api_key', None))
         except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise ProviderProtocolError("OpenAI returned malformed structured output") from None
 
