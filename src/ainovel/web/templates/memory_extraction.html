@@ -1,0 +1,25 @@
+{% extends 'base.html' %}
+{% block title %}AI 整理记忆进度{% endblock %}
+{% block content %}
+<p><a href="/projects/{{ job.project_id }}/memory">返回记忆与人工编辑</a></p>
+<h1>AI 整理记忆</h1>
+<p>当前状态：{{ job.status }} · {{ chunks|length }} 块。单块配置上限：输入 64000／输出 64000 tokens，实际按模型档案限制取小值。</p>
+<p>模型：{{ job.snapshot.profile.model }} · 接口：{{ job.snapshot.profile.base_url }}</p>
+<p>剩余全部块输出预留合计 {{ output_budget }} tokens；每批最多8次串行调用、512000输出预留。预算不是实际用量。不自动重试，不自动批准。</p>
+<details><summary>查看发送范围与每块预算</summary>{% for chunk in chunks %}<p>第{{ loop.index }}块 · {{ chunk.status }} · {{ chunk.snapshot.source.ref.source_type }} / {{ chunk.snapshot.source.ref.field_path }} · 输入上限{{ chunk.snapshot.request.max_input_tokens }}／输出{{ chunk.snapshot.request.max_output_tokens }}</p><details><summary>本块原文</summary><pre>{{ chunk.snapshot.source.text }}</pre></details>{% endfor %}</details>
+{% if job.status in ['DRAFT', 'PAUSED'] %}
+<form method="post" action="/memory-extractions/{{ job.id }}/authorize">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project_id" value="{{ job.project_id }}"><input type="hidden" name="revision" value="{{ job.revision }}"><input type="hidden" name="authorization_id" value="{{ authorization_id }}">
+<label><input type="checkbox" name="author_confirm" value="yes" required>允许将上述资料发送到所选接口，最多8次；可能计费。失败或超时后，我已核对用量才再次授权。</label><button>授权本批整理（授权本身不发送）</button></form>
+{% endif %}
+{% if job.status == 'READY' and auth %}
+<form id="extraction-step" method="post" action="/memory-extractions/{{ job.id }}/step">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project_id" value="{{ job.project_id }}"><input type="hidden" name="revision" value="{{ job.revision }}"><input type="hidden" name="authorization_id" value="{{ auth.id }}">
+<button type="submit">只执行下一块</button><button type="button" id="extraction-run">开始本批串行整理（最多8次）</button><p id="extraction-progress" role="status"></p></form>
+<script src="/static/memory_extraction.js" defer></script>{% endif %}
+{% if job.status == 'RUNNING' or (job.status == 'CANCELLED' and attempts|selectattr('status', 'equalto', 'RUNNING')|list) %}<p>请求尚未确认结束；取消只停止后续分块，刷新不会重新发送。服务重启后的未结束记录需核对，未知用量不按0计算。</p>
+<form method="post" action="/memory-extractions/{{ job.id }}/interrupted"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project_id" value="{{ job.project_id }}"><input type="hidden" name="revision" value="{{ job.revision }}"><label><input type="checkbox" name="author_confirm" value="yes" required>已确认旧服务停止且核对供应商用量</label><button>标记重启前的中断请求</button></form>{% endif %}
+<p><a href="/memory-extractions/{{ job.id }}/diff">查看候选差异并人工编辑</a></p>
+{% if job.status not in ['CANCELLED','MERGED'] %}<form method="post" action="/memory-extractions/{{ job.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project_id" value="{{ job.project_id }}"><input type="hidden" name="revision" value="{{ job.revision }}"><button>取消后续整理（不能保证上游停止计费）</button></form>{% endif %}
+<h2>请求记录</h2>{% for attempt in attempts %}<p>{{ attempt.started_at }} · {{ attempt.status }} · {{ attempt.error_code or '' }} · 输入{{ attempt.input_tokens if attempt.input_tokens is not none else '未知' }}／输出{{ attempt.output_tokens if attempt.output_tokens is not none else '未知' }}</p>{% else %}<p>尚未发送模型请求。</p>{% endfor %}
+{% endblock %}

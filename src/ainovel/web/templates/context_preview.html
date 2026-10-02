@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}写作输入预览{% endblock %}
+{% block content %}
+<p><a href="/workflows/{{ workflow.id }}">返回工作流，手动继续生成</a> · <a href="/projects/{{ workflow.project_id }}/memory">编辑小说记忆与约束卡</a></p>
+<h1>预览精简后的写作输入</h1>
+<p>当前模式：{{ '按剧情点检索记忆' if policy and policy.strategy == 'scoped_story_v1' else '旧版完整资料模式' }}。此页只做本地检查，不调用模型，不自动继续任务。</p>
+<form method="get"><label>用于预览的约束卡<select name="card_id">{% for card in cards %}<option value="{{ card.id }}"{% if card.id == selected_card_id %} selected{% endif %}>第 {{ card.version_number }} 版 · {{ card.status }}</option>{% endfor %}</select></label><button type="submit">更新预览</button></form>
+{% if preview %}
+<h2>本地估算，不是供应商实际用量</h2>
+<p>旧版固定输入估算：{{ preview.legacy_estimated_tokens }} tokens（不含旧检索包，不能视为完整旧请求）；新输入：{{ preview.estimated_tokens }} tokens；可用输入预算：{{ preview.capacity }}；必需内容缺口：{{ preview.deficit }}。</p>
+{% if preview.blockers %}<ul class="notice error">{% for blocker in preview.blockers %}<li>{{ blocker }}</li>{% endfor %}</ul>{% endif %}
+<h2>本次会带入什么</h2>
+{% for item in preview['items'] %}<details><summary>{{ item.kind }} · {{ '必需' if item.required else '可选' }} · {{ '选中' if item.selected else '排除' }} · 约 {{ item.estimated_tokens }} tokens</summary><p>{{ item.reason }} · {{ item.get('state_scope', 'official') }} · {{ item.get('audience', '') }}</p>{% if item.get('trim_reason') %}<p>排除原因：{{ {'budget': '输入预算不足', 'paragraph_too_long': '历史段落过长，不截断原文', 'no_keyword_match': '未匹配本段剧情关键词或人物', 'retrieval_limit': '已达到可选历史段落数量上限'}.get(item.trim_reason, item.trim_reason) }}</p>{% endif %}<pre>{{ item.text }}</pre><details><summary>来源引用</summary><pre>{{ item.source_refs|tojson(indent=2) }}</pre></details></details>{% endfor %}
+{% if conversion_blocker %}<p class="notice">{{ conversion_blocker }}</p>{% elif not preview.blockers and selected_card_id %}
+<form method="post" action="/workflows/{{ workflow.id }}/context-policy"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="card_id" value="{{ selected_card_id }}"><input type="hidden" name="fingerprint" value="{{ preview.preview_fingerprint }}">
+<label><input type="checkbox" name="author_confirm" value="yes" required>确认采用这份输入；旧记录保留，切换不会自动发送模型请求</label><button type="submit">确认采用记忆检索模式</button></form>{% endif %}
+{% endif %}
+{% if policy and policy.strategy == 'scoped_story_v1' and not conversion_blocker %}<form method="post" action="/workflows/{{ workflow.id }}/context-policy/revert"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="policy_version" value="{{ policy.version_number }}"><button type="submit">撤回切换，恢复旧模式（仅未调用时可用）</button></form>{% endif %}
+{% endblock %}

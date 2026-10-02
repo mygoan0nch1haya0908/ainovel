@@ -1,0 +1,15 @@
+{% extends 'base.html' %}
+{% block content %}
+<p><a href="/memory-extractions/{{ job.id }}">返回整理进度</a> · <a href="/projects/{{ job.project_id }}/memory">人工整理入口</a></p>
+<h1>候选记忆差异与人工修订</h1>
+{% for blocker in preview.blockers %}<p class="notice error">{{ blocker }}</p>{% endfor %}
+{% for conflict in preview.conflicts %}<p class="notice">{{ conflict }}</p>{% endfor %}
+{% set fields = [('text','记忆内容'),('kind','分类'),('source_refs','原文引用'),('entity_ids','人物或物品关联'),('point_ids','剧情点关联'),('effective_from','适用起始章'),('effective_until','适用结束章'),('reveal_from','最早揭示章'),('audience','知晓范围'),('author_locked','作者锁定'),('origin','来源方式')] %}
+{% for change in preview.changes %}<details><summary>{{ change.kind }} · {{ change.after.kind }} · {{ change.entry_id }}</summary><table><thead><tr><th>字段</th><th>修改前</th><th>修改后</th></tr></thead><tbody>{% for key,label in fields %}{% if not change.before or change.before[key] != change.after[key] %}<tr><th>{{ label }}</th><td><pre>{{ change.before[key]|tojson(indent=2) if change.before else '无' }}</pre></td><td><pre>{{ change.after[key]|tojson(indent=2) }}</pre></td></tr>{% endif %}{% endfor %}</tbody></table></details>{% endfor %}
+<p>可修改文本、分类、剧情点、范围和author_locked（锁定）。已锁定项不能在此删除或覆盖；如需解锁，请回人工入口保存新版本后重新整理。</p>
+<form method="post" action="/memory-extractions/{{ job.id }}/merge">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project_id" value="{{ job.project_id }}"><input type="hidden" name="revision" value="{{ job.revision }}"><input type="hidden" name="fingerprint" value="{{ preview.fingerprint }}">
+{% if preview.obsolete_ids %}<h2>旧来源已替换或移除，请逐项决定</h2><p>以下条目不会默认获准保留。请从候选 JSON 删除，或勾选明确保留。锁定条目如需删除，须先回人工入口解锁并保存新版本。</p>{% for entry in preview.entries %}{% if entry.entry_id in preview.obsolete_ids %}<label><input type="checkbox" name="retained_obsolete_ids" value="{{ entry.entry_id }}">明确保留旧来源记忆：{{ entry.text }}（{{ entry.entry_id }}）</label>{% endif %}{% endfor %}{% endif %}
+<label>候选条目 JSON（可人工修订）<textarea name="entries_json" rows="24">{{ entries_json }}</textarea></label>
+{% if not preview.blockers and job.status == 'NEEDS_REVIEW' %}<label><input type="checkbox" name="author_confirm" value="yes" required>已核对差异与人工修订，确认合并为新草稿（不是批准）</label><button>确认合并为待批准草稿</button>{% endif %}
+</form>{% endblock %}

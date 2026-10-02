@@ -1,0 +1,22 @@
+{% if batch.status == "draft" %}
+<form action="/batches/{{ batch.id }}/ready" method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button type="submit"{% if not info.can_submit %} disabled aria-describedby="batch-help-{{ batch.id }}"{% endif %}>提交审批</button>
+</form>
+{% if not info.can_submit %}<p id="batch-help-{{ batch.id }}" class="muted">需备齐 {{ batch.planned_chapters }} 章正文，每章 4500–6000 字，且批次仍为当前候选，才能提交审批。</p>{% endif %}
+{% endif %}
+{% if batch.status == "ready_for_review" %}
+<form action="/batches/{{ batch.id }}/approve" method="post" data-confirm="确认已阅读正文并批准此批次？">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">批准已阅读的正文</button>
+</form>
+{% endif %}
+{% if batch.status in ["draft", "ready_for_review"] %}
+<details class="secondary-actions"><summary>不采用此批次 / 释放候选占用</summary>
+  <p>驳回后保留记录，不会自动生成新的正文。</p>
+  <form action="/batches/{{ batch.id }}/reject" method="post" data-confirm="确认驳回此批次？内容记录将保留。">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p><label for="reason-{{ batch.id }}">驳回原因</label><input id="reason-{{ batch.id }}" name="reason" required></p>
+    <button class="secondary" type="submit">驳回批次</button>
+  </form>
+</details>
+{% endif %}

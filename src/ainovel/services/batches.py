@@ -412,6 +412,11 @@ class BatchService:
                             raise ValueError("approval conflict")
                         break
                 else:
+                    from ainovel.services.stages import StageService
+
+                    StageService(self.session).commit_batch_progress(batch, chapters, first_number, actor)
+                    from ainovel.services.story_memory import StoryMemoryService
+                    StoryMemoryService(self.session).promote_batch(batch.id, actor)
                     self._add_audit(
                         batch.project_id,
                         "writing_batch",

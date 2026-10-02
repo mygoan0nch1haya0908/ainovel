@@ -1,8 +1,10 @@
 from __future__ import annotations
+from ainovel.providers.diagnostics import ResponseFailure, FailureReason, safe_failure_detail, safe_failure_code
+from ainovel.services.llm_diagnostics import failure_details, enforce_cooldown
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Callable
 from copy import deepcopy
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
@@ -11,15 +13,23 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from pydantic import BaseModel
-from sqlalchemy import func, select, update
+from ainovel.agents.contracts import PlotPointBatchPlanDraft
+from ainovel.agents.prompts import PLOT_PLANNER_PROMPT
+from ainovel.services.stage_planning import PLOT_FORMAT
+from sqlalchemy import func, select, update, or_
 from sqlalchemy.orm import Session
 
-from ainovel.agents.prompts import AGENT_SCHEMAS
+from ainovel.agents.prompts import (
+    AGENT_SCHEMAS,
+    V2_AGENT_SCHEMAS,
+    V2_BUILTIN_PROMPTS,
+)
 from ainovel.context import RequiredContextOverflow
 from ainovel.models.audit import AuditEvent
 from ainovel.models.batch import WritingBatch
 from ainovel.models.outline import OutlineVersion
 from ainovel.models.project import ConstitutionVersion, NovelProject
+from ainovel.models.stage import StoryStage, StageWorkflow, StageRoadmapVersion
 from ainovel.models.workflow import (
     GenerationWorkflow,
     ModelAttempt,
@@ -36,7 +46,13 @@ from ainovel.providers.contracts import (
     ProviderUnavailable,
 )
 from ainovel.services.counting import count_visible_characters
+from ainovel.services.draft_repair import (
+    coverage_is_valid,
+    persist_work_draft,
+    promote_work_draft,
+)
 from ainovel.services.prompts import PromptService
+from ainovel.services.provider_resolution import validate_profile_binding
 
 
 @dataclass(frozen=True)
@@ -52,7 +68,7 @@ class WorkflowBudgets:
 
 
 DEFAULT_BUDGETS = WorkflowBudgets()
-PROVIDER_NAMES = frozenset({"fake", "ollama", "openai"})
+PROVIDER_NAMES = frozenset({"fake", "ollama", "openai", "qwen", "compatible"})
 WORKFLOW_STATUSES = frozenset(
     {
         "PREPARING",
@@ -163,12 +179,14 @@ _EXPECTED_ARTIFACT_KINDS = {
     "WRITING": "chapter_draft",
     "SUMMARIZING": "chapter_summary_delta",
     "REVIEWING": "batch_review",
+    "VALIDATING_CHAPTER": "chapter_coverage",
 }
 _STEP_PROMPT_ROLES = {
     "PLANNING": "batch_planner",
     "WRITING": "chapter_writer",
     "SUMMARIZING": "chapter_summarizer",
     "REVIEWING": "batch_reviewer",
+    "VALIDATING_CHAPTER": "chapter_coverage_reviewer",
 }
 
 _SAFE_PROVIDER_FAILURES: tuple[
@@ -224,6 +242,36 @@ class _ArtifactValues:
     content_hash: str
 
 
+def planning_schema_for_workflow(session, workflow_id: str) -> type[BaseModel]:
+    workflow = session.get(GenerationWorkflow, workflow_id)
+    if workflow is None:
+        raise ValueError('workflow not found')
+    mapping = session.get(StageWorkflow, workflow_id)
+    if mapping is not None:
+        roadmap = session.get(StageRoadmapVersion, mapping.roadmap_id)
+        if roadmap.payload.get('format') == PLOT_FORMAT:
+            return PlotPointBatchPlanDraft
+    return (V2_AGENT_SCHEMAS if workflow.generation_version == 2 else AGENT_SCHEMAS)['batch_planner']
+
+
+def validate_stage_plan(session, workflow_id: str, payload: dict) -> None:
+    from ainovel.services.stages import StageService
+    workflow = session.get(GenerationWorkflow, workflow_id)
+    plan = planning_schema_for_workflow(session, workflow_id).model_validate(payload)
+    if len(plan.chapters) != workflow.requested_chapters:
+        raise ValueError('plan chapter count mismatch')
+    context = StageService(session).workflow_context(workflow_id)
+    if context is None:
+        return
+    if context.get('format') == PLOT_FORMAT:
+        for chapter, slot in zip(plan.chapters, context['slots'], strict=True):
+            if (chapter.ordinal, chapter.slot_id, chapter.point_id, chapter.point_ordinal) != (slot['ordinal'], slot['node_id'], slot['point_id'], slot['point_ordinal']):
+                raise ValueError('plan chapter slot binding mismatch')
+    elif any(chapter.title != node['title'] or chapter.goal != node['goal']
+             for chapter, node in zip(plan.chapters, context['nodes'], strict=True)):
+        raise ValueError('plan must preserve stage node title and goal')
+
+
 class WorkflowService:
     def __init__(self, session: Session, clock: Clock | None = None) -> None:
         self.session = session
@@ -236,10 +284,19 @@ class WorkflowService:
         model_name: str,
         requested_chapters: int,
         budgets: WorkflowBudgets,
+        *,
+        generation_version: int = 1,
+        model_profile_version_id: str | None = None,
+        _before_commit: Callable[[GenerationWorkflow], None] | None = None,
+        _planning_format: str | None = None,
     ) -> GenerationWorkflow:
         self._validate_start_arguments(
             provider_name, model_name, requested_chapters, budgets
         )
+        if type(generation_version) is not int or generation_version not in {1, 2}:
+            raise ValueError("generation version must be 1 or 2")
+        if _planning_format not in {None, PLOT_FORMAT} or (_planning_format and generation_version != 2):
+            raise ValueError('invalid planning format')
         try:
             initial_state = self._read_valid_start_state(project_id)
         except Exception:
@@ -276,13 +333,65 @@ class WorkflowService:
                 self.session.rollback()
                 self._raise_start_conflict(project_id)
 
+            profile = validate_profile_binding(
+                self.session, provider_name, model_name, model_profile_version_id
+            )
+            if profile is not None:
+                def cap(input_tokens: int, output_tokens: int) -> tuple[int, int]:
+                    output = min(output_tokens, profile.output_limit)
+                    incoming = min(input_tokens, profile.context_limit - output)
+                    if incoming < 1:
+                        raise ValueError("model profile context limit is too small")
+                    return incoming, output
+
+                planner = cap(budgets.planner_input, budgets.planner_output)
+                writer = cap(budgets.writer_input, budgets.writer_output)
+                summarizer = cap(budgets.summarizer_input, budgets.summarizer_output)
+                reviewer = cap(budgets.reviewer_input, budgets.reviewer_output)
+                budgets = replace(
+                    budgets, planner_input=planner[0], planner_output=planner[1],
+                    writer_input=writer[0], writer_output=writer[1],
+                    summarizer_input=summarizer[0], summarizer_output=summarizer[1],
+                    reviewer_input=reviewer[0], reviewer_output=reviewer[1],
+                )
+
             workflow = GenerationWorkflow(
                 id=workflow_id,
                 project_id=project_id,
                 base_outline_version_id=outline_id,
                 provider_name=provider_name,
-                model_name=model_name.strip(),
+                model_name=model_name if profile is not None else model_name.strip(),
+                model_profile_version_id=model_profile_version_id,
                 requested_chapters=requested_chapters,
+                generation_version=generation_version,
+                model_call_limit=(
+                    4 + 10 * requested_chapters if generation_version == 2 else None
+                ),
+                total_input_token_limit=(
+                    2 * budgets.planner_input
+                    + requested_chapters
+                    * (
+                        6 * budgets.writer_input
+                        + 2 * budgets.reviewer_input
+                        + 2 * budgets.summarizer_input
+                    )
+                    + 2 * budgets.reviewer_input
+                    if generation_version == 2
+                    else None
+                ),
+                total_output_token_limit=(
+                    2 * budgets.planner_output
+                    + requested_chapters
+                    * (
+                        6 * budgets.writer_output
+                        + 2 * budgets.reviewer_output
+                        + 2 * budgets.summarizer_output
+                    )
+                    + 2 * budgets.reviewer_output
+                    if generation_version == 2
+                    else None
+                ),
+                model_calls_used=0,
                 status="PLANNING",
                 current_position=0,
                 planner_input_tokens=budgets.planner_input,
@@ -299,9 +408,18 @@ class WorkflowService:
             )
             self.session.add(workflow)
             self.session.flush()
-            PromptService(self.session).snapshot(
-                workflow.id, AGENT_SCHEMAS, self._prompt_parameters(budgets)
-            )
+            prompt_service = PromptService(self.session)
+            if generation_version == 1:
+                prompt_service.snapshot(
+                    workflow.id, AGENT_SCHEMAS, self._prompt_parameters(budgets)
+                )
+            else:
+                prompt_service.snapshot_versioned(
+                    workflow.id,
+                    {**V2_BUILTIN_PROMPTS, 'batch_planner': PLOT_PLANNER_PROMPT} if _planning_format else V2_BUILTIN_PROMPTS,
+                    {**V2_AGENT_SCHEMAS, 'batch_planner': PlotPointBatchPlanDraft} if _planning_format else V2_AGENT_SCHEMAS,
+                    self._v2_prompt_parameters(budgets),
+                )
             self.session.add(
                 WorkflowStep(
                     id=str(uuid4()),
@@ -321,12 +439,16 @@ class WorkflowService:
                 "author",
                 {
                     "provider_name": provider_name,
-                    "model_name": model_name.strip(),
+                    "model_name": model_name if profile is not None else model_name.strip(),
+                    "model_profile_version_id": model_profile_version_id,
                     "requested_chapters": requested_chapters,
                     "base_outline_version_id": outline_id,
+                    "generation_version": generation_version,
                     "budgets": asdict(budgets),
                 },
             )
+            if _before_commit is not None:
+                _before_commit(workflow)
             self.session.commit()
             return workflow
         except Exception:
@@ -369,7 +491,7 @@ class WorkflowService:
                 WorkflowStep.position == workflow.current_position,
             )
         )
-        if project.official_outline_version_id != workflow.base_outline_version_id:
+        if not self._inputs_are_current(workflow, project):
             if step is not None and step.status in {"PENDING", "RUNNING"}:
                 self._pause_stale_workflow(workflow, step)
             else:
@@ -466,6 +588,21 @@ class WorkflowService:
 
         recovered_ids: list[str] = []
         for step in candidates:
+            abandoned_attempt = self.session.scalar(
+                select(ModelAttempt.id)
+                .where(
+                    ModelAttempt.step_id == step.id,
+                    ModelAttempt.status == "RUNNING",
+                )
+                .limit(1)
+            )
+            protocol_failure_count = step.protocol_failure_count
+            if (
+                workflow.generation_version == 2
+                and step.kind == "WRITING"
+                and abandoned_attempt is not None
+            ):
+                protocol_failure_count += 1
             recovered = self.session.execute(
                 update(WorkflowStep)
                 .where(
@@ -482,6 +619,7 @@ class WorkflowService:
                     status="PENDING",
                     lease_owner=None,
                     lease_expires_at=None,
+                    protocol_failure_count=protocol_failure_count,
                     revision=step.revision + 1,
                 )
             )
@@ -537,9 +675,28 @@ class WorkflowService:
         ):
             self.session.rollback()
             raise ValueError("attempt start requires an active step lease")
-        if step.attempt_count >= MAX_STEP_ATTEMPTS:
+        attempt_limit_count = (
+            step.protocol_failure_count
+            if workflow.generation_version == 2 and step.kind == "WRITING"
+            else step.attempt_count
+        )
+        if attempt_limit_count >= MAX_STEP_ATTEMPTS:
             self._pause_attempt_exhaustion(workflow, step)
             raise ValueError("maximum step attempts reached")
+        if workflow.generation_version == 2:
+            input_budget, output_budget = self._step_token_budget(workflow, step)
+            if (
+                workflow.model_call_limit is None
+                or workflow.total_input_token_limit is None
+                or workflow.total_output_token_limit is None
+                or workflow.model_calls_used >= workflow.model_call_limit
+                or workflow.actual_input_tokens + input_budget
+                > workflow.total_input_token_limit
+                or workflow.actual_output_tokens + output_budget
+                > workflow.total_output_token_limit
+            ):
+                self._pause_workflow_budget_exhaustion(workflow, step)
+                raise ValueError("workflow model budget exhausted")
 
         attempt_number = step.attempt_count + 1
         self._require_transition(workflow.status, workflow.status)
@@ -551,7 +708,14 @@ class WorkflowService:
                 GenerationWorkflow.revision == workflow.revision,
                 GenerationWorkflow.current_position == step.position,
             )
-            .values(revision=workflow.revision + 1)
+            .values(
+                revision=workflow.revision + 1,
+                model_calls_used=(
+                    workflow.model_calls_used + 1
+                    if workflow.generation_version == 2
+                    else workflow.model_calls_used
+                ),
+            )
         )
         step_claim = self.session.execute(
             update(WorkflowStep)
@@ -592,6 +756,45 @@ class WorkflowService:
             self.session.rollback()
             raise
         return attempt
+
+    def preflight_model_budget(
+        self, step_id: str, worker_id: str, *, claim_revision: int
+    ) -> bool:
+        self.session.expire_all()
+        step = self.session.get(WorkflowStep, step_id)
+        workflow = (
+            self.session.get(GenerationWorkflow, step.workflow_id)
+            if step is not None
+            else None
+        )
+        if (
+            step is None
+            or workflow is None
+            or step.status != "RUNNING"
+            or step.revision != claim_revision
+            or step.lease_owner != worker_id
+        ):
+            self.session.rollback()
+            raise ValueError("budget preflight requires the active step lease")
+        if workflow.generation_version != 2:
+            self.session.rollback()
+            return True
+        input_budget, output_budget = self._step_token_budget(workflow, step)
+        available = (
+            workflow.model_call_limit is not None
+            and workflow.total_input_token_limit is not None
+            and workflow.total_output_token_limit is not None
+            and workflow.model_calls_used < workflow.model_call_limit
+            and workflow.actual_input_tokens + input_budget
+            <= workflow.total_input_token_limit
+            and workflow.actual_output_tokens + output_budget
+            <= workflow.total_output_token_limit
+        )
+        if available:
+            self.session.rollback()
+            return True
+        self._pause_workflow_budget_exhaustion(workflow, step)
+        return False
 
     def pause_context_overflow(
         self,
@@ -656,9 +859,10 @@ class WorkflowService:
                 .values(
                     status="PAUSED_CONTEXT_OVERFLOW",
                     revision=workflow.revision + 1,
-                    last_error_code="required_context_overflow",
+                    last_error_code=("memory_sources_unavailable" if error.stable_key == "memory_sources_unavailable" else "required_context_overflow"),
                     last_error_detail=(
-                        "required context exceeds the available input budget"
+                        "记忆来源缺失或已失效，请查看输入预览；没有发送模型请求。" if error.stable_key == "memory_sources_unavailable"
+                        else "required context exceeds the available input budget"
                     ),
                 )
             )
@@ -820,7 +1024,7 @@ class WorkflowService:
         response: ModelResponse,
         artifact: BaseModel | Mapping[str, object],
         finalize_step: bool = True,
-    ) -> WorkflowArtifact:
+    ) -> WorkflowArtifact | None:
         self._validate_response(response)
         self.session.expire_all()
         attempt = self.session.get(ModelAttempt, attempt_id)
@@ -855,10 +1059,13 @@ class WorkflowService:
         ):
             self.session.rollback()
             raise ValueError("attempt completion conflict")
-        if not finalize_step and step.kind != "REVIEWING":
+        if not finalize_step and not (
+            step.kind == "REVIEWING"
+            or workflow.generation_version == 2 and step.kind == "WRITING"
+        ):
             self.session.rollback()
-            raise ValueError("only reviewer evidence artifacts may be non-final")
-        if project.official_outline_version_id != workflow.base_outline_version_id:
+            raise ValueError("workflow step may not persist a non-final artifact")
+        if not self._inputs_are_current(workflow, project):
             self.session.rollback()
             if self._pause_stale_attempt_completion(attempt_id, response):
                 raise StaleOutlineCompletion(
@@ -866,10 +1073,18 @@ class WorkflowService:
                 )
             raise ValueError("attempt completion conflict")
 
+        over_budget = workflow.generation_version == 2 and (
+            workflow.total_input_token_limit is None
+            or workflow.total_output_token_limit is None
+            or workflow.actual_input_tokens + (response.input_tokens or 0)
+            > workflow.total_input_token_limit
+            or workflow.actual_output_tokens + (response.output_tokens or 0)
+            > workflow.total_output_token_limit
+        )
         try:
-            artifact_values = self._artifact_values(step, artifact)
+            artifact_values = self._artifact_values(workflow, step, artifact)
             effective_finalize = finalize_step
-            if not finalize_step:
+            if not finalize_step and step.kind == "REVIEWING":
                 evidence_requested = (
                     artifact_values.payload.get("passed") is False
                     and bool(artifact_values.payload.get("evidence_queries"))
@@ -883,11 +1098,15 @@ class WorkflowService:
                     workflow, step, artifact_values, effective_finalize
                 )
             )
+            if over_budget:
+                target_status, target_position, target_step_status, make_active = (
+                    "PAUSED_ATTEMPTS", step.position, "PAUSED", False
+                )
             self._require_transition(workflow.status, target_status)
         except Exception:
             self.session.rollback()
             raise
-        artifact_row = WorkflowArtifact(
+        artifact_row = None if over_budget else WorkflowArtifact(
             id=str(uuid4()),
             workflow_id=workflow.id,
             step_id=step.id,
@@ -898,9 +1117,26 @@ class WorkflowService:
             visible_char_count=artifact_values.visible_char_count,
             content_hash=artifact_values.content_hash,
         )
-        self.session.add(artifact_row)
+        if artifact_row is not None:
+            self.session.add(artifact_row)
         try:
             self.session.flush()
+            promoted_artifact = None
+            if artifact_row is not None and workflow.generation_version == 2 and step.kind == "WRITING":
+                persist_work_draft(
+                    self.session, workflow, step, attempt, artifact_row
+                )
+            if (
+                artifact_row is not None
+                and workflow.generation_version == 2
+                and step.kind == "VALIDATING_CHAPTER"
+                and target_status != "PAUSED_REVIEW"
+            ):
+                promoted_artifact = promote_work_draft(
+                    self.session, workflow, step
+                )
+                self.session.add(promoted_artifact)
+                self.session.flush()
             workflow_claim = self.session.execute(
                 update(GenerationWorkflow)
                 .where(
@@ -908,6 +1144,7 @@ class WorkflowService:
                     GenerationWorkflow.status == workflow.status,
                     GenerationWorkflow.revision == workflow.revision,
                     GenerationWorkflow.current_position == step.position,
+                    self._stage_current_predicate(workflow.id),
                     select(NovelProject.id)
                     .where(
                         NovelProject.id == workflow.project_id,
@@ -926,12 +1163,15 @@ class WorkflowService:
                     + (response.output_tokens or 0),
                     revision=workflow.revision + 1,
                     last_error_code=(
-                        "review_blocked" if target_status == "PAUSED_REVIEW" else None
+                        "workflow_budget_exhausted" if over_budget
+                        else "review_blocked" if target_status == "PAUSED_REVIEW" else None
                     ),
                     last_error_detail=(
-                        "batch review requires author attention"
-                        if target_status == "PAUSED_REVIEW"
-                        else None
+                        "workflow model call or token budget exhausted" if over_budget
+                        else ("chapter coverage requires author attention"
+                              if step.kind == "VALIDATING_CHAPTER"
+                              else "batch review requires author attention")
+                        if target_status == "PAUSED_REVIEW" else None
                     ),
                 )
             )
@@ -949,7 +1189,17 @@ class WorkflowService:
                 )
                 .values(
                     status=target_step_status,
-                    active_artifact_id=artifact_row.id if make_active else None,
+                    active_artifact_id=(
+                        (promoted_artifact or artifact_row).id
+                        if make_active
+                        else None
+                    ),
+                    protocol_failure_count=(
+                        0
+                        if workflow.generation_version == 2
+                        and step.kind == "WRITING"
+                        else step.protocol_failure_count
+                    ),
                     lease_owner=None,
                     lease_expires_at=None,
                     revision=step.revision + 1,
@@ -964,13 +1214,13 @@ class WorkflowService:
                     ModelAttempt.status == "RUNNING",
                 )
                 .values(
-                    status="COMPLETED",
+                    status="FAILED" if over_budget else "COMPLETED",
                     provider_response_id=response.provider_response_id,
                     input_tokens=response.input_tokens,
                     output_tokens=response.output_tokens,
                     latency_ms=response.latency_ms,
-                    error_code=None,
-                    error_detail=None,
+                    error_code="workflow_budget_exhausted" if over_budget else None,
+                    error_detail="workflow token budget exceeded by response" if over_budget else None,
                 )
             )
             if (
@@ -1019,7 +1269,7 @@ class WorkflowService:
             or workflow is None
             or project is None
             or project.active_workflow_id != workflow.id
-            or project.official_outline_version_id == workflow.base_outline_version_id
+            or self._inputs_are_current(workflow, project)
             or attempt.status != "RUNNING"
             or attempt.attempt_number != step.attempt_count
             or step.status != "RUNNING"
@@ -1038,8 +1288,8 @@ class WorkflowService:
                 .where(
                     NovelProject.id == workflow.project_id,
                     NovelProject.active_workflow_id == workflow.id,
-                    NovelProject.official_outline_version_id
-                    != workflow.base_outline_version_id,
+                    or_(NovelProject.official_outline_version_id != workflow.base_outline_version_id,
+                        ~self._stage_current_predicate(workflow.id)),
                 )
                 .exists()
             )
@@ -1124,11 +1374,20 @@ class WorkflowService:
             raise
 
     def fail_attempt(
-        self, attempt_id: str, error: ProviderError
+        self,
+        attempt_id: str,
+        error: ProviderError,
+        *,
+        response: ModelResponse | None = None,
     ) -> GenerationWorkflow:
         if not isinstance(error, ProviderError):
             raise TypeError("attempt failures must be typed ProviderError instances")
+        if response is not None:
+            self._validate_response(response)
         code, detail, retryable = self._provider_failure(error)
+        diagnostic_details = failure_details(error,attempt_id=attempt_id,now=self.clock.now())
+        if diagnostic_details['diagnostic']['error_category']=='rate_limit' or diagnostic_details['cooldown_seconds']:
+            retryable = False  # Durable pause; no immediate 429 loop or sleeping inside a claim lease.
         now = self._aware_utc(self.clock.now())
         self.session.expire_all()
         attempt = self.session.get(ModelAttempt, attempt_id)
@@ -1155,7 +1414,12 @@ class WorkflowService:
             self.session.rollback()
             raise ValueError("attempt failure conflict")
 
-        if retryable and step.attempt_count < MAX_STEP_ATTEMPTS:
+        protocol_failure_count = (
+            step.protocol_failure_count + 1
+            if workflow.generation_version == 2 and step.kind == "WRITING"
+            else step.attempt_count
+        )
+        if retryable and protocol_failure_count < MAX_STEP_ATTEMPTS:
             target_status = workflow.status
             target_step_status = "PENDING"
         elif retryable:
@@ -1176,6 +1440,10 @@ class WorkflowService:
                 )
                 .values(
                     status=target_status,
+                    actual_input_tokens=GenerationWorkflow.actual_input_tokens
+                    + ((response.input_tokens or 0) if response is not None else 0),
+                    actual_output_tokens=GenerationWorkflow.actual_output_tokens
+                    + ((response.output_tokens or 0) if response is not None else 0),
                     revision=workflow.revision + 1,
                     last_error_code=code,
                     last_error_detail=detail,
@@ -1194,6 +1462,12 @@ class WorkflowService:
                 )
                 .values(
                     status=target_step_status,
+                    protocol_failure_count=(
+                        protocol_failure_count
+                        if workflow.generation_version == 2
+                        and step.kind == "WRITING"
+                        else step.protocol_failure_count
+                    ),
                     lease_owner=None,
                     lease_expires_at=None,
                     revision=step.revision + 1,
@@ -1207,7 +1481,17 @@ class WorkflowService:
                     ModelAttempt.attempt_number == step.attempt_count,
                     ModelAttempt.status == "RUNNING",
                 )
-                .values(status="FAILED", error_code=code, error_detail=detail)
+                .values(
+                    status="FAILED",
+                    provider_response_id=(
+                        response.provider_response_id if response is not None else None
+                    ),
+                    input_tokens=(response.input_tokens if response is not None else None),
+                    output_tokens=(response.output_tokens if response is not None else None),
+                    latency_ms=(response.latency_ms if response is not None else None),
+                    error_code=code,
+                    error_detail=detail,
+                )
             )
             if (
                 workflow_claim.rowcount != 1
@@ -1215,6 +1499,7 @@ class WorkflowService:
                 or attempt_claim.rowcount != 1
             ):
                 raise ValueError("attempt failure conflict")
+            self._add_audit(workflow.project_id,workflow.id,'llm_call_failed','system',diagnostic_details)
             self.session.commit()
             return workflow
         except Exception:
@@ -1255,10 +1540,12 @@ class WorkflowService:
             self.session.rollback()
             raise ValueError("plan approval requires an active plan artifact")
         self._validate_plan_payload(plan_artifact.payload, workflow.requested_chapters)
+        if self.session.get(StageWorkflow, workflow.id) is not None:
+            validate_stage_plan(self.session, workflow.id, plan_artifact.payload)
         if (
             project is None
             or project.active_workflow_id != workflow.id
-            or project.official_outline_version_id != workflow.base_outline_version_id
+            or not self._inputs_are_current(workflow, project)
         ):
             self.session.rollback()
             raise ValueError("plan approval conflict")
@@ -1300,6 +1587,13 @@ class WorkflowService:
                     self._new_step(workflow.id, "WRITING", ordinal, position)
                 )
                 position += 1
+                if workflow.generation_version == 2:
+                    steps.append(
+                        self._new_step(
+                            workflow.id, "VALIDATING_CHAPTER", ordinal, position
+                        )
+                    )
+                    position += 1
                 steps.append(
                     self._new_step(workflow.id, "SUMMARIZING", ordinal, position)
                 )
@@ -1411,6 +1705,7 @@ class WorkflowService:
             return True
 
     def resume(self, workflow_id: str) -> GenerationWorkflow:
+        enforce_cooldown(self.session,workflow_id,self.clock.now())
         self.session.expire_all()
         workflow = self._get_workflow(workflow_id)
         source_status = workflow.status
@@ -1455,7 +1750,12 @@ class WorkflowService:
                     WorkflowStep.status == "PAUSED",
                     WorkflowStep.revision == step.revision,
                     WorkflowStep.attempt_count == step.attempt_count,
-                    WorkflowStep.attempt_count < MAX_STEP_ATTEMPTS,
+                    (
+                        WorkflowStep.protocol_failure_count < MAX_STEP_ATTEMPTS
+                        if workflow.generation_version == 2
+                        and step.kind == "WRITING"
+                        else WorkflowStep.attempt_count < MAX_STEP_ATTEMPTS
+                    ),
                     WorkflowStep.active_artifact_id.is_(None),
                     WorkflowStep.lease_owner.is_(None),
                     WorkflowStep.lease_expires_at.is_(None),
@@ -1495,13 +1795,17 @@ class WorkflowService:
         if (
             project is None
             or project.active_workflow_id != workflow.id
-            or project.official_outline_version_id != workflow.base_outline_version_id
+            or not self._inputs_are_current(workflow, project)
             or step is None
             or step.status != "PAUSED"
             or step.lease_owner is not None
             or step.lease_expires_at is not None
             or step.active_artifact_id is not None
-            or step.attempt_count >= MAX_STEP_ATTEMPTS
+            or (
+                step.protocol_failure_count >= MAX_STEP_ATTEMPTS
+                if workflow.generation_version == 2 and step.kind == "WRITING"
+                else step.attempt_count >= MAX_STEP_ATTEMPTS
+            )
         ):
             raise ValueError("workflow cannot be resumed")
         return step
@@ -1737,6 +2041,25 @@ class WorkflowService:
             self.session.rollback()
             raise
 
+    @staticmethod
+    def _stage_current_predicate(workflow_id):
+        mapped = select(StageWorkflow.workflow_id).where(StageWorkflow.workflow_id == workflow_id).exists()
+        valid = (select(StageWorkflow.workflow_id)
+                 .join(StoryStage, StoryStage.id == StageWorkflow.stage_id)
+                 .join(StageRoadmapVersion, StageRoadmapVersion.id == StageWorkflow.roadmap_id)
+                 .join(NovelProject, NovelProject.id == StoryStage.project_id)
+                 .where(StageWorkflow.workflow_id == workflow_id,
+                        StoryStage.approved_roadmap_id == StageWorkflow.roadmap_id,
+                        StoryStage.confirmed_chapters == StageWorkflow.confirmed_start,
+                        StageRoadmapVersion.status == "APPROVED",
+                        NovelProject.current_constitution_version_id == StageRoadmapVersion.constitution_version_id)
+                 .exists())
+        return or_(~mapped, valid)
+
+    def _inputs_are_current(self, workflow, project):
+        return (project.official_outline_version_id == workflow.base_outline_version_id
+                and bool(self.session.scalar(select(self._stage_current_predicate(workflow.id)))))
+
     def _read_valid_start_state(self, project_id: str) -> tuple[str, str]:
         self.session.expire_all()
         project = self.session.get(NovelProject, project_id)
@@ -1828,6 +2151,17 @@ class WorkflowService:
             },
         }
 
+    @classmethod
+    def _v2_prompt_parameters(
+        cls, budgets: WorkflowBudgets
+    ) -> dict[str, dict[str, object]]:
+        parameters = cls._prompt_parameters(budgets)
+        parameters["chapter_coverage_reviewer"] = {
+            "max_input_tokens": budgets.reviewer_input,
+            "max_output_tokens": budgets.reviewer_output,
+        }
+        return parameters
+
     def _pause_stale_workflow(
         self, workflow: GenerationWorkflow, step: WorkflowStep
     ) -> None:
@@ -1911,6 +2245,59 @@ class WorkflowService:
             raise ValueError("maximum attempt pause conflict")
         self.session.commit()
 
+    def _pause_workflow_budget_exhaustion(
+        self, workflow: GenerationWorkflow, step: WorkflowStep
+    ) -> None:
+        self._require_transition(workflow.status, "PAUSED_ATTEMPTS")
+        workflow_claim = self.session.execute(
+            update(GenerationWorkflow)
+            .where(
+                GenerationWorkflow.id == workflow.id,
+                GenerationWorkflow.status == workflow.status,
+                GenerationWorkflow.revision == workflow.revision,
+                GenerationWorkflow.current_position == step.position,
+            )
+            .values(
+                status="PAUSED_ATTEMPTS",
+                revision=workflow.revision + 1,
+                last_error_code="workflow_budget_exhausted",
+                last_error_detail="workflow model call or token budget exhausted",
+            )
+        )
+        step_claim = self.session.execute(
+            update(WorkflowStep)
+            .where(
+                WorkflowStep.id == step.id,
+                WorkflowStep.status == "RUNNING",
+                WorkflowStep.revision == step.revision,
+                WorkflowStep.attempt_count == step.attempt_count,
+            )
+            .values(
+                status="PAUSED",
+                lease_owner=None,
+                lease_expires_at=None,
+                revision=step.revision + 1,
+            )
+        )
+        if workflow_claim.rowcount != 1 or step_claim.rowcount != 1:
+            self.session.rollback()
+            raise ValueError("workflow budget pause conflict")
+        self.session.commit()
+
+    @staticmethod
+    def _step_token_budget(
+        workflow: GenerationWorkflow, step: WorkflowStep
+    ) -> tuple[int, int]:
+        if step.kind == "PLANNING":
+            return workflow.planner_input_tokens, workflow.planner_output_tokens
+        if step.kind == "WRITING":
+            return workflow.writer_input_tokens, workflow.writer_output_tokens
+        if step.kind == "SUMMARIZING":
+            return workflow.summarizer_input_tokens, workflow.summarizer_output_tokens
+        if step.kind in {"VALIDATING_CHAPTER", "REVIEWING"}:
+            return workflow.reviewer_input_tokens, workflow.reviewer_output_tokens
+        raise ValueError("workflow step has no model token budget")
+
     def _completion_transition(
         self,
         workflow: GenerationWorkflow,
@@ -1935,11 +2322,23 @@ class WorkflowService:
         )
         if next_step is None:
             raise ValueError("workflow step sequence is incomplete")
+        expected_after_writing = (
+            "VALIDATING_CHAPTER"
+            if workflow.generation_version == 2
+            else "SUMMARIZING"
+        )
         if step.kind == "WRITING" and (
-            next_step.kind != "SUMMARIZING" or next_step.ordinal != step.ordinal
+            next_step.kind != expected_after_writing
+            or next_step.ordinal != step.ordinal
         ):
             raise ValueError("workflow step sequence is invalid")
         if step.kind == "WRITING":
+            return "GENERATING_CHAPTERS", next_step.position, "COMPLETED", True
+        if step.kind == "VALIDATING_CHAPTER":
+            if next_step.kind != "SUMMARIZING" or next_step.ordinal != step.ordinal:
+                raise ValueError("workflow step sequence is invalid")
+            if not coverage_is_valid(self.session, step, artifact.payload):
+                return "PAUSED_REVIEW", step.position, "PAUSED", True
             return "GENERATING_CHAPTERS", next_step.position, "COMPLETED", True
         if step.kind == "SUMMARIZING" and next_step.kind == "WRITING":
             return "GENERATING_CHAPTERS", next_step.position, "COMPLETED", True
@@ -1950,13 +2349,20 @@ class WorkflowService:
         raise ValueError("workflow step sequence is invalid")
 
     def _artifact_values(
-        self, step: WorkflowStep, artifact: BaseModel | Mapping[str, object]
+        self,
+        workflow: GenerationWorkflow,
+        step: WorkflowStep,
+        artifact: BaseModel | Mapping[str, object],
     ) -> _ArtifactValues:
         expected_kind = _EXPECTED_ARTIFACT_KINDS.get(step.kind)
+        if workflow.generation_version == 2 and step.kind == "WRITING":
+            expected_kind = "chapter_work_draft"
         if expected_kind is None:
             raise ValueError("workflow step does not accept model artifacts")
         if isinstance(artifact, BaseModel):
-            raw_payload: object = artifact.model_dump(mode="json")
+            raw_payload: object = artifact.model_dump(
+                mode="json", exclude_unset=step.kind == "VALIDATING_CHAPTER"
+            )
             kind: object = expected_kind
             ordinal: object = step.ordinal
             text_content: object = None
@@ -1984,9 +2390,17 @@ class WorkflowService:
             raise ValueError("artifact ordinal does not match workflow step")
         payload = deepcopy(dict(raw_payload))
         try:
-            payload = AGENT_SCHEMAS[_STEP_PROMPT_ROLES[step.kind]].model_validate(
+            schemas = (
+                V2_AGENT_SCHEMAS
+                if workflow.generation_version == 2
+                else AGENT_SCHEMAS
+            )
+            schema = planning_schema_for_workflow(self.session, workflow.id) if step.kind == 'PLANNING' else schemas[_STEP_PROMPT_ROLES[step.kind]]
+            payload = schema.model_validate(
                 payload
-            ).model_dump(mode="json")
+            ).model_dump(mode="json", exclude_unset=step.kind == "VALIDATING_CHAPTER")
+            if step.kind == 'PLANNING' and self.session.get(StageWorkflow, workflow.id) is not None:
+                validate_stage_plan(self.session, workflow.id, payload)
         except (KeyError, ValueError, TypeError):
             raise ValueError("artifact payload failed validation") from None
         if step.kind == "WRITING":
@@ -2045,6 +2459,11 @@ class WorkflowService:
 
     @staticmethod
     def _provider_failure(error: ProviderError) -> tuple[str, str, bool]:
+        if isinstance(error, ResponseFailure):
+            if error.reason in {FailureReason.QUOTA, FailureReason.PROVIDER_API, FailureReason.RATE_LIMIT, FailureReason.TEMPORARY, FailureReason.HTTP}:
+                retryable = error.reason in {FailureReason.RATE_LIMIT, FailureReason.TEMPORARY}
+                return safe_failure_code(error), safe_failure_detail(error), retryable
+            return "provider_protocol", safe_failure_detail(error), True
         for error_type, code, detail, retryable in _SAFE_PROVIDER_FAILURES:
             if isinstance(error, error_type):
                 return code, detail, retryable
@@ -2064,7 +2483,7 @@ class WorkflowService:
     def _workflow_status_for_step(kind: str) -> str:
         if kind == "PLANNING":
             return "PLANNING"
-        if kind in {"WRITING", "SUMMARIZING"}:
+        if kind in {"WRITING", "VALIDATING_CHAPTER", "SUMMARIZING"}:
             return "GENERATING_CHAPTERS"
         if kind == "REVIEWING":
             return "REVIEWING_BATCH"

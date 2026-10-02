@@ -1,4 +1,4 @@
-from pydantic import SecretStr
+from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,4 +12,12 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr | None = None
     openai_base_url: str | None = None
     allow_real_openai: bool = False
+    qwen_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "qwen_api_key", "AINOVEL_QWEN_API_KEY", "DASHSCOPE_API_KEY"
+        ),
+    )
+    qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    allow_real_qwen: bool = False
     provider_timeout_seconds: float = 120.0

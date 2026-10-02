@@ -1,0 +1,158 @@
+{% extends "base.html" %}
+{% from "_reading_panels.html" import reading_panel, reading_controls %}
+{% block title %}剧情阶段 · {{ project.title }}{% endblock %}
+{% block content %}
+<p><a href="/projects/{{ project.id }}">返回项目：{{ project.title }}</a></p>
+{% if chapter_test_mode %}<aside aria-label="阶段测试提示"><strong>TEST · 剧情阶段规划</strong><p>此阶段位于独立测试数据库，不代表发布；章节安排、批次计划和批次正文仍分别由作者确认。</p><p><a href="/chapter-test">返回测试入口或选择独立单章测试</a></p></aside>{% endif %}
+<h1>本阶段写作工作台</h1>
+<aside id="next-action" aria-labelledby="next-action-heading">
+  <h2 id="next-action-heading">当前进度与下一步</h2>
+  <p>已确认 {{ stage.confirmed_chapters }}{% if estimated_chapters is not none %} / {{ estimated_chapters }}{% endif %} 章 · 每次最多写 5 章，写完由你确认。</p>
+  {% if active_workflow %}<a class="button" href="/workflows/{{ active_workflow.id }}">继续当前写作任务</a>
+  {% elif project.active_batch_id %}<a class="button" href="/batches/{{ project.active_batch_id }}">审阅待确认正文</a>
+  {% elif can_start_batch %}<p>章节安排已确认，可以开始下一批写作。</p><a class="button" href="#stage-batch-heading">开始下一批</a>
+  {% elif roadmap_rows %}{% set latest = roadmap_rows[-1].roadmap %}<p>{{ stage_status_labels.get(latest.status, latest.status) }}</p><a class="button" href="#planning-{{ latest.id }}">查看最新章节安排与可用操作</a>
+  {% else %}<p>先保存规划设置，再让 AI 根据阶段大纲拆分章节。</p><a class="button" href="#roadmap-create-heading">准备章节规划</a>{% endif %}
+  <nav aria-label="阶段快捷入口"><a href="#author-inputs">查看大纲与设定</a><a href="#roadmaps-heading">章节安排与历史</a><a href="#roadmap-create-heading">调整规划设置</a></nav>
+</aside>
+<section id="author-inputs" aria-labelledby="architecture-heading" data-disclosure-scope>
+  <h2 id="architecture-heading">已输入的大纲与设定</h2>
+  <p class="muted">收起不影响 AI 使用这些内容。展开可查看完整原文。</p>
+  {{ reading_controls() }}
+  {% if current_constitution %}{% for key, value in current_constitution.content.items() %}{{ reading_panel(constitution_labels.get(key, key), value if value is string else value|tojson) }}{% endfor %}{% endif %}
+  {% if outline_hierarchy %}
+  {{ reading_panel("总剧情大纲（全书主线）", outline_hierarchy.book_outline) }}
+  {{ reading_panel("已确认的阶段大纲", outline_hierarchy.stage_architecture) }}
+  {% if outline_hierarchy.first_chapter %}
+  {{ reading_panel("单章大纲（当前阶段第一章）", outline_hierarchy.first_chapter.chapter_outline) }}
+  <p>建议标题：{{ outline_hierarchy.first_chapter.title }}{% if outline_hierarchy.first_chapter.goal %}；目标：{{ outline_hierarchy.first_chapter.goal }}{% endif %}{% if outline_hierarchy.first_chapter.ending_hook %}；章末钩子：{{ outline_hierarchy.first_chapter.ending_hook }}{% endif %}</p>
+  {% else %}<p>未提供；由 AI 按阶段大纲自动拆分章节。</p>{% endif %}
+  <p>上层大纲约束下层展开。请在批准章节安排前核对总剧情、阶段和单章是否一致；发现冲突时先修订提案再批准。系统不保证自动发现所有语义冲突。</p>
+  {% endif %}
+  {{ reading_panel("作者确认的阶段输入", stage.architecture) }}
+  <p>阶段修订号：{{ stage.revision }}</p>
+  {% if estimated_chapters is not none %}<p><strong>已确认 {{ stage.confirmed_chapters }} / {{ estimated_chapters }} 章</strong>；剩余 {{ remaining_chapters }} 章。只有正式批准候选批次后才推进。</p>{% elif proposed_estimate is not none %}<p><strong>已确认 {{ stage.confirmed_chapters }} / {{ proposed_estimate }} 章</strong>（提案尚未批准，不作为正式总数）。</p>{% else %}<p>尚无已批准章节安排，确认进度为 {{ stage.confirmed_chapters }} 章。</p>{% endif %}
+</section>
+
+<section aria-labelledby="roadmap-create-heading">
+  <h2 id="roadmap-create-heading">准备章节规划</h2>
+  <p>先按阶段大纲安排“剧情点＋分配章节数”；开始写作时，AI 再细化下一批最多 5 章的内容，交给你确认。</p>
+  {% if legacy_locked %}<p>本阶段沿用逐章规划：已有确认正文，不能转换为剧情点格式。可修改未确认安排，新阶段使用剧情点规划。</p>{% elif roadmap_form.get('roadmap_format') == 'legacy' %}<p>正在沿用旧版逐章规划格式。若希望切换，请使用独立入口：<a href="/stages/{{ stage.id }}#roadmap-create-heading">新建剧情点规划</a>。</p>{% else %}<p><strong>新建剧情点规划</strong>：保留旧版本；下方确认模型并保存后，再显式生成。</p>{% endif %}
+  <details id="planning-settings"{% if error or roadmap_form or not roadmap_rows %} open{% endif %}><summary>模型选择与规划设置 · 点击查看或调整</summary>
+  {% if request.query_params.get('retry_roadmap') %}<aside data-context-rebuild-notice><p>已带入旧提案的作者架构和模型选择。新提案会使用当前已批准的总纲与设定、最新阶段进度和章节安排，不是原请求的逐字重放；请核对后重新确认。旧提案及其完整输入快照不会修改。</p></aside>{% endif %}
+  <p>先保存本次大纲和模型选择；保存后再点击“AI 拆分章节”，才会开始生成。</p>
+  <form action="/stages/{{ stage.id }}/roadmaps" method="post" data-confirm="确认冻结这次架构与模型设置？此操作不会调用模型。">
+    <input type="hidden" name="roadmap_format" value="{{ roadmap_form.get('roadmap_format', 'legacy' if legacy_locked else 'plot_points_v1') }}">
+    {% include "_profile_selection.html" %}
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    {% set selected_provider = roadmap_form.get('provider_name', 'qwen' if chapter_test_mode else 'fake') %}
+    <p><label for="provider-name">模型服务商</label><select id="provider-name" name="provider_name">{% if chapter_test_mode %}<option value="qwen"{% if selected_provider == 'qwen' %} selected{% endif %}>Qwen</option><option value="fake"{% if selected_provider == 'fake' %} selected{% endif %}>Fake 演示</option>{% else %}<option value="fake"{% if selected_provider == 'fake' %} selected{% endif %}>Fake 演示</option><option value="ollama"{% if selected_provider == 'ollama' %} selected{% endif %}>Ollama</option><option value="openai"{% if selected_provider == 'openai' %} selected{% endif %}>OpenAI</option><option value="qwen"{% if selected_provider == 'qwen' %} selected{% endif %}>Qwen</option>{% endif %}{% if selected_provider not in (['qwen', 'fake'] if chapter_test_mode else ['fake', 'ollama', 'openai', 'qwen']) %}<option value="{{ selected_provider }}" selected>原模型服务商不可用，请重新选择</option>{% endif %}</select></p>
+    <p><label for="model-name">模型名称</label><input id="model-name" name="model_name" value="{{ roadmap_form.get('model_name', 'qwen-flash' if chapter_test_mode else 'demo') }}" required></p>
+    <p><label for="stage-output-budget">规划输出预算（Token，可选）</label><input id="stage-output-budget" name="output_token_limit" type="number" min="1" step="1" value="{{ roadmap_form.get('output_token_limit', '') }}" placeholder="默认最多 32000，受模型配置限制"></p>
+    <p class="muted">留空使用所选模型配置允许的预算（最多 32000 Token）；已有配置若仍为 12000，需先在模型配置中提高上限。输入、输出及安全余量须同时容纳在上下文内。阶段规划最多等待 600 秒，不自动重试。更高预算可能增加费用和耗时，不保证消除截断。新提案使用精简规划，旧提案的预算与提示词保持不变。</p>
+    <p><label for="architecture-revision">可选：修订后的总体架构</label><textarea id="architecture-revision" name="architecture" rows="6" placeholder="留空则沿用上方架构">{{ roadmap_form.get('architecture', '') }}</textarea></p>
+    <p><label><input type="checkbox" name="author_confirm" value="yes"{% if roadmap_form.get('author_confirm') == 'yes' %} checked{% endif %} required> 我确认架构和模型设置。</label></p>
+    <button type="submit">保存规划设置（不会调用模型）</button>
+  </form>
+  </details>
+</section>
+
+<section aria-labelledby="roadmaps-heading">
+  <h2 id="roadmaps-heading">本阶段章节安排</h2>
+  <p class="muted">最新安排默认展开；历史版本保留，可随时查看。</p>
+  {% if roadmap_rows %}
+  {% for row in roadmap_rows|reverse %}{% set roadmap = row.roadmap %}
+  {% set revision = roadmap.input_snapshot.get('revision') %}
+  <details class="planning-card" id="planning-{{ roadmap.id }}"{% if loop.first or feedback_form.get('roadmap_id') == roadmap.id %} open{% endif %}>
+    <summary>版本 {{ roadmap.version_number }} · {{ stage_status_labels.get(roadmap.status, roadmap.status) }}{% if loop.first %} · 最新{% endif %}{% if stage.approved_roadmap_id == roadmap.id %} · 当前采用{% endif %}</summary>
+    <p>模型服务商 / 模型：{{ roadmap.provider_name }} / {{ roadmap.model_name }}；尝试 {{ roadmap.attempts_used }} / {{ roadmap.attempt_limit }}</p>
+    {% if revision %}
+    <aside><p>基于版本 {{ revision.source_version }} 的修改意见创建。旧版保留，修订版经你确认后才生效。</p>
+    <details open><summary>本次作者修改意见</summary><p class="preserve-whitespace">{{ revision.feedback }}</p></details>
+    <p>已确认正文对应的前 {{ roadmap.input_snapshot.confirmed_chapters }} 章保持锁定；本次仅保存原安排和本次意见，不累积整段历史对话。</p></aside>
+    {% endif %}
+    {% if row.profile %}<p>固定认证目标：{{ row.profile.base_url }} · 模型 {{ row.profile.model_name }} · 版本 {{ row.profile.version_id }}</p>{% endif %}
+    {% if row.attempts and row.attempts[-1].error_code and row.attempts[-1].status == roadmap.status and roadmap.status in ["PAUSED_INVALID", "PAUSED_PROVIDER", "PAUSED_BUDGET"] %}
+    <p class="notice error" role="status">最近一次失败原因（已记录的模型尝试，不含调用前检查）：{{ failure_code_detail(row.attempts[-1].error_code) }}</p>
+    {% endif %}
+    {% if row.context_report and row.context_report.overflow %}<p role="status" class="notice error">本次发送给 AI 的内容过长。请调整模型容量或输入后，重新准备章节规划；当前不会发起调用。</p>{% endif %}
+    <details><summary>查看用量与预算详情（Token）</summary>
+    <p>累计用量：输入 {{ roadmap.actual_input_tokens if roadmap.actual_input_tokens is not none else "未知" }} / 输出 {{ roadmap.actual_output_tokens if roadmap.actual_output_tokens is not none else "未知" }} Token{% if roadmap.actual_input_tokens is none or roadmap.actual_output_tokens is none %}（含未知项，合计不完整）{% endif %}</p>
+    {% if row.context_report %}<p>预计输入：{{ row.context_report.estimated }} Token；可用输入：{{ row.context_report.capacity }} Token；输出预留：{{ row.context_report.output }} Token（另留安全余量）。{% if row.context_report.overflow %}输入仍超过本提案预算或模型配置容量，不会调用模型；请选择容量足够的模型配置后重新创建提案。{% endif %}</p>{% else %}<p>暂时无法读取模型容量，请检查模型配置。</p>{% endif %}
+    <p>本提案累计预算上限：输入 {{ roadmap.total_input_token_limit }} / 输出 {{ roadmap.total_output_token_limit }} Token，最多 {{ roadmap.attempt_limit }} 次；提高容量可能增加费用。</p>
+    <p class="muted">Token 是模型计算文本用量的单位，不等于汉字数。状态代码：{{ roadmap.status }}</p>
+    </details>
+    {% if roadmap.status == "PAUSED_CONTEXT_OVERFLOW" %}<p>旧记录保持不变。<a href="/stages/{{ stage.id }}?retry_roadmap={{ roadmap.id }}#roadmap-create-heading">沿用原输入重新创建提案（先核对，不调用模型）</a></p>{% endif %}
+    {% if roadmap.status in ["PENDING", "PAUSED_PROVIDER", "PAUSED_INVALID"] %}
+    <form action="/stages/{{ stage.id }}/roadmaps/{{ roadmap.id }}/generate" method="post" data-confirm="确认调用 {{ roadmap.provider_name }} / {{ roadmap.model_name }} 生成章节安排？可能产生费用。">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="model_call_confirm" value="yes">
+      {% if row.profile %}<label><input type="checkbox" name="provider_consent" value="yes" required>确认将小说设定与提纲发送给 {{ row.profile.base_url }}，使用 {{ row.profile.model_name }}，可能收费。</label>{% endif %}
+      <button type="submit">{% if revision %}按意见生成修订版（可能收费）{% else %}AI 拆分章节（可能收费）{% endif %}</button>
+    </form>
+    {% elif roadmap.status == "RUNNING" %}<p class="notice error">该尝试记录为生成中。进程中断后不会自动恢复、重置预算或另建提案；请先人工核查持久状态。</p>{% endif %}
+    {% if roadmap.payload %}
+      <p><strong>预计 {{ roadmap.estimated_chapters }} 章</strong></p>
+      <p>目标：{{ roadmap.payload.goal }}；起点：{{ roadmap.payload.start_state }}；终点：{{ roadmap.payload.end_state }}</p>
+      {% if row.planning_view.points %}
+      <p>剧情点规划 · 写作前再细化单章。已开始并确认正文的剧情点整体锁定。</p>
+      <ol>{% for point in row.planning_view.points %}<li><details><summary>{{ point.title }} · 第 {{ point.start }}—{{ point.end }} 章 · 分配 {{ point.chapter_count }} 章</summary>
+      <p>目标：{{ point.goal }}</p>{% if stage.approved_roadmap_id == roadmap.id %}<p>已确认 {{ point.confirmed_count }} / {{ point.chapter_count }} 章{% if point.confirmed_count %} · 本剧情点已锁定{% endif %}</p>{% endif %}
+      <p>关键事件：{{ point.key_events|join('；') }}</p><p>人物变化：{{ point.character_changes|join('；') or '无' }}</p><p>伏笔任务：{{ point.foreshadowing|join('；') or '无' }}</p><p>前置剧情点：{{ point.dependencies|join('、') or '无' }}</p>
+      </details></li>{% endfor %}</ol>
+      {% else %}<p>旧版逐章规划（历史格式保留）</p><ol>{% for node in roadmap.payload.nodes %}<li><strong>阶段第 {{ node.ordinal }} 章 · {{ node.title }}</strong><br>目标：{{ node.goal }}{% if node.dependencies %}<br>依赖：{{ node.dependencies | join(", ") }}{% endif %}</li>{% endfor %}</ol>{% endif %}
+      {% if row.difference or revision %}
+      <details open><summary>{% if revision %}与修改前版本的差异{% else %}与当前批准版的修订差异{% endif %}</summary>
+      {% set field_labels = {'goal':'阶段目标', 'start_state':'起点', 'end_state':'终点', 'key_events':'关键事件', 'foreshadowing':'伏笔', 'nodes':'章节安排', 'points':'剧情点与章节分配', 'format':'规划格式'} %}
+      {% if not row.difference %}<p>修改前与修订后内容相同；请核对 AI 是否落实意见，可继续提出修改意见。</p>{% endif %}
+      {% for key, change in row.difference.items() %}
+      <h4>{{ field_labels.get(key, key) }}</h4>
+      <table><thead><tr><th scope="col">修改前</th><th scope="col">修订后</th></tr></thead><tbody><tr>
+      {% for value in [change.before, change.after] %}<td>
+      {% if key == 'points' and value %}<ol>{% for item in value %}<li><strong>{{ item.title }} · 第 {{ item.start }}—{{ item.end }} 章（{{ item.chapter_count }} 章）</strong><p>{{ item.goal }}</p><p>关键事件：{{ item.key_events|join('；') }}</p><p>人物变化：{{ item.character_changes|join('；') or '无' }}</p><p>伏笔：{{ item.foreshadowing|join('；') or '无' }}</p><p>依赖：{{ item.dependencies|join('、') or '无' }}</p></li>{% endfor %}</ol>
+      {% elif key == 'nodes' and value %}<ol>{% for item in value %}<li><strong>第 {{ item.ordinal }} 章 · {{ item.title }}</strong><p>{{ item.goal }}</p>{% if item.dependencies %}<p>依赖：{{ item.dependencies|join('、') }}</p>{% endif %}</li>{% endfor %}</ol>
+      {% elif key in ['key_events', 'foreshadowing'] and value %}<ul>{% for item in value %}<li>{{ item }}</li>{% endfor %}</ul>
+      {% else %}{{ value if value is not none else '无' }}{% endif %}
+      </td>{% endfor %}</tr></tbody></table>
+      {% endfor %}</details>{% endif %}
+      {% if roadmap.status == "PROPOSED" %}<form action="/stages/{{ stage.id }}/roadmaps/{{ roadmap.id }}/approve" method="post" data-confirm="已核对章节安排与全书、阶段及单章输入的一致性，确认批准？批准不会调用模型。"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="approval_confirm" value="yes"><button type="submit">确认章节安排（不会调用模型）</button></form>{% endif %}
+      {% set can_feedback = not project.active_workflow_id and not project.active_batch_id and ((roadmap.status == 'PROPOSED' and roadmap.input_revision == stage.revision) or (roadmap.status == 'APPROVED' and stage.approved_roadmap_id == roadmap.id)) %}
+      {% if can_feedback or feedback_form.get('roadmap_id') == roadmap.id %}
+      <details{% if feedback_form.get('roadmap_id') == roadmap.id %} open{% endif %}><summary>提出修改意见</summary>
+      <p>告诉 AI 哪些章节需要调整、希望怎样改。保存不会调用模型，也不会替换当前已确认安排。</p>
+      <form action="/stages/{{ stage.id }}/roadmaps/{{ roadmap.id }}/feedback" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="stage_revision" value="{{ stage.revision }}">
+        <label for="feedback-{{ roadmap.id }}">你希望怎样调整？</label>
+        <textarea id="feedback-{{ roadmap.id }}" name="feedback" rows="5" required placeholder="例如：前两章节奏太快；第二章先埋下线索，第四章再揭露反派。">{{ feedback_form.get('feedback', '') if feedback_form.get('roadmap_id') == roadmap.id else '' }}</textarea>
+        <p><label><input type="checkbox" name="feedback_confirm" value="yes" required>确认保存意见，保留旧版并建立待生成的修订版。</label></p>
+        <button type="submit">保存修改意见（不会调用模型）</button>
+      </form></details>
+      {% elif project.active_workflow_id or project.active_batch_id %}<p class="muted">当前有写作任务或待审批正文，处理完成后可提出章节安排修改意见。</p>{% endif %}
+    {% endif %}
+    {% if row.attempts %}<details><summary>章节安排模型尝试</summary><ol>{% for attempt in row.attempts %}<li>第 {{ attempt.number }} 次 · {{ attempt.status }} · 输入 {{ attempt.input_tokens if attempt.input_tokens is not none else "未知" }} / 输出 {{ attempt.output_tokens if attempt.output_tokens is not none else "未知" }}{% if attempt.error_code %} · {{ attempt.error_code }}{% endif %}
+    {% if row.schema_issues.get(attempt.number) %}<details><summary>字段校验详情</summary><p>以下仅显示字段位置与错误类型，不显示失败正文。列表下标从 0 开始，0 表示第一项。</p><ul>{% for issue in row.schema_issues[attempt.number] %}<li><code>{{ issue.loc | join('.') if issue.loc else '根对象' }}</code>：{{ schema_error_labels[issue.type] }}</li>{% endfor %}</ul></details>{% endif %}
+    {% with diagnostic=row.llm_diagnostics.get(attempt.number) %}{% include '_llm_diagnostic.html' %}{% endwith %}
+    </li>{% endfor %}</ol></details>{% endif %}
+  </details>
+  {% endfor %}
+  {% else %}<p>尚未创建章节安排提案。</p>{% endif %}
+</section>
+
+<section aria-labelledby="stage-batch-heading">
+  <h2 id="stage-batch-heading">分批写作（每次最多 5 章）</h2>
+  {% if can_start_batch %}
+  <p>自动预留接下来的连续章节，单批最多五章，可跨剧情点。建立任务不会调用模型；之后由 AI 细化每章目标和场景，你确认计划后才写正文，正文仍需你批准。</p>
+  <form action="/stages/{{ stage.id }}/batches" method="post" data-confirm="确认建立下一批工作流？此操作不会调用模型。">
+    {% if approved_profile %}<p>本批继承已批准版本：{{ approved_profile.base_url }} · {{ approved_profile.model_name }} · {{ approved_profile.version_id }}。更换接口需要新建并批准章节安排提案。</p>{% endif %}
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p><label for="requested-chapters">本批最多章节数（1 至 5）</label><input id="requested-chapters" name="requested_chapters" type="number" min="1" max="5" value="5" required></p>
+    <p><label><input type="checkbox" name="author_confirm" value="yes" required> 我确认建立下一批任务。</label></p>
+    <button type="submit">建立下一批任务（不会调用模型）</button>
+  </form>
+  {% elif active_workflow %}<p>当前批次尚未完成作者审批与对账：<a href="/workflows/{{ active_workflow.id }}">{{ workflow_labels.get(active_workflow.status, active_workflow.status) }}</a>。不能提前启动下一批。</p>
+  {% elif project.active_batch_id %}<p>候选正文尚待作者批准或驳回，不能启动下一批。</p>
+  {% elif approved_roadmap and remaining_chapters == 0 %}<p>阶段章节安排已全部确认。</p>
+  {% else %}<p>批准章节安排后才能启动批次。</p>{% endif %}
+  {% if workflow_rows %}<h3>阶段批次记录</h3><ol>{% for row in workflow_rows %}<li><a href="/workflows/{{ row.workflow.id }}">{{ workflow_labels.get(row.workflow.status, row.workflow.status) }}</a>{% if row.mapping.committed_batch_id %} · 已正式确认{% else %} · 尚未推进阶段进度{% endif %}<ul>{% for node in row.nodes %}<li>批内第 {{ node.ordinal }} 章 · 阶段第 {{ node.stage_ordinal }} 章 · 全书第 {{ node.book_ordinal }} 章</li>{% endfor %}</ul></li>{% endfor %}</ol>{% endif %}
+</section>
+{% endblock %}

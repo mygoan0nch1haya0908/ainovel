@@ -19,8 +19,13 @@ from ainovel.db import create_engine_for_url, create_session_factory, database_r
 from ainovel.providers.demo import DemoFakeProvider
 from ainovel.providers.ollama import OllamaProvider
 from ainovel.providers.openai import OpenAIProvider
+from ainovel.providers.qwen import QwenProvider
 from ainovel.providers.registry import ProviderRegistry
+from ainovel.services.model_profiles import ModelProfileService
+from ainovel.services.provider_resolution import ProviderResolver
+from ainovel.security.secret_vault import SecretVault
 from ainovel.workflows.orchestrator import WorkflowOrchestrator
+from ainovel.services.workflows import DEFAULT_BUDGETS
 
 
 PROVIDER_CONTEXT_WINDOW_CEILING = 16_000
@@ -41,7 +46,12 @@ def _loopback_provider_url(value: str) -> str:
     return value.rstrip("/")
 
 
-def _default_provider_registry(settings: Settings) -> ProviderRegistry:
+def _default_provider_registry(
+    settings: Settings,
+    *,
+    qwen_context_window_ceiling: int = PROVIDER_CONTEXT_WINDOW_CEILING,
+    qwen_output_token_ceiling: int = PROVIDER_OUTPUT_TOKEN_CEILING,
+) -> ProviderRegistry:
     ollama_base_url = _loopback_provider_url(settings.ollama_base_url)
     api_key = (
         settings.openai_api_key.get_secret_value()
@@ -49,6 +59,11 @@ def _default_provider_registry(settings: Settings) -> ProviderRegistry:
         else None
     )
     allow_openai = bool(settings.allow_real_openai and api_key)
+    qwen_api_key = (
+        settings.qwen_api_key.get_secret_value()
+        if settings.qwen_api_key is not None
+        else None
+    )
 
     def ollama_provider() -> OllamaProvider:
         return OllamaProvider(
@@ -65,6 +80,7 @@ def _default_provider_registry(settings: Settings) -> ProviderRegistry:
         client_options: dict[str, object] = {
             "api_key": api_key or "not-configured",
             "timeout": settings.provider_timeout_seconds,
+            "max_retries": 0,
         }
         if settings.openai_base_url:
             client_options["base_url"] = settings.openai_base_url
@@ -75,11 +91,26 @@ def _default_provider_registry(settings: Settings) -> ProviderRegistry:
             max_output_tokens_limit=PROVIDER_OUTPUT_TOKEN_CEILING,
         )
 
+    def qwen_provider() -> QwenProvider:
+        return QwenProvider(
+            OpenAI(
+                api_key=qwen_api_key or "not-configured",
+                base_url=settings.qwen_base_url,
+                timeout=settings.provider_timeout_seconds,
+                max_retries=0,
+            ),
+            allow_real_calls=settings.allow_real_qwen,
+            context_window_limit=qwen_context_window_ceiling,
+            max_output_tokens_limit=qwen_output_token_ceiling,
+            api_key_configured=bool(qwen_api_key),
+        )
+
     return ProviderRegistry(
         {
             "fake": DemoFakeProvider,
             "ollama": ollama_provider,
             "openai": openai_provider,
+            "qwen": qwen_provider,
         }
     )
 
@@ -87,7 +118,14 @@ def _default_provider_registry(settings: Settings) -> ProviderRegistry:
 def create_app(
     database_url: str | None = None,
     provider_registry: ProviderRegistry | None = None,
+    *,
+    orchestrator_request_timeout_seconds: float = 60.0,
+    profile_vault: SecretVault | None = None,
+    profile_transport=None,
+    provider_resolver: ProviderResolver | None = None,
 ) -> FastAPI:
+    from ainovel.providers.request_diagnostics import configure_telemetry
+    configure_telemetry()
     settings = Settings(database_url=database_url) if database_url else Settings()
 
     @asynccontextmanager
@@ -97,15 +135,37 @@ def create_app(
 
     engine = create_engine_for_url(settings.database_url)
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
+    from ainovel.providers.request_diagnostics import operation_context
+    from uuid import uuid4
+    @app.middleware('http')
+    async def correlate_model_calls(request,call_next):
+        token=operation_context.set(str(uuid4()))
+        try:
+            return await call_next(request)
+        finally:
+            from ainovel.providers.request_diagnostics import send_metrics
+            send_metrics.close_operation(operation_context.get())
+            operation_context.reset(token)
     session_secret = settings.session_secret or token_urlsafe(32)
     app.state.settings = settings
     app.state.engine = engine
     app.state.session_factory = create_session_factory(engine)
     app.state.provider_registry = provider_registry or _default_provider_registry(settings)
+    app.state.profile_vault = profile_vault
+    app.state.model_profile_service_factory = lambda session: ModelProfileService(
+        session, vault=profile_vault
+    )
+    app.state.provider_resolver = provider_resolver or ProviderResolver(
+        app.state.session_factory, app.state.provider_registry,
+        vault=profile_vault, transport=profile_transport,
+    )
+    app.state.workflow_budgets = DEFAULT_BUDGETS
     orchestrator = WorkflowOrchestrator(
         app.state.session_factory,
         app.state.provider_registry,
         AgentRunner(),
+        request_timeout_seconds=orchestrator_request_timeout_seconds,
+        provider_resolver=app.state.provider_resolver,
     )
     app.state.orchestrator_factory = lambda: orchestrator
     app.state.csrf_signer = URLSafeSerializer(session_secret, salt="ainovel-csrf")
@@ -126,9 +186,17 @@ def create_app(
 
     from ainovel.web.routes import router as web_router
     from ainovel.web.workflow_routes import router as workflow_router
+    from ainovel.web.memory_routes import router as memory_router
+    from ainovel.web.memory_extraction_routes import router as memory_extraction_router
+    from ainovel.web.stage_routes import router as stage_router
+    from ainovel.web.model_profile_routes import router as model_profile_router
 
     app.include_router(web_router)
     app.include_router(workflow_router)
+    app.include_router(memory_router)
+    app.include_router(memory_extraction_router)
+    app.include_router(stage_router)
+    app.include_router(model_profile_router)
 
     @app.get("/health")
     def health() -> dict[str, str]:

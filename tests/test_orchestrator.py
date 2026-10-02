@@ -193,6 +193,19 @@ def approved_plan_workflow(orchestrator, workflow, session, clock):
     return session.get(GenerationWorkflow, workflow.id)
 
 
+def test_quota_pauses_workflow_without_a_second_dispatch(session_factory, workflow, session, clock):
+    from ainovel.providers.llm_response import LLMQuotaError
+    provider = FakeProvider([LLMQuotaError()])
+    runner = make_orchestrator(session_factory, provider, clock)
+    first = runner.run_until_blocked(workflow.id)
+    assert first.status == 'PAUSED_PROVIDER'
+    second = runner.run_until_blocked(workflow.id)
+    assert second.status == 'PAUSED_PROVIDER'
+    assert len(provider.requests) == 1
+    session.expire_all()
+    assert session.get(GenerationWorkflow, workflow.id).last_error_code == 'provider_quota'
+
+
 def make_request_for_digest() -> ModelRequest:
     return ModelRequest(
         model="m",
@@ -519,6 +532,35 @@ def test_unrelated_full_length_chapter_fails_deterministic_plan_coverage(
     assert writer.status == "PENDING"
     assert writer.active_artifact_id is None
     assert attempt.status == "FAILED"
+    assert 'goal_missing' in attempt.error_detail
+
+
+@pytest.mark.parametrize(('body', 'reason'), [
+    ('甲' * 100, 'chapter_too_short'),
+    ('推进第1章目标。' + '甲' * 4500, 'hook_missing'),
+    ('推进第1章目标。第1章悬念。\n\n' + ('甲' * 1500 + '\n\n') * 3, 'repeated_blocks'),
+], ids=['short', 'hook', 'repeated'])
+def test_failed_writer_diagnostic_survives_retry_and_reaches_page(session_factory, session, ready_project, clock, client, body, reason):
+    provider = FakeProvider([response(plan_payload(1), 1), response({'title': '章', 'body': body}, 2), response({'title': '章', 'body': body}, 3)])
+    workflow = WorkflowService(session, clock=clock).start(ready_project.id, 'fake', 'scripted', 1, DEFAULT_BUDGETS)
+    orchestrator = make_orchestrator(session_factory, provider, clock)
+    orchestrator.advance(workflow.id)
+    WorkflowService(session, clock=clock).approve_plan(workflow.id, 'author')
+    result = orchestrator.run_until_blocked(workflow.id)
+    assert result.status == 'PAUSED_ATTEMPTS'
+    session.expire_all()
+    persisted = session.get(GenerationWorkflow, workflow.id)
+    assert reason in persisted.last_error_detail
+    failures = session.scalars(select(ModelAttempt).join(WorkflowStep).where(WorkflowStep.workflow_id == workflow.id, ModelAttempt.status == 'FAILED')).all()
+    assert len(failures) == 2
+    assert all(reason in attempt.error_detail for attempt in failures)
+    assert session.scalar(select(func.count()).select_from(WorkflowArtifact).where(WorkflowArtifact.workflow_id == workflow.id, WorkflowArtifact.kind == 'chapter_draft')) == 0
+    page = client.get(f'/workflows/{workflow.id}')
+    assert reason in page.text
+    assert 'aria-labelledby="failure-attempts-heading"' in page.text
+    assert '第 1 次' in page.text and '第 2 次' in page.text
+    assert '甲甲' not in page.text
+    assert len(provider.requests) == 3
 
 
 def test_validation_recovery_recomputes_body_coverage_instead_of_hardcoding_success(

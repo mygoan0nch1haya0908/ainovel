@@ -1,0 +1,12 @@
+<label>配置名称 <input name="name" maxlength="120" required value="{{ profile.name if profile else '' }}"></label>
+<label>连接类型 <select name="connection_kind"><option value="remote">远程 HTTPS</option><option value="loopback" {% if profile and profile.kind == 'loopback' %}selected{% endif %}>本机 loopback（允许 HTTP，可不填密钥）</option></select></label>
+<label>Base URL <input name="base_url" maxlength="2048" required value="{{ profile.base_url if profile else '' }}" placeholder="https://example.com/v1"></label>
+<label>API Key <input name="api_key" type="password" autocomplete="new-password" maxlength="8192"></label>
+<p>密钥只在您提交时发送至本机后端，加密后保存；调用时会发送给您授权的服务商。不要把密钥填写到名称、模型名或小说正文。</p>
+{% if profile %}<p>凭据：{{ '已配置' if profile.has_key else '未配置' }}</p><label><input type="checkbox" name="keep_existing_key" value="yes">同一目标明确复用已有密钥（修改地址或类型时必须重新输入密钥；无密钥本机配置可继续无密钥）</label>{% endif %}
+<label>模型名称 <input name="model_name" maxlength="255" required value="{{ profile.model_name if profile else '' }}" list="model-ids"></label>
+<datalist id="model-ids">{% for model in models %}<option value="{{ model }}">{{ model }}</option>{% endfor %}</datalist>
+<label>模型上下文容量（Token） <input name="context_limit" type="number" min="1" max="2147483647" value="{{ profile.context_limit if profile else 32000 }}" required></label>
+<p>请按服务商对当前模型公布的实际容量填写，不会自动探测；提高数值不会扩大模型本身的容量，较长输入可能增加费用。</p>
+<label>输出上限 <input name="output_limit" type="number" min="1" max="64000" value="{{ profile.output_limit if profile else 12000 }}" required></label>
+<p>输出不能超过上下文；仍受系统预算、章长与作者审批限制。保存和检查配置不会联网。</p>

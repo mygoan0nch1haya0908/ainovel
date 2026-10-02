@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}模型接口配置{% endblock %}
+{% block content %}
+<h1>模型接口配置</h1>
+{% if message %}<p role="status">{{ message }}</p>{% endif %}
+<p>仅用于本机 loopback 部署。密钥由 Windows 当前用户 DPAPI 保护；同用户恶意程序、管理员或被攻陷的浏览器仍可能读取密钥。</p>
+<section><h2>已保存配置</h2><ul>{% for item in profiles %}<li><a href="/model-profiles/{{ item.profile_id }}">{{ item.name }}</a> · {{ item.base_url }} · {{ item.model_name }} · {{ '已撤销' if item.revoked else '已启用' if item.enabled else '已停用' }} · {{ '已配置' if item.has_key else '未配置' }}</li>{% else %}<li>尚无配置</li>{% endfor %}</ul></section>
+<section><h2>添加配置</h2><form method="post" action="/model-profiles">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% include "_profile_fields.html" %}
+<button type="submit" formaction="/model-profiles/check">检查配置（仅本地）</button><button type="submit">保存并启用</button></form></section>
+{% endblock %}
